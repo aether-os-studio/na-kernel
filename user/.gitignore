@@ -1,4 +1,5 @@
 /.build-stamp-*
-/cache
+# Downloaded rootfs bootstrap tools and package caches.
+/cache/
 /initramfs-*/
 /rootfs-*/

@@ -5,6 +5,64 @@ set -e # fail globally
 
 SCRIPT=$(realpath "$0")
 SCRIPTPATH=$(dirname "$SCRIPT")
+ROOTFS_DISTRO=${ROOTFS_DISTRO:-void}
+
+if [ "$ROOTFS_DISTRO" == alpine ]; then
+    if [ "$ARCH" != riscv64 ]; then
+        echo "Alpine rootfs is currently supported only for riscv64" >&2
+        exit 1
+    fi
+
+    APK_INSTALL_PATH="$SCRIPTPATH/cache/apk"
+    APK_PACKAGE_CACHE_PATH="$SCRIPTPATH/cache/apk-packages-$ARCH"
+    APK_XZ_PATH="$SCRIPTPATH/cache/apk-tools-static.apk"
+    APK_XZ_URI="http://mirror.sjtu.edu.cn/alpine/edge/main/x86_64/apk-tools-static-3.0.6-r0.apk"
+
+    ALPINE_VERSION=edge
+    ALPINE_MIRROR_ROOT="http://mirror.sjtu.edu.cn/alpine"
+    ALPINE_MIRROR="$ALPINE_MIRROR_ROOT/$ALPINE_VERSION"
+
+    mkdir -p "$(dirname "$APK_XZ_PATH")"
+    [ -f "$APK_XZ_PATH" ] || curl -Lo "$APK_XZ_PATH" "$APK_XZ_URI"
+
+    mkdir -p "$APK_INSTALL_PATH"
+    tar -xf "$APK_XZ_PATH" -C "$APK_INSTALL_PATH"
+
+    mkdir -p "$APK_PACKAGE_CACHE_PATH"
+
+    sudo "$APK_INSTALL_PATH/sbin/apk.static" \
+        --arch "$ARCH" \
+        -U \
+        --allow-untrusted \
+        --root "$ROOTFS_SYSROOT" \
+        --cache-dir "$APK_PACKAGE_CACHE_PATH" \
+        -X "$ALPINE_MIRROR/main" \
+        -X "$ALPINE_MIRROR/community" \
+        --initdb add \
+        alpine-base bash coreutils util-linux bind-tools pciutils sudo iw \
+        gcc binutils make strace git \
+        musl-locales ncurses tzdata which shadow grep elfutils curl ca-certificates \
+        seatd seatd-launch eudev dbus dbus-x11 \
+        labwc foot fuzzel xwayland xrandr xkeyboard-config \
+        thunar \
+        adwaita-icon-theme adwaita-xfce-icon-theme adw-gtk3 font-dejavu \
+        gdk-pixbuf librsvg shared-mime-info hicolor-icon-theme \
+        mesa mesa-dri-gallium mesa-egl mesa-gbm mesa-gl libdisplay-info \
+        fastfetch mesa-demos lite-xl qemu-system-x86_64
+
+    sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai "$ROOTFS_SYSROOT/etc/localtime"
+
+    sudo cp -rf "$SCRIPTPATH/base/"* "$ROOTFS_SYSROOT/"
+    sudo chmod +x "$ROOTFS_SYSROOT/usr/lib/aether/init"
+    sudo ln -sf /usr/lib/aether/init "$ROOTFS_SYSROOT/sbin/init"
+
+    exit 0
+fi
+
+if [ "$ROOTFS_DISTRO" != void ]; then
+    echo "Unsupported rootfs distribution: $ROOTFS_DISTRO" >&2
+    exit 1
+fi
 
 XBPS_INSTALL_PATH="$SCRIPTPATH/cache/xbps"
 XBPS_XZ_PATH="$SCRIPTPATH/cache/xbps-static-latest.tar.xz"

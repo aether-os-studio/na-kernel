@@ -97,9 +97,12 @@ ifeq ($(BOOT_PROTOCOL),laboot)
 kernel: initramfs-$(ARCH).img
 endif
 
+USER_BUILD_INPUTS := user/GNUmakefile user/build_initramfs.sh user/build_rootfs.sh $(shell find user/base -type f -o -type l 2>/dev/null)
+
 user: user/.build-stamp-$(ARCH)
-user/.build-stamp-$(ARCH):
+user/.build-stamp-$(ARCH): $(USER_BUILD_INPUTS)
 	$(call PRINT_STEP,MAKE,user)
+	$(Q)sudo rm -rf user/initramfs-$(ARCH) user/rootfs-$(ARCH)
 	$(Q)$(MAKE) -C user
 	$(call PRINT_STEP,TOUCH,$@)
 	$(Q)touch $@
