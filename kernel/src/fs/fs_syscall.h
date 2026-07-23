@@ -1287,9 +1287,8 @@ uint64_t sys_fadvise64(int fd, uint64_t offset, uint64_t len, int advice);
  * Notes: UTIME_NOW and UTIME_OMIT intentionally mix explicit and implicit
  * timestamp updates in one call, so callers may pass partially meaningful input
  * arrays instead of a pair of ordinary concrete timestamps.
- * Gaps: timestamp changes are applied through generic inode metadata;
- * filesystems that keep separate persistent timestamp state are not yet
- * integrated here.
+ * Notes: timestamp changes are passed through the filesystem setattr hook so
+ * persistent filesystems can update their on-disk inode metadata.
  */
 uint64_t sys_utimensat(int dfd, const char *pathname, struct timespec *utimes,
                        int flags);

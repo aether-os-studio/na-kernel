@@ -150,6 +150,8 @@ static int ext_zero_inode_tail_locked(ext_mount_ctx_t *fs, uint32_t ino,
 static int ext_inode_resize_locked(ext_mount_ctx_t *fs, uint32_t ino,
                                    ext_inode_disk_t *inode, uint64_t new_size,
                                    bool write_back);
+static void ext_inode_touch(ext_inode_disk_t *inode, bool atime, bool mtime,
+                            bool ctime);
 static void ext_inode_copy_size_blocks(ext_inode_disk_t *dst,
                                        const ext_inode_disk_t *src);
 static void ext_sync_vfs_inode(struct vfs_inode *inode, ext_mount_ctx_t *fs,
@@ -273,14 +275,6 @@ static bool ext_inode_uses_extents(const ext_inode_disk_t *inode) {
 static bool ext_inode_is_indexed_dir(const ext_inode_disk_t *inode) {
     return inode && (inode->i_flags & EXT2_INDEX_FL) &&
            ((inode->i_mode & S_IFMT) == EXT2_S_IFDIR);
-}
-
-static int ext_require_mutable_linear_dir(const ext_inode_disk_t *inode) {
-    /* htree directories need indexed updates; linear edits would corrupt them.
-     */
-    if (ext_inode_is_indexed_dir(inode))
-        return -EOPNOTSUPP;
-    return 0;
 }
 
 static size_t ext_inode_extra_capacity(ext_mount_ctx_t *fs) {
@@ -583,6 +577,156 @@ static int ext_dir_block_write_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     if (ctx->has_tail)
         ext_dir_block_checksum_set(fs, dir_ino, dir_inode, ctx, buf);
     return ext_write_block(fs, ctx->pblock, buf);
+}
+
+/*
+ * The driver reads indexed directories by scanning their leaf blocks, but it
+ * does not yet maintain the htree when a directory entry is changed.  Convert
+ * an indexed directory to the ext4 linear representation before the first
+ * mutation.  The htree root contains only the fake "." and ".." entries; all
+ * real entries already live in ordinary directory leaf blocks and remain
+ * reachable after EXT2_INDEX_FL is cleared.
+ */
+static int ext_dir_make_linear_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
+                                      ext_inode_disk_t *dir_inode) {
+    ext_inode_disk_t old_inode;
+    ext_dir_block_ctx_t block_ctx = {0};
+    ext_dir_entry_t *dot;
+    ext_dir_entry_t *dotdot;
+    uint8_t *buf;
+    uint8_t *old_buf;
+    uint64_t pblock = 0;
+    uint64_t dir_size;
+    uint32_t parent_ino;
+    uint32_t blocks;
+    uint32_t data_size;
+    uint16_t dot_len;
+    uint16_t dotdot_len;
+    int ret;
+
+    if (!fs || !dir_inode)
+        return -EINVAL;
+    if (!ext_inode_is_indexed_dir(dir_inode))
+        return 0;
+
+    ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, 0, false, &pblock);
+    if (ret)
+        return ret;
+    if (!pblock)
+        return -EIO;
+
+    buf = calloc(1, fs->block_size);
+    old_buf = calloc(1, fs->block_size);
+    if (!buf || !old_buf) {
+        free(buf);
+        free(old_buf);
+        return -ENOMEM;
+    }
+
+    ret = ext_read_block(fs, pblock, old_buf);
+    if (ret)
+        goto out;
+    memcpy(buf, old_buf, fs->block_size);
+
+    dot = (ext_dir_entry_t *)buf;
+    if (!ext_dir_entry_valid(dot, 0, fs->block_size) || !dot->inode ||
+        dot->name_len != 1 || dot->name[0] != '.') {
+        ret = -EIO;
+        goto out;
+    }
+    dotdot = (ext_dir_entry_t *)(buf + dot->rec_len);
+    if (!ext_dir_entry_valid(dotdot, dot->rec_len, fs->block_size) ||
+        !dotdot->inode || dotdot->name_len != 2 || dotdot->name[0] != '.' ||
+        dotdot->name[1] != '.') {
+        ret = -EIO;
+        goto out;
+    }
+    parent_ino = dotdot->inode;
+
+    data_size = fs->block_size;
+    if (ext_dir_has_tail(fs, dir_inode, data_size))
+        data_size -= sizeof(ext_dir_entry_tail_t);
+    dot_len = ext_dir_rec_len(1);
+    dotdot_len = ext_dir_rec_len(2);
+    if ((uint32_t)dot_len + dotdot_len > data_size) {
+        ret = -EIO;
+        goto out;
+    }
+
+    /* Discard the dx_root payload and turn its space into dirent slack. */
+    memset(buf + dot_len, 0, fs->block_size - dot_len);
+    dot = (ext_dir_entry_t *)buf;
+    dot->rec_len = dot_len;
+    dotdot = (ext_dir_entry_t *)(buf + dot_len);
+    dotdot->inode = parent_ino;
+    dotdot->rec_len = (uint16_t)(data_size - dot_len);
+    dotdot->name_len = 2;
+    dotdot->file_type = EXT2_FT_DIR;
+    dotdot->name[0] = '.';
+    dotdot->name[1] = '.';
+
+    old_inode = *dir_inode;
+    dir_inode->i_flags &= ~EXT2_INDEX_FL;
+    ext_inode_touch(dir_inode, false, true, true);
+
+    ret = ext_write_inode(fs, dir_ino, dir_inode);
+    if (ret) {
+        *dir_inode = old_inode;
+        goto out;
+    }
+
+    /*
+     * A multi-level htree has interior nodes whose fake dirent covers the
+     * complete block.  They are valid empty blocks after de-indexing, but the
+     * old dx checksum tail is not a linear-directory checksum tail.  Normalize
+     * them now so a later insertion preserves metadata_csum correctly.
+     */
+    dir_size = ext_inode_size_get(dir_inode);
+    blocks = (uint32_t)((dir_size + fs->block_size - 1) / fs->block_size);
+    for (uint32_t lblock = 1; lblock < blocks; lblock++) {
+        ext_dir_entry_t *entry;
+        uint64_t node_pblock = 0;
+
+        ret = ext_inode_get_block_locked(fs, dir_ino, dir_inode, lblock, false,
+                                         &node_pblock);
+        if (ret)
+            goto out;
+        if (!node_pblock)
+            continue;
+        ret = ext_read_block(fs, node_pblock, old_buf);
+        if (ret)
+            goto out;
+
+        entry = (ext_dir_entry_t *)old_buf;
+        if (!ext_dir_entry_valid(entry, 0, fs->block_size) || entry->inode ||
+            entry->rec_len != fs->block_size || entry->name_len)
+            continue;
+
+        memset(old_buf, 0, fs->block_size);
+        entry = (ext_dir_entry_t *)old_buf;
+        entry->rec_len = (uint16_t)data_size;
+        memset(&block_ctx, 0, sizeof(block_ctx));
+        block_ctx.pblock = node_pblock;
+        block_ctx.lblock = lblock;
+        block_ctx.data_size = data_size;
+        block_ctx.has_tail = data_size != fs->block_size;
+        ret = ext_dir_block_write_locked(fs, dir_ino, dir_inode, &block_ctx,
+                                         old_buf);
+        if (ret)
+            goto out;
+    }
+
+    memset(&block_ctx, 0, sizeof(block_ctx));
+    block_ctx.pblock = pblock;
+    block_ctx.lblock = 0;
+    block_ctx.data_size = data_size;
+    block_ctx.has_tail = data_size != fs->block_size;
+    ret = ext_dir_block_write_locked(fs, dir_ino, dir_inode, &block_ctx, buf);
+
+out:
+    free(old_buf);
+    free(buf);
+    return ret;
 }
 
 static void ext_inode_init_large_fields(ext_mount_ctx_t *fs,
@@ -3899,7 +4043,7 @@ static int ext_dir_add_entry_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
 
     if (!name_len || name_len > 255)
         return -EINVAL;
-    ret = ext_require_mutable_linear_dir(dir_inode);
+    ret = ext_dir_make_linear_locked(fs, dir_ino, dir_inode);
     if (ret)
         return ret;
 
@@ -4032,7 +4176,7 @@ static int ext_dir_remove_entry_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
                                        const char *name,
                                        ext_dir_lookup_t *removed) {
     ext_dir_lookup_t lookup = {0};
-    int ret = ext_require_mutable_linear_dir(dir_inode);
+    int ret = ext_dir_make_linear_locked(fs, dir_ino, dir_inode);
     if (ret)
         return ret;
 
@@ -4085,7 +4229,7 @@ static int ext_dir_replace_entry_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
                                         const char *name, uint32_t child_ino,
                                         uint8_t file_type) {
     ext_dir_lookup_t lookup = {0};
-    int ret = ext_require_mutable_linear_dir(dir_inode);
+    int ret = ext_dir_make_linear_locked(fs, dir_ino, dir_inode);
     if (ret)
         return ret;
 
@@ -4134,12 +4278,6 @@ static int ext_dir_is_empty_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     int ret;
     if (!buf)
         return -ENOMEM;
-
-    ret = ext_require_mutable_linear_dir(dir_inode);
-    if (ret) {
-        free(buf);
-        return ret;
-    }
 
     for (uint32_t lblock = 0; lblock < blocks; lblock++) {
         ret = ext_dir_block_prepare(fs, dir_ino, dir_inode, lblock, buf,
@@ -4194,7 +4332,7 @@ static int ext_delete_directory_contents_locked(ext_mount_ctx_t *fs,
     if (!buf)
         return -ENOMEM;
 
-    ret = ext_require_mutable_linear_dir(dir_inode);
+    ret = ext_dir_make_linear_locked(fs, dir_ino, dir_inode);
     if (ret) {
         free(buf);
         return ret;
@@ -4285,7 +4423,7 @@ static int ext_dir_set_dotdot_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
     if (!buf)
         return -ENOMEM;
 
-    ret = ext_require_mutable_linear_dir(dir_inode);
+    ret = ext_dir_make_linear_locked(fs, dir_ino, dir_inode);
     if (ret) {
         free(buf);
         return ret;
@@ -5507,21 +5645,26 @@ static int ext_setattr(struct vfs_dentry *dentry,
     struct vfs_inode *inode = dentry ? dentry->d_inode : NULL;
     ext_mount_ctx_t *fs;
     ext_inode_disk_t disk_inode = {0};
+    bool selective;
+    bool size_changed;
     uint64_t old_size;
     int ret;
 
     if (!inode || !stat)
         return -EINVAL;
 
+    selective = stat->mask != 0;
     fs = ext_sb_info(inode->i_sb);
     spin_lock(&fs->lock);
     ret = ext_load_inode_locked(inode, &disk_inode);
     if (ret)
         goto out;
     old_size = ext_inode_size_get(&disk_inode);
+    size_changed = (!selective || (stat->mask & STATX_SIZE)) &&
+                   !S_ISDIR(disk_inode.i_mode) && stat->size != old_size;
     spin_unlock(&fs->lock);
 
-    if (!S_ISDIR(disk_inode.i_mode) && stat->size != old_size) {
+    if (size_changed) {
         uint64_t wb_end = stat->size < old_size ? stat->size : UINT64_MAX;
         ret = page_cache_writeback_range(&inode->i_mapping, 0, wb_end, false);
         if (ret < 0)
@@ -5533,18 +5676,27 @@ static int ext_setattr(struct vfs_dentry *dentry,
     if (ret)
         goto out;
 
-    if (stat->mode)
+    if ((!selective || (stat->mask & STATX_MODE)) && stat->mode)
         disk_inode.i_mode = (disk_inode.i_mode & S_IFMT) | (stat->mode & 07777);
-    ext_inode_uid_set(&disk_inode, stat->uid);
-    ext_inode_gid_set(&disk_inode, stat->gid);
-    old_size = ext_inode_size_get(&disk_inode);
-    if (!S_ISDIR(disk_inode.i_mode) && stat->size != old_size) {
+    if (!selective || (stat->mask & STATX_UID))
+        ext_inode_uid_set(&disk_inode, stat->uid);
+    if (!selective || (stat->mask & STATX_GID))
+        ext_inode_gid_set(&disk_inode, stat->gid);
+    if (stat->mask & STATX_ATIME)
+        disk_inode.i_atime = (uint32_t)stat->atime.sec;
+    if (stat->mask & STATX_MTIME)
+        disk_inode.i_mtime = (uint32_t)stat->mtime.sec;
+    if (stat->mask & STATX_CTIME)
+        disk_inode.i_ctime = (uint32_t)stat->ctime.sec;
+
+    if (size_changed) {
         ret = ext_inode_truncate_locked(fs, (uint32_t)inode->i_ino, &disk_inode,
                                         stat->size);
         if (ret)
             goto out;
     } else {
-        ext_inode_touch(&disk_inode, false, false, true);
+        if (!(stat->mask & STATX_CTIME))
+            ext_inode_touch(&disk_inode, false, false, true);
         ret = ext_write_inode(fs, (uint32_t)inode->i_ino, &disk_inode);
         if (ret)
             goto out;
@@ -5553,7 +5705,7 @@ static int ext_setattr(struct vfs_dentry *dentry,
     ret = ext_store_inode_locked(inode, &disk_inode, false);
 out:
     spin_unlock(&fs->lock);
-    if (!ret && !S_ISDIR(disk_inode.i_mode) && stat->size != old_size)
+    if (!ret && size_changed)
         page_cache_truncate(&inode->i_mapping, stat->size);
     return ret;
 }

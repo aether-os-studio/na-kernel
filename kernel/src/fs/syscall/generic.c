@@ -723,6 +723,7 @@ static int generic_utimens_path(const struct vfs_path *path,
                                 const struct timespec *times, bool set_atime,
                                 bool set_mtime, bool all_now) {
     struct vfs_inode *inode;
+    struct vfs_kstat stat;
     struct vfs_timespec64 now;
     int ret;
 
@@ -730,8 +731,12 @@ static int generic_utimens_path(const struct vfs_path *path,
         return 0;
     if (!path || !path->dentry || !path->dentry->d_inode)
         return -ENOENT;
-    if (path->mnt && (path->mnt->mnt_flags & VFS_MNT_READONLY))
-        return -EROFS;
+
+    /*
+     * Read-only mount enforcement must be shared by all metadata mutation
+     * paths.  Enforcing it only here made utimensat fail on paths where the
+     * same mount still allowed create, rename, and truncate operations.
+     */
 
     inode = path->dentry->d_inode;
     if (all_now) {
@@ -743,24 +748,40 @@ static int generic_utimens_path(const struct vfs_path *path,
     }
 
     now = generic_realtime_now();
-    spin_lock(&inode->i_lock);
+    vfs_fill_generic_kstat(path, &stat);
+    stat.mask = STATX_CTIME;
+    stat.ctime = now;
     if (set_atime) {
         if (!times || times[0].tv_nsec == UTIME_NOW) {
-            inode->i_atime = now;
+            stat.atime = now;
         } else {
-            inode->i_atime.sec = times[0].tv_sec;
-            inode->i_atime.nsec = (uint32_t)times[0].tv_nsec;
+            stat.atime.sec = times[0].tv_sec;
+            stat.atime.nsec = (uint32_t)times[0].tv_nsec;
         }
+        stat.mask |= STATX_ATIME;
     }
     if (set_mtime) {
         if (!times || times[1].tv_nsec == UTIME_NOW) {
-            inode->i_mtime = now;
+            stat.mtime = now;
         } else {
-            inode->i_mtime.sec = times[1].tv_sec;
-            inode->i_mtime.nsec = (uint32_t)times[1].tv_nsec;
+            stat.mtime.sec = times[1].tv_sec;
+            stat.mtime.nsec = (uint32_t)times[1].tv_nsec;
         }
+        stat.mask |= STATX_MTIME;
     }
-    inode->i_ctime = now;
+
+    if (inode->i_op && inode->i_op->setattr) {
+        ret = inode->i_op->setattr(path->dentry, &stat);
+        if (ret < 0)
+            return ret;
+    }
+
+    spin_lock(&inode->i_lock);
+    if (set_atime)
+        inode->i_atime = stat.atime;
+    if (set_mtime)
+        inode->i_mtime = stat.mtime;
+    inode->i_ctime = stat.ctime;
     spin_unlock(&inode->i_lock);
 
     notifyfs_queue_inode_event(inode, inode, NULL, IN_ATTRIB, 0);
