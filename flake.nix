@@ -1,5 +1,5 @@
 {
-  description = "Development shell for naos";
+  description = "Kernel and kernel-module development shell for na-kernel";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -90,27 +90,21 @@
               zsh
               binutils
               clang
-              cpio
               curl
-              dosfstools
-              e2fsprogs
               findutils
               git
               gnumake
               gnugrep
               gnutar
-              gptfdisk
-              gzip
-              grub2_efi
               lld
               llvm
               meson
-              mtools
               nasm
               ninja
+              openssl
               pkg-config
               perl
-              qemu
+              python3
               which
               xz
               toolchainWrappers
@@ -120,9 +114,9 @@
               export ARCH="''${ARCH:-x86_64}"
               export BUILD_MODE="''${BUILD_MODE:-release}"
 
-              echo "naos dev shell"
+              echo "na-kernel development shell"
               echo "default ARCH=$ARCH"
-              echo "host tools are available; project scripts still invoke sudo for image/rootfs steps"
+              echo "kernel and kernel-module tools are available"
               if [[ $- == *i* ]]; then
                 exec zsh
               fi

@@ -6,6 +6,40 @@ static volatile uint64_t vfs_rename_seq = 1;
 
 void vfs_ops_init(void) { spin_init(&vfs_rename_lock); }
 
+ssize_t vfs_getxattr(struct vfs_inode *inode, const char *name, void *value,
+                     size_t size) {
+    if (!inode || !name)
+        return -EINVAL;
+    if (!inode->i_op || !inode->i_op->getxattr)
+        return -EOPNOTSUPP;
+    return inode->i_op->getxattr(inode, name, value, size);
+}
+
+ssize_t vfs_listxattr(struct vfs_inode *inode, char *list, size_t size) {
+    if (!inode)
+        return -EINVAL;
+    if (!inode->i_op || !inode->i_op->listxattr)
+        return -EOPNOTSUPP;
+    return inode->i_op->listxattr(inode, list, size);
+}
+
+int vfs_setxattr(struct vfs_inode *inode, const char *name, const void *value,
+                 size_t size, int flags) {
+    if (!inode || !name)
+        return -EINVAL;
+    if (!inode->i_op || !inode->i_op->setxattr)
+        return -EOPNOTSUPP;
+    return inode->i_op->setxattr(inode, name, value, size, flags);
+}
+
+int vfs_removexattr(struct vfs_inode *inode, const char *name) {
+    if (!inode || !name)
+        return -EINVAL;
+    if (!inode->i_op || !inode->i_op->removexattr)
+        return -EOPNOTSUPP;
+    return inode->i_op->removexattr(inode, name);
+}
+
 static int vfs_may_write_dir(struct vfs_inode *dir) {
     if (!dir)
         return -ENOENT;
@@ -567,11 +601,9 @@ int vfs_do_bind_mount(int from_dfd, const char *from_pathname, int to_dfd,
     if (ret < 0)
         goto out;
 
-    mnt = vfs_create_bind_mount(&from, recursive);
-    if (!mnt) {
-        ret = -ENOMEM;
+    ret = vfs_create_bind_mount_err(&from, recursive, &mnt);
+    if (ret < 0)
         goto out;
-    }
 
     ret = vfs_reconfigure_mount(mnt, &to, true);
     if (ret < 0)

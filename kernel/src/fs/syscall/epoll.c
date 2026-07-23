@@ -65,6 +65,36 @@ static bool epoll_file_is_epoll(struct vfs_file *file) {
     return epoll_file_handle(file) != NULL;
 }
 
+static bool epoll_watch_mark_ready(epoll_watch_t *watch) {
+    epoll_t *epoll = watch ? watch->owner : NULL;
+    bool newly_ready = false;
+
+    if (!epoll || !watch)
+        return false;
+
+    spin_lock(&epoll->ready_lock);
+    if (!watch->ready_queued) {
+        llist_append(&epoll->ready_watches, &watch->ready_node);
+        watch->ready_queued = true;
+        newly_ready = true;
+    }
+    spin_unlock(&epoll->ready_lock);
+    return newly_ready;
+}
+
+static void epoll_watch_remove_ready_locked(epoll_t *epoll,
+                                            epoll_watch_t *watch) {
+    if (!epoll || !watch)
+        return;
+
+    spin_lock(&epoll->ready_lock);
+    if (watch->ready_queued) {
+        llist_delete(&watch->ready_node);
+        watch->ready_queued = false;
+    }
+    spin_unlock(&epoll->ready_lock);
+}
+
 static int epoll_watch_wake(wait_queue_entry_t *entry, uint32_t events,
                             int reason) {
     epoll_watch_t *watch;
@@ -75,6 +105,8 @@ static int epoll_watch_wake(wait_queue_entry_t *entry, uint32_t events,
         return 0;
 
     watch->last_ready_events = 0;
+    if (!epoll_watch_mark_ready(watch))
+        return 1;
 
     /*
      * The watched file changed state; the epoll file itself becomes readable
@@ -150,6 +182,7 @@ static void epoll_watch_detach_locked(epoll_watch_t *watch, bool unlink_file) {
         return;
 
     epoll_watch_disarm(watch);
+    epoll_watch_remove_ready_locked(watch->owner, watch);
     if (unlink_file)
         epoll_watch_unlink_file(watch);
     if (!llist_empty(&watch->node))
@@ -256,6 +289,87 @@ static int epoll_collect_ready_locked(epoll_t *epoll,
                                       struct vfs_poll_table *pt, bool consume) {
     int ready = 0;
     struct llist_header *node;
+
+    if (consume) {
+        struct llist_header requeue;
+        uint64_t collect_seq = ++epoll->collect_seq;
+
+        if (!collect_seq)
+            collect_seq = ++epoll->collect_seq;
+        llist_init_head(&requeue);
+        /* Notifications enqueue the affected watch. Revalidate only those
+         * watches; scanning the complete epoll set on every network event is
+         * prohibitively expensive for browser-sized descriptor sets. */
+        while (ready < maxevents) {
+            epoll_watch_t *browse;
+
+            spin_lock(&epoll->ready_lock);
+            if (llist_empty(&epoll->ready_watches)) {
+                spin_unlock(&epoll->ready_lock);
+                break;
+            }
+            node = epoll->ready_watches.next;
+            browse = list_entry(node, epoll_watch_t, ready_node);
+            if (browse->collect_seq == collect_seq) {
+                llist_delete(node);
+                llist_append(&requeue, node);
+                spin_unlock(&epoll->ready_lock);
+                continue;
+            }
+            llist_delete(node);
+            browse->ready_queued = false;
+            browse->collect_seq = collect_seq;
+            spin_unlock(&epoll->ready_lock);
+
+            if (!browse->file || browse->disabled)
+                continue;
+
+            uint32_t request_events = browse->events | EPOLL_ALWAYS_EVENTS;
+            int poll_ret =
+                vfs_poll_with_table(browse->file, request_events, pt);
+            uint32_t ready_events =
+                poll_ret < 0 ? EPOLLNVAL
+                             : epoll_reportable_events(browse->events,
+                                                       (uint32_t)poll_ret);
+
+            if (browse->edge_triggered) {
+                uint32_t changed_events =
+                    ready_events & ~browse->last_ready_events;
+                if (!changed_events) {
+                    browse->last_ready_events = ready_events;
+                    continue;
+                }
+            }
+
+            if (ready_events) {
+                events[ready].events = ready_events;
+                events[ready].data.u64 = browse->data;
+                browse->last_ready_events = ready_events;
+                ready++;
+                if (browse->one_shot)
+                    browse->disabled = true;
+                else if (!browse->edge_triggered)
+                    epoll_watch_mark_ready(browse);
+            } else {
+                browse->last_ready_events = 0;
+            }
+        }
+
+        spin_lock(&epoll->ready_lock);
+        while (!llist_empty(&requeue)) {
+            node = requeue.next;
+            llist_delete(node);
+            llist_append(&epoll->ready_watches, node);
+        }
+        spin_unlock(&epoll->ready_lock);
+        return ready;
+    }
+
+    spin_lock(&epoll->ready_lock);
+    bool has_ready = !llist_empty(&epoll->ready_watches);
+    spin_unlock(&epoll->ready_lock);
+    if (has_ready)
+        return 1;
 
     /*
      * epoll readiness is collected from the watched file objects, not from fd
@@ -486,7 +600,9 @@ static int epoll_create_handle_file(struct vfs_file **out_file,
         return -ENOMEM;
     }
     spin_init(&epoll->lock);
+    spin_init(&epoll->ready_lock);
     llist_init_head(&epoll->watches);
+    llist_init_head(&epoll->ready_watches);
 
     sb = mnt->mnt_sb;
     fsi = epollfs_sb_info(sb);
@@ -737,12 +853,14 @@ static size_t epoll_ctl_file(struct vfs_file *epoll_file, int op, int fd,
         new_watch->one_shot = (event->events & EPOLLONESHOT) != 0;
         llist_init_head(&new_watch->node);
         llist_init_head(&new_watch->file_node);
+        llist_init_head(&new_watch->ready_node);
         llist_init_head(&new_watch->wait.node);
         llist_append(&epoll->watches, &new_watch->node);
         epoll_watch_link_file(new_watch);
         epoll_watch_arm(epoll, new_watch);
         if (vfs_poll(new_watch->file, new_watch->events | EPOLL_ALWAYS_EVENTS) >
             0) {
+            epoll_watch_mark_ready(new_watch);
             vfs_poll_notify_inode(epoll->inode, EPOLLIN | EPOLLRDNORM);
         }
         break;
@@ -768,6 +886,7 @@ static size_t epoll_ctl_file(struct vfs_file *epoll_file, int op, int fd,
         existing->last_ready_events = 0;
         if (vfs_poll(existing->file, existing->events | EPOLL_ALWAYS_EVENTS) >
             0) {
+            epoll_watch_mark_ready(existing);
             vfs_poll_notify_inode(epoll->inode, EPOLLIN | EPOLLRDNORM);
         }
         break;

@@ -1165,10 +1165,11 @@ uint64_t sys_open_tree(int dfd, const char *pathname, unsigned int flags) {
     }
 
     if (flags & OPEN_TREE_CLONE) {
-        mnt = vfs_create_bind_mount(&path, (flags & AT_RECURSIVE) != 0);
-        if (!mnt) {
+        ret =
+            vfs_create_bind_mount_err(&path, (flags & AT_RECURSIVE) != 0, &mnt);
+        if (ret < 0) {
             vfs_path_put(&path);
-            return (uint64_t)-ENOMEM;
+            return (uint64_t)ret;
         }
         ret = mountfd_create_file(mnt, mnt->mnt_root, true, flags, &file);
     } else {
@@ -1340,10 +1341,12 @@ uint64_t sys_creat(const char *path, uint64_t mode) {
 
 uint64_t sys_open(const char *path, uint64_t flags, uint64_t mode) {
     char name[512];
+    uint64_t ret;
     if (copy_from_user_str(name, path, sizeof(name)))
         return (uint64_t)-EFAULT;
 
-    return do_sys_open(name, flags, mode);
+    ret = do_sys_open(name, flags, mode);
+    return ret;
 }
 
 uint64_t sys_openat(uint64_t dirfd, const char *name, uint64_t flags,
@@ -1353,10 +1356,257 @@ uint64_t sys_openat(uint64_t dirfd, const char *name, uint64_t flags,
         .mode = mode,
     };
     char name_k[512];
+    uint64_t ret;
     if (!name || copy_from_user_str(name_k, name, sizeof(name_k))) {
         return (uint64_t)-EFAULT;
     }
-    return (uint64_t)vfs_sys_openat((int)dirfd, name_k, &how);
+    ret = (uint64_t)vfs_sys_openat((int)dirfd, name_k, &how);
+    return ret;
+}
+
+#define XATTR_NAME_MAX 255u
+#define XATTR_SIZE_MAX 65536u
+#define XATTR_CREATE 0x1
+#define XATTR_REPLACE 0x2
+
+static int xattr_copy_name(char name_k[XATTR_NAME_MAX + 1], const char *name) {
+    if (!name || copy_from_user_str(name_k, name, XATTR_NAME_MAX + 1))
+        return -EFAULT;
+    if (!name_k[0])
+        return -EINVAL;
+    return 0;
+}
+
+static uint64_t xattr_get_inode(struct vfs_inode *inode, const char *name,
+                                void *value, uint64_t size) {
+    char name_k[XATTR_NAME_MAX + 1];
+    void *value_k = NULL;
+    ssize_t ret;
+    int err = xattr_copy_name(name_k, name);
+
+    if (err)
+        return (uint64_t)err;
+    if (size > XATTR_SIZE_MAX)
+        return (uint64_t)-E2BIG;
+    if (size && !value)
+        return (uint64_t)-EFAULT;
+    if (size) {
+        value_k = malloc((size_t)size);
+        if (!value_k)
+            return (uint64_t)-ENOMEM;
+    }
+
+    ret = vfs_getxattr(inode, name_k, value_k, (size_t)size);
+    if (ret > 0 && value_k && copy_to_user(value, value_k, (size_t)ret))
+        ret = -EFAULT;
+    free(value_k);
+    return (uint64_t)ret;
+}
+
+static uint64_t xattr_get_path(const char *path_user, const char *name,
+                               void *value, uint64_t size, bool follow) {
+    struct vfs_path path = {0};
+    char path_k[VFS_PATH_MAX];
+    uint64_t ret;
+
+    if (!path_user || copy_from_user_str(path_k, path_user, sizeof(path_k)))
+        return (uint64_t)-EFAULT;
+    int err = vfs_filename_lookup(
+        AT_FDCWD, path_k, follow ? LOOKUP_FOLLOW : LOOKUP_NOFOLLOW, &path);
+    if (err < 0)
+        return (uint64_t)err;
+    ret = xattr_get_inode(path.dentry->d_inode, name, value, size);
+    vfs_path_put(&path);
+    return ret;
+}
+
+uint64_t sys_getxattr(const char *path, const char *name, void *value,
+                      uint64_t size) {
+    return xattr_get_path(path, name, value, size, true);
+}
+
+uint64_t sys_lgetxattr(const char *path, const char *name, void *value,
+                       uint64_t size) {
+    return xattr_get_path(path, name, value, size, false);
+}
+
+uint64_t sys_fgetxattr(int fd, const char *name, void *value, uint64_t size) {
+    struct vfs_file *file = task_get_file(current_task, fd);
+    uint64_t ret;
+    if (!file)
+        return (uint64_t)-EBADF;
+    ret = xattr_get_inode(file->f_inode, name, value, size);
+    vfs_file_put(file);
+    return ret;
+}
+
+static uint64_t xattr_list_inode(struct vfs_inode *inode, char *list,
+                                 uint64_t size) {
+    char *list_k = NULL;
+    ssize_t ret;
+
+    if (size > XATTR_SIZE_MAX)
+        return (uint64_t)-E2BIG;
+    if (size && !list)
+        return (uint64_t)-EFAULT;
+    if (size) {
+        list_k = malloc((size_t)size);
+        if (!list_k)
+            return (uint64_t)-ENOMEM;
+    }
+    ret = vfs_listxattr(inode, list_k, (size_t)size);
+    if (ret > 0 && list_k && copy_to_user(list, list_k, (size_t)ret))
+        ret = -EFAULT;
+    free(list_k);
+    return (uint64_t)ret;
+}
+
+static uint64_t xattr_list_path(const char *path_user, char *list,
+                                uint64_t size, bool follow) {
+    struct vfs_path path = {0};
+    char path_k[VFS_PATH_MAX];
+    uint64_t ret;
+    int err;
+
+    if (!path_user || copy_from_user_str(path_k, path_user, sizeof(path_k)))
+        return (uint64_t)-EFAULT;
+    err = vfs_filename_lookup(AT_FDCWD, path_k,
+                              follow ? LOOKUP_FOLLOW : LOOKUP_NOFOLLOW, &path);
+    if (err < 0)
+        return (uint64_t)err;
+    ret = xattr_list_inode(path.dentry->d_inode, list, size);
+    vfs_path_put(&path);
+    return ret;
+}
+
+uint64_t sys_listxattr(const char *path, char *list, uint64_t size) {
+    return xattr_list_path(path, list, size, true);
+}
+
+uint64_t sys_llistxattr(const char *path, char *list, uint64_t size) {
+    return xattr_list_path(path, list, size, false);
+}
+
+uint64_t sys_flistxattr(int fd, char *list, uint64_t size) {
+    struct vfs_file *file = task_get_file(current_task, fd);
+    uint64_t ret;
+    if (!file)
+        return (uint64_t)-EBADF;
+    ret = xattr_list_inode(file->f_inode, list, size);
+    vfs_file_put(file);
+    return ret;
+}
+
+static uint64_t xattr_set_inode(struct vfs_inode *inode, const char *name,
+                                const void *value, uint64_t size, int flags) {
+    char name_k[XATTR_NAME_MAX + 1];
+    void *value_k = NULL;
+    int ret = xattr_copy_name(name_k, name);
+
+    if (ret)
+        return (uint64_t)ret;
+    if (flags & ~(XATTR_CREATE | XATTR_REPLACE))
+        return (uint64_t)-EINVAL;
+    if (size > XATTR_SIZE_MAX)
+        return (uint64_t)-E2BIG;
+    if (size && !value)
+        return (uint64_t)-EFAULT;
+    if (size) {
+        value_k = malloc((size_t)size);
+        if (!value_k)
+            return (uint64_t)-ENOMEM;
+        if (copy_from_user(value_k, value, (size_t)size)) {
+            free(value_k);
+            return (uint64_t)-EFAULT;
+        }
+    }
+    ret = vfs_setxattr(inode, name_k, value_k, (size_t)size, flags);
+    free(value_k);
+    return (uint64_t)ret;
+}
+
+static uint64_t xattr_set_path(const char *path_user, const char *name,
+                               const void *value, uint64_t size, int flags,
+                               bool follow) {
+    struct vfs_path path = {0};
+    char path_k[VFS_PATH_MAX];
+    uint64_t ret;
+    int err;
+
+    if (!path_user || copy_from_user_str(path_k, path_user, sizeof(path_k)))
+        return (uint64_t)-EFAULT;
+    err = vfs_filename_lookup(AT_FDCWD, path_k,
+                              follow ? LOOKUP_FOLLOW : LOOKUP_NOFOLLOW, &path);
+    if (err < 0)
+        return (uint64_t)err;
+    ret = xattr_set_inode(path.dentry->d_inode, name, value, size, flags);
+    vfs_path_put(&path);
+    return ret;
+}
+
+uint64_t sys_setxattr(const char *path, const char *name, const void *value,
+                      uint64_t size, int flags) {
+    return xattr_set_path(path, name, value, size, flags, true);
+}
+
+uint64_t sys_lsetxattr(const char *path, const char *name, const void *value,
+                       uint64_t size, int flags) {
+    return xattr_set_path(path, name, value, size, flags, false);
+}
+
+uint64_t sys_fsetxattr(int fd, const char *name, const void *value,
+                       uint64_t size, int flags) {
+    struct vfs_file *file = task_get_file(current_task, fd);
+    uint64_t ret;
+    if (!file)
+        return (uint64_t)-EBADF;
+    ret = xattr_set_inode(file->f_inode, name, value, size, flags);
+    vfs_file_put(file);
+    return ret;
+}
+
+static uint64_t xattr_remove_inode(struct vfs_inode *inode, const char *name) {
+    char name_k[XATTR_NAME_MAX + 1];
+    int ret = xattr_copy_name(name_k, name);
+    if (ret)
+        return (uint64_t)ret;
+    return (uint64_t)vfs_removexattr(inode, name_k);
+}
+
+static uint64_t xattr_remove_path(const char *path_user, const char *name,
+                                  bool follow) {
+    struct vfs_path path = {0};
+    char path_k[VFS_PATH_MAX];
+    uint64_t ret;
+    int err;
+
+    if (!path_user || copy_from_user_str(path_k, path_user, sizeof(path_k)))
+        return (uint64_t)-EFAULT;
+    err = vfs_filename_lookup(AT_FDCWD, path_k,
+                              follow ? LOOKUP_FOLLOW : LOOKUP_NOFOLLOW, &path);
+    if (err < 0)
+        return (uint64_t)err;
+    ret = xattr_remove_inode(path.dentry->d_inode, name);
+    vfs_path_put(&path);
+    return ret;
+}
+
+uint64_t sys_removexattr(const char *path, const char *name) {
+    return xattr_remove_path(path, name, true);
+}
+
+uint64_t sys_lremovexattr(const char *path, const char *name) {
+    return xattr_remove_path(path, name, false);
+}
+
+uint64_t sys_fremovexattr(int fd, const char *name) {
+    struct vfs_file *file = task_get_file(current_task, fd);
+    uint64_t ret;
+    if (!file)
+        return (uint64_t)-EBADF;
+    ret = xattr_remove_inode(file->f_inode, name);
+    vfs_file_put(file);
+    return ret;
 }
 
 static int openat2_copy_how_from_user(struct vfs_open_how *how,
@@ -1667,6 +1917,74 @@ uint64_t sys_fdatasync(uint64_t fd) {
     ret = vfs_fsync_file_range(file, 0, (loff_t)file->f_inode->i_size, 1);
     vfs_file_put(file);
     return ret < 0 ? (uint64_t)ret : 0;
+}
+
+uint64_t sys_syncfs(int fd) {
+    struct vfs_file *file;
+    struct vfs_super_block *sb;
+    struct vfs_inode *inode, *tmp;
+    struct vfs_inode **inodes = NULL;
+    size_t capacity = 0;
+    size_t count = 0;
+    size_t i;
+    int first_error = 0;
+
+    file = task_get_file(current_task, fd);
+    if (!file)
+        return (uint64_t)-EBADF;
+    sb = file->f_path.mnt ? file->f_path.mnt->mnt_sb
+                          : (file->f_inode ? file->f_inode->i_sb : NULL);
+    if (!sb) {
+        vfs_file_put(file);
+        return (uint64_t)-EINVAL;
+    }
+    if (!vfs_get_super(sb)) {
+        vfs_file_put(file);
+        return (uint64_t)-EIO;
+    }
+    vfs_file_put(file);
+
+    spin_lock(&sb->s_inode_lock);
+    llist_for_each(inode, tmp, &sb->s_inodes, i_sb_list) { capacity++; }
+    spin_unlock(&sb->s_inode_lock);
+
+    if (capacity) {
+        inodes = calloc(capacity, sizeof(*inodes));
+        if (!inodes) {
+            vfs_put_super(sb);
+            return (uint64_t)-ENOMEM;
+        }
+
+        spin_lock(&sb->s_inode_lock);
+        llist_for_each(inode, tmp, &sb->s_inodes, i_sb_list) {
+            if (count >= capacity)
+                break;
+            inodes[count] = vfs_igrab(inode);
+            if (inodes[count])
+                count++;
+        }
+        spin_unlock(&sb->s_inode_lock);
+    }
+
+    for (i = 0; i < count; ++i) {
+        int ret = 0;
+
+        if (inodes[i]->i_mapping.dirty_pages)
+            ret = page_cache_writeback_range(&inodes[i]->i_mapping, 0,
+                                             UINT64_MAX, false);
+        if (ret < 0 && first_error == 0)
+            first_error = ret;
+        vfs_iput(inodes[i]);
+    }
+    free(inodes);
+
+    if (sb->s_op && sb->s_op->sync_fs) {
+        int ret = sb->s_op->sync_fs(sb, 1);
+        if (ret < 0 && first_error == 0)
+            first_error = ret;
+    }
+    vfs_put_super(sb);
+    return first_error < 0 ? (uint64_t)first_error : 0;
 }
 
 uint64_t sys_close(uint64_t fd) {
@@ -3976,11 +4294,20 @@ uint64_t sys_fchmodat2(int dfd, const char *name_user, uint16_t mode,
     struct vfs_path path = {0};
     int ret;
     char name[512];
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+        return (uint64_t)-EINVAL;
     if (copy_from_user_str(name, name_user, sizeof(name)))
         return (uint64_t)-EFAULT;
-    ret = vfs_filename_lookup(
-        dfd, name,
-        (flags & AT_SYMLINK_NOFOLLOW) ? LOOKUP_NOFOLLOW : LOOKUP_FOLLOW, &path);
+    if (name[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH))
+            return (uint64_t)-ENOENT;
+        ret = generic_get_fd_path(dfd, &path);
+    } else {
+        ret = vfs_filename_lookup(
+            dfd, name,
+            (flags & AT_SYMLINK_NOFOLLOW) ? LOOKUP_NOFOLLOW : LOOKUP_FOLLOW,
+            &path);
+    }
     if (ret < 0)
         return (uint64_t)ret;
     ret = generic_setattr_path(&path, true, mode, false, 0, false, 0, false, 0);
@@ -4017,11 +4344,20 @@ uint64_t sys_fchownat(int dfd, const char *name_user, uint64_t uid,
     struct vfs_path path = {0};
     int ret;
     char name[512];
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH))
+        return (uint64_t)-EINVAL;
     if (copy_from_user_str(name, name_user, sizeof(name)))
         return (uint64_t)-EFAULT;
-    ret = vfs_filename_lookup(
-        dfd, name,
-        (flags & AT_SYMLINK_NOFOLLOW) ? LOOKUP_NOFOLLOW : LOOKUP_FOLLOW, &path);
+    if (name[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH))
+            return (uint64_t)-ENOENT;
+        ret = generic_get_fd_path(dfd, &path);
+    } else {
+        ret = vfs_filename_lookup(
+            dfd, name,
+            (flags & AT_SYMLINK_NOFOLLOW) ? LOOKUP_NOFOLLOW : LOOKUP_FOLLOW,
+            &path);
+    }
     if (ret < 0)
         return (uint64_t)ret;
     ret = generic_chown_path(&path, uid, gid);

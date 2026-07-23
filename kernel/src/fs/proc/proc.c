@@ -968,8 +968,15 @@ static ssize_t procfs_read(struct vfs_file *file, void *addr, size_t count,
         return -EINVAL;
     ssize_t ret =
         (ssize_t)procfs_read_dispatch(&handle, addr, (size_t)*ppos, count);
-    if (ret > 0)
+    if (ret > 0) {
         *ppos += (loff_t)ret;
+        if (procfs_dispatch_is_mount_watch(info->dispatch_name)) {
+            procfs_mount_watch_state_t *state =
+                (procfs_mount_watch_state_t *)file->private_data;
+            if (state)
+                state->seen_seq = vfs_mount_seq_read();
+        }
+    }
     return ret;
 }
 
@@ -1323,8 +1330,7 @@ static __poll_t procfs_poll_file(struct vfs_file *file,
         if (state->seen_seq == seq)
             return 0;
 
-        state->seen_seq = seq;
-        return EPOLLPRI;
+        return EPOLLERR | EPOLLPRI;
     }
 
     procfs_fill_handle(&handle, file->f_inode);
@@ -1763,7 +1769,7 @@ static int procfs_notify_mount_change(void) {
 
     spin_lock(&procfs_mount_watch_lock);
     llist_for_each(info, tmp, &procfs_mount_watch_list, mount_watch_node) {
-        vfs_poll_notify_inode(&info->vfs_inode, EPOLLPRI);
+        vfs_poll_notify_inode(&info->vfs_inode, EPOLLERR | EPOLLPRI);
     }
     spin_unlock(&procfs_mount_watch_lock);
     return 0;

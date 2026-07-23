@@ -271,21 +271,27 @@ __attribute__((__packed__))
 typedef struct epoll_watch {
     struct llist_header node;
     struct llist_header file_node;
+    struct llist_header ready_node;
     struct vfs_file *file;
     struct epoll *owner;
     wait_queue_entry_t wait;
     bool wait_armed;
     uint32_t events;
     uint32_t last_ready_events;
+    uint64_t collect_seq;
     uint64_t data;
     bool edge_triggered;
     bool one_shot;
     bool disabled;
+    bool ready_queued;
 } epoll_watch_t;
 
 typedef struct epoll {
     struct llist_header watches;
+    struct llist_header ready_watches;
     spinlock_t lock;
+    spinlock_t ready_lock;
+    uint64_t collect_seq;
     struct vfs_inode *inode;
 } epoll_t;
 
@@ -387,6 +393,9 @@ enum fsconfig_command {
 /* fsopen/fspick flags */
 #define FSOPEN_CLOEXEC 0x00000001
 #define FSPICK_CLOEXEC 0x00000001
+#define FSPICK_SYMLINK_NOFOLLOW 0x00000002
+#define FSPICK_NO_AUTOMOUNT 0x00000004
+#define FSPICK_EMPTY_PATH 0x00000008
 
 /* FSMOUNT flags */
 #define FSMOUNT_CLOEXEC 0x00000001
@@ -508,6 +517,24 @@ uint64_t sys_open(const char *name, uint64_t flags, uint64_t mode);
  */
 uint64_t sys_openat(uint64_t dirfd, const char *name, uint64_t flags,
                     uint64_t mode);
+uint64_t sys_getxattr(const char *path, const char *name, void *value,
+                      uint64_t size);
+uint64_t sys_lgetxattr(const char *path, const char *name, void *value,
+                       uint64_t size);
+uint64_t sys_fgetxattr(int fd, const char *name, void *value, uint64_t size);
+uint64_t sys_setxattr(const char *path, const char *name, const void *value,
+                      uint64_t size, int flags);
+uint64_t sys_lsetxattr(const char *path, const char *name, const void *value,
+                       uint64_t size, int flags);
+uint64_t sys_fsetxattr(int fd, const char *name, const void *value,
+                       uint64_t size, int flags);
+uint64_t sys_listxattr(const char *path, char *list, uint64_t size);
+uint64_t sys_llistxattr(const char *path, char *list, uint64_t size);
+uint64_t sys_flistxattr(int fd, char *list, uint64_t size);
+uint64_t sys_removexattr(const char *path, const char *name);
+uint64_t sys_lremovexattr(const char *path, const char *name);
+uint64_t sys_fremovexattr(int fd, const char *name);
+
 /**
  * Linux contract: open a path using openat2(2) resolution semantics.
  * Current kernel: consumes the supplied vfs_open_how structure through the
@@ -570,6 +597,7 @@ uint64_t sys_inotify_rm_watch(uint64_t watchfd, uint64_t wd);
  * implementation.
  */
 uint64_t sys_fsync(uint64_t fd);
+uint64_t sys_syncfs(int fd);
 uint64_t sys_fdatasync(uint64_t fd);
 uint64_t sys_readahead(int fd, uint64_t offset, uint64_t count);
 /**
@@ -1171,6 +1199,7 @@ uint64_t sys_memfd_create(const char *name, unsigned int flags);
  * VFS.
  */
 uint64_t sys_fsopen(const char *fsname, unsigned int flags);
+uint64_t sys_fspick(int dfd, const char *path, unsigned int flags);
 /**
  * Linux contract: open a mount tree or detached mount fd.
  * Current kernel: supports OPEN_TREE_CLONE, AT_EMPTY_PATH,

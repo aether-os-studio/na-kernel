@@ -342,6 +342,7 @@ static struct vfs_inode *tmpfs_new_inode(struct vfs_super_block *sb,
 
     spin_init(&info->lock);
     llist_init_head(&info->children);
+    llist_init_head(&info->xattrs);
     inode->i_ino = tmpfs_next_ino(sb);
     vfs_inode_init_owner(inode, dir, mode);
     inode->inode = inode->i_ino;
@@ -664,6 +665,138 @@ static int tmpfs_permission(struct vfs_inode *inode, int mask) {
     return vfs_inode_permission(inode, mask);
 }
 
+static tmpfs_xattr_t *tmpfs_find_xattr_locked(tmpfs_inode_info_t *info,
+                                              const char *name) {
+    tmpfs_xattr_t *xattr, *tmp;
+    llist_for_each(xattr, tmp, &info->xattrs, node) {
+        if (!strcmp(xattr->name, name))
+            return xattr;
+    }
+    return NULL;
+}
+
+static ssize_t tmpfs_getxattr(struct vfs_inode *inode, const char *name,
+                              void *value, size_t size) {
+    tmpfs_inode_info_t *info = tmpfs_i(inode);
+    tmpfs_xattr_t *xattr;
+    ssize_t ret;
+    if (!info || !name)
+        return -EINVAL;
+    spin_lock(&info->lock);
+    xattr = tmpfs_find_xattr_locked(info, name);
+    if (!xattr)
+        ret = -ENODATA;
+    else if (size && size < xattr->size)
+        ret = -ERANGE;
+    else {
+        if (value && xattr->size)
+            memcpy(value, xattr->value, xattr->size);
+        ret = (ssize_t)xattr->size;
+    }
+    spin_unlock(&info->lock);
+    return ret;
+}
+
+static ssize_t tmpfs_listxattr(struct vfs_inode *inode, char *list,
+                               size_t size) {
+    tmpfs_inode_info_t *info = tmpfs_i(inode);
+    tmpfs_xattr_t *xattr, *tmp;
+    size_t total = 0;
+    ssize_t ret;
+    if (!info)
+        return -EINVAL;
+    spin_lock(&info->lock);
+    llist_for_each(xattr, tmp, &info->xattrs, node) {
+        size_t len = strlen(xattr->name) + 1;
+        if (size && total + len > size) {
+            ret = -ERANGE;
+            goto out;
+        }
+        if (list)
+            memcpy(list + total, xattr->name, len);
+        total += len;
+    }
+    ret = (ssize_t)total;
+out:
+    spin_unlock(&info->lock);
+    return ret;
+}
+
+static int tmpfs_setxattr(struct vfs_inode *inode, const char *name,
+                          const void *value, size_t size, int flags) {
+    tmpfs_inode_info_t *info = tmpfs_i(inode);
+    tmpfs_xattr_t *xattr;
+    void *new_value = NULL;
+    if (!info || !name || (size && !value))
+        return -EINVAL;
+    if (vfs_current_fsuid() != 0 && vfs_current_fsuid() != inode->i_uid)
+        return -EPERM;
+    if (size) {
+        new_value = malloc(size);
+        if (!new_value)
+            return -ENOMEM;
+        memcpy(new_value, value, size);
+    }
+    spin_lock(&info->lock);
+    xattr = tmpfs_find_xattr_locked(info, name);
+    if ((flags & 1) && xattr) {
+        spin_unlock(&info->lock);
+        free(new_value);
+        return -EEXIST;
+    }
+    if ((flags & 2) && !xattr) {
+        spin_unlock(&info->lock);
+        free(new_value);
+        return -ENODATA;
+    }
+    if (!xattr) {
+        xattr = calloc(1, sizeof(*xattr));
+        if (!xattr) {
+            spin_unlock(&info->lock);
+            free(new_value);
+            return -ENOMEM;
+        }
+        xattr->name = strdup(name);
+        if (!xattr->name) {
+            spin_unlock(&info->lock);
+            free(xattr);
+            free(new_value);
+            return -ENOMEM;
+        }
+        llist_append(&info->xattrs, &xattr->node);
+    }
+    free(xattr->value);
+    xattr->value = new_value;
+    xattr->size = size;
+    inode->i_ctime.sec = (int64_t)(nano_time() / 1000000000ULL);
+    inode->i_version++;
+    spin_unlock(&info->lock);
+    return 0;
+}
+
+static int tmpfs_removexattr(struct vfs_inode *inode, const char *name) {
+    tmpfs_inode_info_t *info = tmpfs_i(inode);
+    tmpfs_xattr_t *xattr;
+    if (!info || !name)
+        return -EINVAL;
+    if (vfs_current_fsuid() != 0 && vfs_current_fsuid() != inode->i_uid)
+        return -EPERM;
+    spin_lock(&info->lock);
+    xattr = tmpfs_find_xattr_locked(info, name);
+    if (!xattr) {
+        spin_unlock(&info->lock);
+        return -ENODATA;
+    }
+    llist_delete(&xattr->node);
+    spin_unlock(&info->lock);
+    free(xattr->name);
+    free(xattr->value);
+    free(xattr);
+    inode->i_ctime.sec = (int64_t)(nano_time() / 1000000000ULL);
+    inode->i_version++;
+    return 0;
+}
+
 static int tmpfs_getattr(const struct vfs_path *path, struct vfs_kstat *stat,
                          uint32_t request_mask, unsigned int flags) {
     (void)request_mask;
@@ -890,6 +1023,7 @@ static void tmpfs_destroy_inode(struct vfs_inode *inode) {
 static void tmpfs_evict_inode(struct vfs_inode *inode) {
     tmpfs_inode_info_t *info = tmpfs_i(inode);
     tmpfs_dirent_t *de, *tmp;
+    tmpfs_xattr_t *xattr, *xattr_tmp;
 
     if (!info)
         return;
@@ -903,6 +1037,12 @@ static void tmpfs_evict_inode(struct vfs_inode *inode) {
     llist_for_each(de, tmp, &info->children, node) {
         llist_delete(&de->node);
         tmpfs_free_dirent(de);
+    }
+    llist_for_each(xattr, xattr_tmp, &info->xattrs, node) {
+        llist_delete(&xattr->node);
+        free(xattr->name);
+        free(xattr->value);
+        free(xattr);
     }
     spin_unlock(&info->lock);
 
@@ -1060,6 +1200,10 @@ static const struct vfs_inode_operations tmpfs_inode_ops = {
     .getattr = tmpfs_getattr,
     .setattr = tmpfs_setattr,
     .tmpfile = tmpfs_tmpfile,
+    .getxattr = tmpfs_getxattr,
+    .listxattr = tmpfs_listxattr,
+    .setxattr = tmpfs_setxattr,
+    .removexattr = tmpfs_removexattr,
 };
 
 static struct vfs_file_system_type tmpfs_fs_type = {

@@ -17,6 +17,8 @@ vfs_find_mount_child_by_source(struct vfs_mount *parent,
                                const struct vfs_mount *src_child);
 struct vfs_mount *vfs_create_bind_mount(const struct vfs_path *from,
                                         bool recursive);
+int vfs_create_bind_mount_err(const struct vfs_path *from, bool recursive,
+                              struct vfs_mount **out);
 
 int vfs_get_fs_start(int dfd, const char *name, unsigned int lookup_flags,
                      struct vfs_path *start, struct vfs_path *root);

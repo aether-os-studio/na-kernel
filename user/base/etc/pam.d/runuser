@@ -1,5 +1,0 @@
-#%PAM-1.0
-
-auth      sufficient pam_rootok.so
-account   include    system-login
-session   include    system-login

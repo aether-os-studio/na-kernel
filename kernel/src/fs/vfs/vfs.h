@@ -392,6 +392,12 @@ struct vfs_inode_operations {
                        struct vfs_file *file, unsigned int open_flags,
                        umode_t mode);
     int (*tmpfile)(struct vfs_inode *dir, struct vfs_file *file, umode_t mode);
+    ssize_t (*getxattr)(struct vfs_inode *inode, const char *name, void *value,
+                        size_t size);
+    ssize_t (*listxattr)(struct vfs_inode *inode, char *list, size_t size);
+    int (*setxattr)(struct vfs_inode *inode, const char *name,
+                    const void *value, size_t size, int flags);
+    int (*removexattr)(struct vfs_inode *inode, const char *name);
 };
 
 /**
@@ -815,6 +821,8 @@ int vfs_mount_attach(struct vfs_mount *parent, struct vfs_dentry *mountpoint,
 void vfs_mount_detach(struct vfs_mount *mnt);
 struct vfs_mount *vfs_create_bind_mount(const struct vfs_path *from,
                                         bool recursive);
+int vfs_create_bind_mount_err(const struct vfs_path *from, bool recursive,
+                              struct vfs_mount **out);
 struct vfs_mount *vfs_clone_mount_tree(struct vfs_mount *root);
 struct vfs_mount *vfs_clone_visible_mount_tree(const struct vfs_path *from);
 void vfs_put_mount_tree(struct vfs_mount *root);
@@ -955,6 +963,12 @@ int vfs_renameat2(int olddfd, const char *oldname, int newdfd,
                   const char *newname, unsigned int flags, bool kernel);
 int vfs_statx(int dfd, const char *pathname, int flags, uint32_t mask,
               struct vfs_kstat *stat);
+ssize_t vfs_getxattr(struct vfs_inode *inode, const char *name, void *value,
+                     size_t size);
+ssize_t vfs_listxattr(struct vfs_inode *inode, char *list, size_t size);
+int vfs_setxattr(struct vfs_inode *inode, const char *name, const void *value,
+                 size_t size, int flags);
+int vfs_removexattr(struct vfs_inode *inode, const char *name);
 
 /**
  * Internal mount helper used by kernel subsystems to mount a filesystem by

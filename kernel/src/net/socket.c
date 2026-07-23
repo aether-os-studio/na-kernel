@@ -2177,10 +2177,12 @@ int socket_bind(uint64_t fd, const struct sockaddr_un *addr,
 }
 
 int socket_listen(uint64_t fd, int backlog) {
+    const int somaxconn = 4096;
+
     if (backlog == 0)
         backlog = 16;
-    if (backlog < 0)
-        backlog = 0;
+    else if (backlog < 0 || backlog > somaxconn)
+        backlog = somaxconn;
 
     fd_t *file = task_get_file(current_task, (int)fd);
     if (!file)

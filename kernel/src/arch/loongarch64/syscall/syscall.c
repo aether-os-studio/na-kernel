@@ -382,6 +382,20 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_FSYNC, (syscall_handle_t)sys_fsync);
     regist_syscall_handler(SYS_FDATASYNC, (syscall_handle_t)sys_fdatasync);
     regist_syscall_handler(SYS_READAHEAD, (syscall_handle_t)sys_readahead);
+    regist_syscall_handler(SYS_SETXATTR, (syscall_handle_t)sys_setxattr);
+    regist_syscall_handler(SYS_LSETXATTR, (syscall_handle_t)sys_lsetxattr);
+    regist_syscall_handler(SYS_FSETXATTR, (syscall_handle_t)sys_fsetxattr);
+    regist_syscall_handler(SYS_GETXATTR, (syscall_handle_t)sys_getxattr);
+    regist_syscall_handler(SYS_LGETXATTR, (syscall_handle_t)sys_lgetxattr);
+    regist_syscall_handler(SYS_FGETXATTR, (syscall_handle_t)sys_fgetxattr);
+    regist_syscall_handler(SYS_LISTXATTR, (syscall_handle_t)sys_listxattr);
+    regist_syscall_handler(SYS_LLISTXATTR, (syscall_handle_t)sys_llistxattr);
+    regist_syscall_handler(SYS_FLISTXATTR, (syscall_handle_t)sys_flistxattr);
+    regist_syscall_handler(SYS_REMOVEXATTR, (syscall_handle_t)sys_removexattr);
+    regist_syscall_handler(SYS_LREMOVEXATTR,
+                           (syscall_handle_t)sys_lremovexattr);
+    regist_syscall_handler(SYS_FREMOVEXATTR,
+                           (syscall_handle_t)sys_fremovexattr);
     regist_syscall_handler(SYS_TRUNCATE, (syscall_handle_t)sys_truncate);
     regist_syscall_handler(SYS_FTRUNCATE, (syscall_handle_t)sys_ftruncate);
     regist_syscall_handler(SYS_GETDENTS64, (syscall_handle_t)sys_getdents64);
@@ -542,6 +556,7 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_KEYCTL, (syscall_handle_t)sys_keyctl);
     regist_syscall_handler(SYS_MEMFD_CREATE,
                            (syscall_handle_t)sys_memfd_create);
+    regist_syscall_handler(SYS_SYNCFS, (syscall_handle_t)sys_syncfs);
     regist_syscall_handler(SYS_EXECVEAT, (syscall_handle_t)sys_execveat);
     regist_syscall_handler(SYS_MEMBARRIER, (syscall_handle_t)sys_membarrier);
     regist_syscall_handler(SYS_COPY_FILE_RANGE,
@@ -555,6 +570,7 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_FSOPEN, (syscall_handle_t)sys_fsopen);
     regist_syscall_handler(SYS_FSCONFIG, (syscall_handle_t)sys_fsconfig);
     regist_syscall_handler(SYS_FSMOUNT, (syscall_handle_t)sys_fsmount);
+    regist_syscall_handler(SYS_FSPICK, (syscall_handle_t)sys_fspick);
     regist_syscall_handler(SYS_PIDFD_OPEN, (syscall_handle_t)sys_pidfd_open);
     regist_syscall_handler(SYS_CLONE3, (syscall_handle_t)sys_clone3);
     regist_syscall_handler(SYS_CLOSE_RANGE, (syscall_handle_t)sys_close_range);

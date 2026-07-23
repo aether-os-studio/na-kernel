@@ -28,6 +28,7 @@ typedef struct fs_context {
     char *data;
     uint64_t mount_flags;
     uint64_t attr_flags;
+    struct vfs_mount *reconfigure_mnt;
     int state;
 } fs_context_t;
 
@@ -126,6 +127,8 @@ static void fsfd_destroy_object(void *ptr) {
 
         free(ctx->source);
         free(ctx->data);
+        if (ctx->reconfigure_mnt)
+            vfs_mntput(ctx->reconfigure_mnt);
         free(ctx);
         return;
     }
@@ -609,10 +612,33 @@ static int fsconfig_cmd_create(fs_context_t *ctx) {
 }
 
 static int fsconfig_cmd_reconfigure(fs_context_t *ctx) {
+    unsigned long preserved_flags;
+    unsigned long new_flags = 0;
+
     if (!ctx)
         return -EINVAL;
     if (ctx->state != FC_STATE_CREATED && ctx->state != FC_STATE_MOUNTED)
         return -EINVAL;
+    if (!ctx->reconfigure_mnt)
+        return 0;
+
+    if (ctx->mount_flags & MS_RDONLY)
+        new_flags |= VFS_MNT_READONLY;
+    if (ctx->mount_flags & MS_NOSUID)
+        new_flags |= VFS_MNT_NOSUID;
+    if (ctx->mount_flags & MS_NODEV)
+        new_flags |= VFS_MNT_NODEV;
+    if (ctx->mount_flags & MS_NOEXEC)
+        new_flags |= VFS_MNT_NOEXEC;
+    if (ctx->mount_flags & MS_NOSYMFOLLOW)
+        new_flags |= VFS_MNT_NOSYMFOLLOW;
+
+    spin_lock(&ctx->reconfigure_mnt->mnt_lock);
+    preserved_flags = ctx->reconfigure_mnt->mnt_flags &
+                      ~(VFS_MNT_READONLY | VFS_MNT_NOSUID | VFS_MNT_NODEV |
+                        VFS_MNT_NOEXEC | VFS_MNT_NOSYMFOLLOW);
+    ctx->reconfigure_mnt->mnt_flags = preserved_flags | new_flags;
+    spin_unlock(&ctx->reconfigure_mnt->mnt_lock);
     return 0;
 }
 
@@ -631,6 +657,23 @@ static void fsconfig_note_parameter_update(fs_context_t *ctx) {
 
 static struct vfs_mount *fsfd_path_mount(const struct vfs_path *path) {
     return vfs_path_mount(path);
+}
+
+static int fsfd_get_fd_path(int fd, struct vfs_path *path) {
+    struct vfs_file *file;
+
+    if (!path)
+        return -EINVAL;
+    file = task_get_file(current_task, fd);
+    if (!file)
+        return -EBADF;
+    memset(path, 0, sizeof(*path));
+    if (!vfs_path_copy(path, &file->f_path)) {
+        vfs_file_put(file);
+        return -ENOENT;
+    }
+    vfs_file_put(file);
+    return 0;
 }
 
 uint64_t sys_fsopen(const char *fsname_user, unsigned int flags) {
@@ -665,6 +708,78 @@ uint64_t sys_fsopen(const char *fsname_user, unsigned int flags) {
 
     ret = task_install_file(current_task, file,
                             (flags & FSOPEN_CLOEXEC) ? FD_CLOEXEC : 0, 0);
+    vfs_file_put(file);
+    return (uint64_t)ret;
+}
+
+uint64_t sys_fspick(int dfd, const char *path_user, unsigned int flags) {
+    static const unsigned int allowed_flags =
+        FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT |
+        FSPICK_EMPTY_PATH;
+    struct vfs_path path = {0};
+    struct vfs_mount *mnt = NULL;
+    struct vfs_file *file = NULL;
+    fs_context_t *ctx = NULL;
+    char pathname[VFS_PATH_MAX];
+    int ret;
+
+    if (flags & ~allowed_flags)
+        return (uint64_t)-EINVAL;
+    if (!path_user)
+        return (uint64_t)-EFAULT;
+    if (copy_from_user_str(pathname, path_user, sizeof(pathname)))
+        return (uint64_t)-EFAULT;
+
+    if (pathname[0] == '\0') {
+        if (!(flags & FSPICK_EMPTY_PATH))
+            return (uint64_t)-ENOENT;
+        ret = fsfd_get_fd_path(dfd, &path);
+    } else {
+        ret = vfs_filename_lookup(
+            dfd, pathname,
+            (flags & FSPICK_SYMLINK_NOFOLLOW) ? LOOKUP_NOFOLLOW : LOOKUP_FOLLOW,
+            &path);
+    }
+    if (ret < 0)
+        return (uint64_t)ret;
+
+    mnt = fsfd_path_mount(&path);
+    if (!mnt && path.mnt)
+        mnt = vfs_mntget(path.mnt);
+    vfs_path_put(&path);
+    if (!mnt || !mnt->mnt_sb || !mnt->mnt_sb->s_type) {
+        if (mnt)
+            vfs_mntput(mnt);
+        return (uint64_t)-EINVAL;
+    }
+
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        vfs_mntput(mnt);
+        return (uint64_t)-ENOMEM;
+    }
+    ctx->object.kind = FSFD_OBJECT_CONTEXT;
+    ctx->fs_type = mnt->mnt_sb->s_type;
+    ctx->reconfigure_mnt = mnt;
+    ctx->state = FC_STATE_CREATED;
+    if (mnt->mnt_flags & VFS_MNT_READONLY)
+        ctx->mount_flags |= MS_RDONLY;
+    if (mnt->mnt_flags & VFS_MNT_NOSUID)
+        ctx->mount_flags |= MS_NOSUID;
+    if (mnt->mnt_flags & VFS_MNT_NODEV)
+        ctx->mount_flags |= MS_NODEV;
+    if (mnt->mnt_flags & VFS_MNT_NOEXEC)
+        ctx->mount_flags |= MS_NOEXEC;
+    if (mnt->mnt_flags & VFS_MNT_NOSYMFOLLOW)
+        ctx->mount_flags |= MS_NOSYMFOLLOW;
+
+    ret = fsfdfs_create_file("fspick", &fsfdfs_ctx_file_ops, ctx, &file);
+    if (ret < 0) {
+        fsfd_destroy_object(ctx);
+        return (uint64_t)ret;
+    }
+    ret = task_install_file(current_task, file,
+                            (flags & FSPICK_CLOEXEC) ? FD_CLOEXEC : 0, 0);
     vfs_file_put(file);
     return (uint64_t)ret;
 }

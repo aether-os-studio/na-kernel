@@ -62,6 +62,13 @@ typedef struct ext_inode_info {
     char *symlink;
 } ext_inode_info_t;
 
+typedef struct ext_xattr_record {
+    uint8_t index;
+    char *name;
+    uint8_t *value;
+    uint32_t size;
+} ext_xattr_record_t;
+
 typedef struct ext_quota_header {
     uint32_t dqh_magic;
     uint32_t dqh_version;
@@ -129,6 +136,9 @@ static int ext_read_inode(ext_mount_ctx_t *fs, uint32_t ino,
                           ext_inode_disk_t *inode);
 static int ext_write_inode(ext_mount_ctx_t *fs, uint32_t ino,
                            const ext_inode_disk_t *inode);
+static int ext_alloc_block_locked(ext_mount_ctx_t *fs, uint32_t prefer_group,
+                                  uint64_t *out_block);
+static int ext_free_block_locked(ext_mount_ctx_t *fs, uint64_t block);
 static int ext_write_group_desc(ext_mount_ctx_t *fs, uint32_t group);
 static int ext_inode_get_block_locked(ext_mount_ctx_t *fs, uint32_t ino,
                                       ext_inode_disk_t *inode,
@@ -1421,6 +1431,426 @@ static int ext_write_inode_zeroed(ext_mount_ctx_t *fs, uint32_t ino,
     ext_inode_checksum_set(fs, ino, raw);
     ret = ext_dev_write(fs, offset, raw, fs->inode_size);
     free(raw);
+    return ret;
+}
+
+static uint64_t ext_inode_xattr_block(const ext_inode_disk_t *inode) {
+    return (uint64_t)inode->i_file_acl_lo |
+           ((uint64_t)inode->i_file_acl_high << 32);
+}
+
+static void ext_inode_xattr_block_set(ext_inode_disk_t *inode, uint64_t block) {
+    inode->i_file_acl_lo = (uint32_t)block;
+    inode->i_file_acl_high = (uint16_t)(block >> 32);
+}
+
+static int ext_read_inode_raw(ext_mount_ctx_t *fs, uint32_t ino,
+                              uint8_t **out) {
+    uint64_t offset;
+    uint8_t *raw;
+    int ret;
+
+    if (!fs || !out || !ino || ino > fs->inodes_count)
+        return -EINVAL;
+    ret = ext_inode_offset(fs, ino, &offset);
+    if (ret)
+        return ret;
+    raw = calloc(1, fs->inode_size);
+    if (!raw)
+        return -ENOMEM;
+    ret = ext_dev_read(fs, offset, raw, fs->inode_size);
+    if (ret) {
+        free(raw);
+        return ret;
+    }
+    *out = raw;
+    return 0;
+}
+
+static int ext_write_inode_raw(ext_mount_ctx_t *fs, uint32_t ino,
+                               uint8_t *raw) {
+    uint64_t offset;
+    int ret;
+
+    if (!fs || !raw || !ino || ino > fs->inodes_count)
+        return -EINVAL;
+    ret = ext_inode_offset(fs, ino, &offset);
+    if (ret)
+        return ret;
+    ext_inode_checksum_set(fs, ino, raw);
+    return ext_dev_write(fs, offset, raw, fs->inode_size);
+}
+
+static const char *ext_xattr_prefix(uint8_t index) {
+    switch (index) {
+    case EXT4_XATTR_INDEX_USER:
+        return "user.";
+    case EXT4_XATTR_INDEX_POSIX_ACL_ACCESS:
+        return "system.posix_acl_access";
+    case EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT:
+        return "system.posix_acl_default";
+    case EXT4_XATTR_INDEX_TRUSTED:
+        return "trusted.";
+    case EXT4_XATTR_INDEX_SECURITY:
+        return "security.";
+    case EXT4_XATTR_INDEX_SYSTEM:
+        return "system.";
+    case EXT4_XATTR_INDEX_RICHACL:
+        return "system.richacl";
+    default:
+        return NULL;
+    }
+}
+
+static int ext_xattr_split_name(const char *full, uint8_t *index,
+                                const char **name) {
+    if (!full || !index || !name)
+        return -EINVAL;
+    if (!strncmp(full, "user.", 5)) {
+        *index = EXT4_XATTR_INDEX_USER;
+        *name = full + 5;
+    } else if (!strcmp(full, "system.posix_acl_access")) {
+        *index = EXT4_XATTR_INDEX_POSIX_ACL_ACCESS;
+        *name = full + strlen(full);
+    } else if (!strcmp(full, "system.posix_acl_default")) {
+        *index = EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT;
+        *name = full + strlen(full);
+    } else if (!strncmp(full, "trusted.", 8)) {
+        *index = EXT4_XATTR_INDEX_TRUSTED;
+        *name = full + 8;
+    } else if (!strncmp(full, "security.", 9)) {
+        *index = EXT4_XATTR_INDEX_SECURITY;
+        *name = full + 9;
+    } else if (!strcmp(full, "system.richacl")) {
+        *index = EXT4_XATTR_INDEX_RICHACL;
+        *name = full + strlen(full);
+    } else if (!strncmp(full, "system.", 7)) {
+        *index = EXT4_XATTR_INDEX_SYSTEM;
+        *name = full + 7;
+    } else {
+        return -EOPNOTSUPP;
+    }
+    if (strlen(*name) > 255)
+        return -ERANGE;
+    return 0;
+}
+
+static size_t ext_xattr_entry_size(uint8_t name_len) {
+    return PADDING_UP(sizeof(ext_xattr_entry_t) + name_len, 4);
+}
+
+static bool ext_xattr_last(const ext_xattr_entry_t *entry) {
+    const uint32_t *word = (const uint32_t *)entry;
+    return *word == 0;
+}
+
+static int ext_xattr_collect_area(const uint8_t *first, const uint8_t *end,
+                                  const uint8_t *value_base,
+                                  ext_xattr_record_t **records, size_t *count,
+                                  size_t *capacity) {
+    const ext_xattr_entry_t *entry = (const ext_xattr_entry_t *)first;
+
+    while ((const uint8_t *)entry + sizeof(uint32_t) <= end &&
+           !ext_xattr_last(entry)) {
+        size_t entry_size = ext_xattr_entry_size(entry->e_name_len);
+        uint32_t value_size = entry->e_value_size;
+        uint16_t value_offs = entry->e_value_offs;
+        ext_xattr_record_t *record;
+
+        if ((const uint8_t *)entry + entry_size > end || entry->e_value_inum ||
+            value_offs > (size_t)(end - value_base) ||
+            value_size > (size_t)(end - value_base - value_offs))
+            return -EIO;
+        if (*count == *capacity) {
+            size_t new_capacity = *capacity ? *capacity * 2 : 8;
+            ext_xattr_record_t *new_records =
+                realloc(*records, new_capacity * sizeof(**records));
+            if (!new_records)
+                return -ENOMEM;
+            *records = new_records;
+            *capacity = new_capacity;
+        }
+        record = &(*records)[(*count)++];
+        memset(record, 0, sizeof(*record));
+        record->index = entry->e_name_index;
+        record->name = calloc(1, (size_t)entry->e_name_len + 1);
+        if (!record->name)
+            return -ENOMEM;
+        memcpy(record->name, entry->e_name, entry->e_name_len);
+        record->size = value_size;
+        if (value_size) {
+            record->value = malloc(value_size);
+            if (!record->value)
+                return -ENOMEM;
+            memcpy(record->value, value_base + value_offs, value_size);
+        }
+        entry =
+            (const ext_xattr_entry_t *)((const uint8_t *)entry + entry_size);
+    }
+    if ((const uint8_t *)entry + sizeof(uint32_t) > end)
+        return -EIO;
+    return 0;
+}
+
+static void ext_xattr_records_free(ext_xattr_record_t *records, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(records[i].name);
+        free(records[i].value);
+    }
+    free(records);
+}
+
+static int ext_xattr_records_load_locked(ext_mount_ctx_t *fs, uint32_t ino,
+                                         uint8_t **raw_out,
+                                         ext_xattr_record_t **records_out,
+                                         size_t *count_out) {
+    ext_xattr_record_t *records = NULL;
+    size_t count = 0, capacity = 0;
+    uint8_t *raw = NULL;
+    ext_inode_disk_t *disk_inode;
+    uint64_t block;
+    int ret;
+
+    ret = ext_read_inode_raw(fs, ino, &raw);
+    if (ret)
+        return ret;
+    disk_inode = (ext_inode_disk_t *)raw;
+    if (fs->inode_size > EXT2_GOOD_OLD_INODE_SIZE &&
+        disk_inode->i_extra_isize <=
+            fs->inode_size - EXT2_GOOD_OLD_INODE_SIZE - sizeof(uint32_t)) {
+        uint8_t *header =
+            raw + EXT2_GOOD_OLD_INODE_SIZE + disk_inode->i_extra_isize;
+        if (*(uint32_t *)header == EXT4_XATTR_MAGIC) {
+            uint8_t *first = header + sizeof(uint32_t);
+            ret = ext_xattr_collect_area(first, raw + fs->inode_size, first,
+                                         &records, &count, &capacity);
+            if (ret)
+                goto fail;
+        }
+    }
+
+    block = ext_inode_xattr_block(disk_inode);
+    if (block) {
+        uint8_t *buf = calloc(1, fs->block_size);
+        ext_xattr_header_t *header;
+        if (!buf) {
+            ret = -ENOMEM;
+            goto fail;
+        }
+        ret = ext_read_block(fs, block, buf);
+        if (ret) {
+            free(buf);
+            goto fail;
+        }
+        header = (ext_xattr_header_t *)buf;
+        if (header->h_magic != EXT4_XATTR_MAGIC || header->h_blocks != 1) {
+            free(buf);
+            ret = -EIO;
+            goto fail;
+        }
+        ret =
+            ext_xattr_collect_area(buf + sizeof(*header), buf + fs->block_size,
+                                   buf, &records, &count, &capacity);
+        free(buf);
+        if (ret)
+            goto fail;
+    }
+
+    *raw_out = raw;
+    *records_out = records;
+    *count_out = count;
+    return 0;
+
+fail:
+    free(raw);
+    ext_xattr_records_free(records, count);
+    return ret;
+}
+
+static int ext_xattr_record_compare(const void *a, const void *b) {
+    const ext_xattr_record_t *ra = a;
+    const ext_xattr_record_t *rb = b;
+    if (ra->index != rb->index)
+        return (int)ra->index - (int)rb->index;
+    return strcmp(ra->name, rb->name);
+}
+
+static uint32_t ext_xattr_block_checksum(ext_mount_ctx_t *fs, uint64_t block,
+                                         uint8_t *buf) {
+    ext_xattr_header_t *header = (ext_xattr_header_t *)buf;
+    uint32_t old = header->h_checksum;
+    uint32_t zero = 0;
+    uint32_t crc = ext_crc32c_update(fs->checksum_seed, &block, sizeof(block));
+    size_t off = offsetof(ext_xattr_header_t, h_checksum);
+    crc = ext_crc32c_update(crc, buf, off);
+    crc = ext_crc32c_update(crc, &zero, sizeof(zero));
+    crc = ext_crc32c_update(crc, buf + off + sizeof(zero),
+                            fs->block_size - off - sizeof(zero));
+    header->h_checksum = old;
+    return crc;
+}
+
+static int ext_xattr_serialize_block(ext_mount_ctx_t *fs, uint64_t block,
+                                     ext_xattr_record_t *records, size_t count,
+                                     uint8_t *buf) {
+    ext_xattr_header_t *header = (ext_xattr_header_t *)buf;
+    uint8_t *entry_pos = buf + sizeof(*header);
+    uint8_t *value_pos = buf + fs->block_size;
+
+    memset(buf, 0, fs->block_size);
+    header->h_magic = EXT4_XATTR_MAGIC;
+    header->h_refcount = 1;
+    header->h_blocks = 1;
+    qsort(records, count, sizeof(*records), ext_xattr_record_compare);
+
+    for (size_t i = 0; i < count; i++) {
+        size_t name_len = strlen(records[i].name);
+        size_t entry_size = ext_xattr_entry_size((uint8_t)name_len);
+        size_t value_size = PADDING_UP(records[i].size, 4);
+        ext_xattr_entry_t *entry;
+
+        if (entry_pos + entry_size + sizeof(uint32_t) > value_pos ||
+            value_size >
+                (size_t)(value_pos - entry_pos - entry_size - sizeof(uint32_t)))
+            return -ENOSPC;
+        value_pos -= value_size;
+        entry = (ext_xattr_entry_t *)entry_pos;
+        entry->e_name_len = (uint8_t)name_len;
+        entry->e_name_index = records[i].index;
+        entry->e_value_offs = (uint16_t)(value_pos - buf);
+        entry->e_value_size = records[i].size;
+        memcpy(entry->e_name, records[i].name, name_len);
+        if (records[i].size)
+            memcpy(value_pos, records[i].value, records[i].size);
+        entry_pos += entry_size;
+    }
+    if (fs->has_metadata_csum)
+        header->h_checksum = ext_xattr_block_checksum(fs, block, buf);
+    return 0;
+}
+
+static int ext_xattr_records_store_locked(ext_mount_ctx_t *fs, uint32_t ino,
+                                          uint8_t *raw,
+                                          ext_xattr_record_t *records,
+                                          size_t count) {
+    ext_inode_disk_t *disk_inode = (ext_inode_disk_t *)raw;
+    uint64_t old_block = ext_inode_xattr_block(disk_inode);
+    uint64_t block = old_block;
+    uint8_t *buf = NULL;
+    uint8_t *old_buf = NULL;
+    bool allocated_new = false;
+    int ret = 0;
+
+    if (fs->inode_size > EXT2_GOOD_OLD_INODE_SIZE &&
+        disk_inode->i_extra_isize <=
+            fs->inode_size - EXT2_GOOD_OLD_INODE_SIZE - sizeof(uint32_t)) {
+        uint8_t *header =
+            raw + EXT2_GOOD_OLD_INODE_SIZE + disk_inode->i_extra_isize;
+        memset(header, 0, (raw + fs->inode_size) - header);
+    }
+
+    if (!count) {
+        if (old_block) {
+            old_buf = calloc(1, fs->block_size);
+            if (!old_buf)
+                return -ENOMEM;
+            ret = ext_read_block(fs, old_block, old_buf);
+            if (ret)
+                goto out;
+            ext_xattr_header_t *old_header = (ext_xattr_header_t *)old_buf;
+            if (old_header->h_magic != EXT4_XATTR_MAGIC ||
+                !old_header->h_refcount) {
+                ret = -EIO;
+                goto out;
+            }
+            if (old_header->h_refcount > 1) {
+                old_header->h_refcount--;
+                if (fs->has_metadata_csum)
+                    old_header->h_checksum =
+                        ext_xattr_block_checksum(fs, old_block, old_buf);
+                ret = ext_write_block(fs, old_block, old_buf);
+            } else {
+                ret = ext_free_block_locked(fs, old_block);
+            }
+            if (ret)
+                goto out;
+            ext_inode_xattr_block_set(disk_inode, 0);
+            uint64_t sectors = fs->block_size / 512;
+            uint64_t blocks = ext_inode_blocks_get(disk_inode);
+            ext_inode_blocks_set(disk_inode,
+                                 blocks > sectors ? blocks - sectors : 0);
+        }
+        ret = ext_write_inode_raw(fs, ino, raw);
+        goto out;
+    }
+
+    if (old_block) {
+        old_buf = calloc(1, fs->block_size);
+        if (!old_buf)
+            return -ENOMEM;
+        ret = ext_read_block(fs, old_block, old_buf);
+        if (ret)
+            goto out;
+        ext_xattr_header_t *old_header = (ext_xattr_header_t *)old_buf;
+        if (old_header->h_magic != EXT4_XATTR_MAGIC ||
+            !old_header->h_refcount) {
+            ret = -EIO;
+            goto out;
+        }
+        if (old_header->h_refcount > 1) {
+            ret = ext_alloc_block_locked(
+                fs, (ino - 1) / fs->sb.s_inodes_per_group, &block);
+            if (ret)
+                goto out;
+            allocated_new = true;
+            ext_inode_xattr_block_set(disk_inode, block);
+            buf = calloc(1, fs->block_size);
+            if (!buf) {
+                ret = -ENOMEM;
+                goto out;
+            }
+        } else {
+            buf = old_buf;
+            old_buf = NULL;
+        }
+    } else {
+        ret = ext_alloc_block_locked(fs, (ino - 1) / fs->sb.s_inodes_per_group,
+                                     &block);
+        if (ret)
+            return ret;
+        allocated_new = true;
+        ext_inode_xattr_block_set(disk_inode, block);
+        ext_inode_add_fs_blocks(fs, disk_inode, 1);
+        buf = calloc(1, fs->block_size);
+        if (!buf) {
+            ext_free_block_locked(fs, block);
+            return -ENOMEM;
+        }
+    }
+
+    ret = ext_xattr_serialize_block(fs, block, records, count, buf);
+    if (ret)
+        goto out;
+    ret = ext_write_block(fs, block, buf);
+    if (ret)
+        goto out;
+    if (old_buf) {
+        ext_xattr_header_t *old_header = (ext_xattr_header_t *)old_buf;
+        old_header->h_refcount--;
+        if (fs->has_metadata_csum)
+            old_header->h_checksum =
+                ext_xattr_block_checksum(fs, old_block, old_buf);
+        ret = ext_write_block(fs, old_block, old_buf);
+        if (ret)
+            goto out;
+    }
+    ret = ext_write_inode_raw(fs, ino, raw);
+
+out:
+    if (ret && allocated_new)
+        ext_free_block_locked(fs, block);
+    free(buf);
+    free(old_buf);
     return ret;
 }
 
@@ -4844,6 +5274,226 @@ static int ext_permission(struct vfs_inode *inode, int mask) {
     return vfs_inode_permission(inode, mask);
 }
 
+static ssize_t ext_getxattr(struct vfs_inode *inode, const char *full_name,
+                            void *value, size_t size) {
+    ext_mount_ctx_t *fs;
+    ext_xattr_record_t *records = NULL;
+    uint8_t *raw = NULL;
+    size_t count = 0;
+    uint8_t index;
+    const char *name;
+    ssize_t ret;
+
+    if (!inode || !inode->i_sb || !full_name)
+        return -EINVAL;
+    ret = ext_xattr_split_name(full_name, &index, &name);
+    if (ret)
+        return ret;
+    fs = inode->i_sb->s_fs_info;
+    spin_lock(&fs->lock);
+    ret = ext_xattr_records_load_locked(fs, (uint32_t)inode->i_ino, &raw,
+                                        &records, &count);
+    spin_unlock(&fs->lock);
+    if (ret)
+        return ret;
+    ret = -ENODATA;
+    for (size_t i = 0; i < count; i++) {
+        if (records[i].index != index || strcmp(records[i].name, name))
+            continue;
+        if (size && size < records[i].size) {
+            ret = -ERANGE;
+            break;
+        }
+        if (value && records[i].size)
+            memcpy(value, records[i].value, records[i].size);
+        ret = records[i].size;
+        break;
+    }
+    free(raw);
+    ext_xattr_records_free(records, count);
+    return ret;
+}
+
+static ssize_t ext_listxattr(struct vfs_inode *inode, char *list, size_t size) {
+    ext_mount_ctx_t *fs;
+    ext_xattr_record_t *records = NULL;
+    uint8_t *raw = NULL;
+    size_t count = 0, total = 0;
+    int ret;
+
+    if (!inode || !inode->i_sb)
+        return -EINVAL;
+    fs = inode->i_sb->s_fs_info;
+    spin_lock(&fs->lock);
+    ret = ext_xattr_records_load_locked(fs, (uint32_t)inode->i_ino, &raw,
+                                        &records, &count);
+    spin_unlock(&fs->lock);
+    if (ret)
+        return ret;
+    for (size_t i = 0; i < count; i++) {
+        const char *prefix = ext_xattr_prefix(records[i].index);
+        size_t prefix_len, name_len, full_len;
+        if (!prefix)
+            continue;
+        prefix_len = strlen(prefix);
+        name_len = strlen(records[i].name);
+        full_len = prefix_len + name_len + 1;
+        if (size && total + full_len > size) {
+            ret = -ERANGE;
+            goto out;
+        }
+        if (list) {
+            memcpy(list + total, prefix, prefix_len);
+            memcpy(list + total + prefix_len, records[i].name, name_len);
+            list[total + prefix_len + name_len] = '\0';
+        }
+        total += full_len;
+    }
+    ret = (int)total;
+out:
+    free(raw);
+    ext_xattr_records_free(records, count);
+    return ret;
+}
+
+static int ext_xattr_may_set(struct vfs_inode *inode, uint8_t index) {
+    uid32_t fsuid = vfs_current_fsuid();
+    if (fsuid != 0 && fsuid != inode->i_uid)
+        return -EPERM;
+    if ((index == EXT4_XATTR_INDEX_TRUSTED ||
+         index == EXT4_XATTR_INDEX_SECURITY) &&
+        fsuid != 0)
+        return -EPERM;
+    return 0;
+}
+
+static int ext_setxattr(struct vfs_inode *inode, const char *full_name,
+                        const void *value, size_t size, int flags) {
+    ext_mount_ctx_t *fs;
+    ext_xattr_record_t *records = NULL;
+    uint8_t *raw = NULL;
+    size_t count = 0;
+    uint8_t index;
+    const char *name;
+    ssize_t found = -1;
+    int ret;
+
+    if (!inode || !inode->i_sb || !full_name || (size && !value))
+        return -EINVAL;
+    ret = ext_xattr_split_name(full_name, &index, &name);
+    if (ret)
+        return ret;
+    ret = ext_xattr_may_set(inode, index);
+    if (ret)
+        return ret;
+    fs = inode->i_sb->s_fs_info;
+    spin_lock(&fs->lock);
+    ret = ext_xattr_records_load_locked(fs, (uint32_t)inode->i_ino, &raw,
+                                        &records, &count);
+    if (ret)
+        goto out;
+    for (size_t i = 0; i < count; i++)
+        if (records[i].index == index && !strcmp(records[i].name, name)) {
+            found = (ssize_t)i;
+            break;
+        }
+    if ((flags & 1) && found >= 0) {
+        ret = -EEXIST;
+        goto out;
+    }
+    if ((flags & 2) && found < 0) {
+        ret = -ENODATA;
+        goto out;
+    }
+    if (found < 0) {
+        ext_xattr_record_t *new_records =
+            realloc(records, (count + 1) * sizeof(*records));
+        if (!new_records) {
+            ret = -ENOMEM;
+            goto out;
+        }
+        records = new_records;
+        found = (ssize_t)count++;
+        memset(&records[found], 0, sizeof(records[found]));
+        records[found].index = index;
+        records[found].name = strdup(name);
+        if (!records[found].name) {
+            ret = -ENOMEM;
+            goto out;
+        }
+    }
+    free(records[found].value);
+    records[found].value = NULL;
+    records[found].size = (uint32_t)size;
+    if (size) {
+        records[found].value = malloc(size);
+        if (!records[found].value) {
+            ret = -ENOMEM;
+            goto out;
+        }
+        memcpy(records[found].value, value, size);
+    }
+    ret = ext_xattr_records_store_locked(fs, (uint32_t)inode->i_ino, raw,
+                                         records, count);
+    if (!ret)
+        ext_sync_vfs_inode(inode, fs, (ext_inode_disk_t *)raw);
+out:
+    spin_unlock(&fs->lock);
+    free(raw);
+    ext_xattr_records_free(records, count);
+    return ret;
+}
+
+static int ext_removexattr(struct vfs_inode *inode, const char *full_name) {
+    ext_mount_ctx_t *fs;
+    ext_xattr_record_t *records = NULL;
+    uint8_t *raw = NULL;
+    size_t count = 0;
+    uint8_t index;
+    const char *name;
+    ssize_t found = -1;
+    int ret;
+
+    if (!inode || !inode->i_sb || !full_name)
+        return -EINVAL;
+    ret = ext_xattr_split_name(full_name, &index, &name);
+    if (ret)
+        return ret;
+    ret = ext_xattr_may_set(inode, index);
+    if (ret)
+        return ret;
+    fs = inode->i_sb->s_fs_info;
+    spin_lock(&fs->lock);
+    ret = ext_xattr_records_load_locked(fs, (uint32_t)inode->i_ino, &raw,
+                                        &records, &count);
+    if (ret)
+        goto out;
+    for (size_t i = 0; i < count; i++)
+        if (records[i].index == index && !strcmp(records[i].name, name)) {
+            found = (ssize_t)i;
+            break;
+        }
+    if (found < 0) {
+        ret = -ENODATA;
+        goto out;
+    }
+    free(records[found].name);
+    free(records[found].value);
+    if ((size_t)found + 1 < count)
+        memmove(&records[found], &records[found + 1],
+                (count - (size_t)found - 1) * sizeof(*records));
+    count--;
+    ret = ext_xattr_records_store_locked(fs, (uint32_t)inode->i_ino, raw,
+                                         records, count);
+    if (!ret)
+        ext_sync_vfs_inode(inode, fs, (ext_inode_disk_t *)raw);
+out:
+    spin_unlock(&fs->lock);
+    free(raw);
+    ext_xattr_records_free(records, count);
+    return ret;
+}
+
 static int ext_getattr(const struct vfs_path *path, struct vfs_kstat *stat,
                        uint32_t request_mask, unsigned int flags) {
     (void)request_mask;
@@ -5484,6 +6134,10 @@ static const struct vfs_inode_operations ext_inode_ops = {
     .permission = ext_permission,
     .getattr = ext_getattr,
     .setattr = ext_setattr,
+    .getxattr = ext_getxattr,
+    .listxattr = ext_listxattr,
+    .setxattr = ext_setxattr,
+    .removexattr = ext_removexattr,
 };
 
 static struct vfs_file_system_type ext_fs_type = {

@@ -1,36 +1,18 @@
-# The Neo Aether Operating System
+# na-kernel
 
-![Screenshot](./images/naos.png?raw=true)
+`na-kernel` contains only the freestanding kernel and its loadable kernel
+modules.
 
-![GitHub Repo stars](https://img.shields.io/github/stars/aether-os-studio/naos?style=flat-square)
-![GitHub issues](https://img.shields.io/github/issues/aether-os-studio/naos?style=flat-square)
-![GitHub License](https://img.shields.io/github/license/aether-os-studio/naos?style=flat-square)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/aether-os-studio/naos)
+## Targets
 
-## LICENSE
+- `make prepare` downloads kernel-only build dependencies.
+- `make kernel` builds the kernel.
+- `make modules` builds loadable kernel modules.
+- `make` builds both kernel and modules.
 
-This project is licensed under GPLv3.
+The development flake contains only compiler, linker, dependency-fetching and
+module-signing tools; disk, rootfs, initramfs and VM tooling belong to the
+parent repository.
 
-## Features
-
-* 64-bit operating system with SMP (i.e., multicore) and ACPI support.
-* Support for many modern hardware devices such as USB XHCI controllers.
-* Networking support.
-* POSIX and Linux API compatibility.
-* Support for Linux-style special files (epoll, signalfd, timerfd, ...) and pseudo file systems (`/sys`, `/proc`, ...).
-
-## Supported Software
-
-Programs supported on aether-os include [Weston](https://gitlab.freedesktop.org/wayland/weston/) (the Wayland reference compositor), Busybox, Coreutils, Bash, nano, vim and others.
-
-## Supported Hardware
-
-**General** USB (XHCI)\
-**Graphics** virtio GPU\
-**Input** USB human interface devices, PS/2 keyboard and mouse\
-**Storage** USB mass storage devices, NVMe, AHCI, virtio block\
-**Network** E1000, virtio network
-
-## Running naos
-
-Running `make prepare` and `make run` will build the optimized kernel and a bootable image and a rootfs image, and then run it using `qemu` (if installed). Use `BUILD_MODE=debug make run` for an unoptimized kernel with debug symbols.
+For a complete system build, run `make` from the parent directory. The parent
+passes its generated initramfs to SBI/LA boot builds through `INITRAMFS_IMAGE`.

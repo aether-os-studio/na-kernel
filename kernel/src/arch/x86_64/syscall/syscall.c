@@ -633,30 +633,20 @@ void syscall_handler_init() {
     // (syscall_handle_t)sys_security);
     regist_syscall_handler(SYS_GETTID, (syscall_handle_t)sys_gettid);
     regist_syscall_handler(SYS_READAHEAD, (syscall_handle_t)sys_readahead);
-    regist_syscall_handler(SYS_SETXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_LSETXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_FSETXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_GETXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_LGETXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_FGETXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_LISTXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_LLISTXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_FLISTXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
-    regist_syscall_handler(SYS_REMOVEXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
+    regist_syscall_handler(SYS_SETXATTR, (syscall_handle_t)sys_setxattr);
+    regist_syscall_handler(SYS_LSETXATTR, (syscall_handle_t)sys_lsetxattr);
+    regist_syscall_handler(SYS_FSETXATTR, (syscall_handle_t)sys_fsetxattr);
+    regist_syscall_handler(SYS_GETXATTR, (syscall_handle_t)sys_getxattr);
+    regist_syscall_handler(SYS_LGETXATTR, (syscall_handle_t)sys_lgetxattr);
+    regist_syscall_handler(SYS_FGETXATTR, (syscall_handle_t)sys_fgetxattr);
+    regist_syscall_handler(SYS_LISTXATTR, (syscall_handle_t)sys_listxattr);
+    regist_syscall_handler(SYS_LLISTXATTR, (syscall_handle_t)sys_llistxattr);
+    regist_syscall_handler(SYS_FLISTXATTR, (syscall_handle_t)sys_flistxattr);
+    regist_syscall_handler(SYS_REMOVEXATTR, (syscall_handle_t)sys_removexattr);
     regist_syscall_handler(SYS_LREMOVEXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
+                           (syscall_handle_t)sys_lremovexattr);
     regist_syscall_handler(SYS_FREMOVEXATTR,
-                           (syscall_handle_t)dummy_syscall_handler);
+                           (syscall_handle_t)sys_fremovexattr);
     regist_syscall_handler(SYS_TKILL, (syscall_handle_t)sys_tkill);
     regist_syscall_handler(SYS_TIME, (syscall_handle_t)sys_time);
     regist_syscall_handler(SYS_FUTEX, (syscall_handle_t)sys_futex);
@@ -820,7 +810,7 @@ void syscall_handler_init() {
                            (syscall_handle_t)sys_open_by_handle_at);
     // regist_syscall_handler(SYS_CLOCK_ADJTIME,
     // (syscall_handle_t)sys_clock_adjtime);
-    // regist_syscall_handler(SYS_SYNCFS, (syscall_handle_t)sys_syncfs);
+    regist_syscall_handler(SYS_SYNCFS, (syscall_handle_t)sys_syncfs);
 #ifdef SYS_SENDMMSG
     regist_syscall_handler(SYS_SENDMMSG, (syscall_handle_t)sys_sendmmsg);
 #endif
@@ -879,7 +869,7 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_FSOPEN, (syscall_handle_t)sys_fsopen);
     regist_syscall_handler(SYS_FSCONFIG, (syscall_handle_t)sys_fsconfig);
     regist_syscall_handler(SYS_FSMOUNT, (syscall_handle_t)sys_fsmount);
-    // regist_syscall_handler(SYS_FSPICK, (syscall_handle_t)sys_fspick);
+    regist_syscall_handler(SYS_FSPICK, (syscall_handle_t)sys_fspick);
     regist_syscall_handler(SYS_PIDFD_OPEN, (syscall_handle_t)sys_pidfd_open);
     regist_syscall_handler(SYS_CLONE3, (syscall_handle_t)sys_clone3);
     regist_syscall_handler(SYS_CLOSE_RANGE, (syscall_handle_t)sys_close_range);

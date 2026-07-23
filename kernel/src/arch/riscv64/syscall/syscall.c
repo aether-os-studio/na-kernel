@@ -538,18 +538,18 @@ void syscall_handler_init() {
     // syscall_handlers[SYS_SECURITY] = (syscall_handle_t)sys_security;
     syscall_handlers[SYS_GETTID] = (syscall_handle_t)sys_gettid;
     syscall_handlers[SYS_READAHEAD] = (syscall_handle_t)sys_readahead;
-    // syscall_handlers[SYS_SETXATTR] = (syscall_handle_t)sys_setxattr;
-    // syscall_handlers[SYS_LSETXATTR] = (syscall_handle_t)sys_lsetxattr;
-    // syscall_handlers[SYS_FSETXATTR] = (syscall_handle_t)sys_fsetxattr;
-    // syscall_handlers[SYS_GETXATTR] = (syscall_handle_t)sys_getxattr;
-    // syscall_handlers[SYS_LGETXATTR] = (syscall_handle_t)sys_lgetxattr;
-    // syscall_handlers[SYS_FGETXATTR] = (syscall_handle_t)sys_fgetxattr;
-    // syscall_handlers[SYS_LISTXATTR] = (syscall_handle_t)sys_listxattr;
-    // syscall_handlers[SYS_LLISTXATTR] = (syscall_handle_t)sys_llistxattr;
-    // syscall_handlers[SYS_FLISTXATTR] = (syscall_handle_t)sys_flistxattr;
-    // syscall_handlers[SYS_REMOVEXATTR] = (syscall_handle_t)sys_removexattr;
-    // syscall_handlers[SYS_LREMOVEXATTR] = (syscall_handle_t)sys_lremovexattr;
-    // syscall_handlers[SYS_FREMOVEXATTR] = (syscall_handle_t)sys_fremovexattr;
+    syscall_handlers[SYS_SETXATTR] = (syscall_handle_t)sys_setxattr;
+    syscall_handlers[SYS_LSETXATTR] = (syscall_handle_t)sys_lsetxattr;
+    syscall_handlers[SYS_FSETXATTR] = (syscall_handle_t)sys_fsetxattr;
+    syscall_handlers[SYS_GETXATTR] = (syscall_handle_t)sys_getxattr;
+    syscall_handlers[SYS_LGETXATTR] = (syscall_handle_t)sys_lgetxattr;
+    syscall_handlers[SYS_FGETXATTR] = (syscall_handle_t)sys_fgetxattr;
+    syscall_handlers[SYS_LISTXATTR] = (syscall_handle_t)sys_listxattr;
+    syscall_handlers[SYS_LLISTXATTR] = (syscall_handle_t)sys_llistxattr;
+    syscall_handlers[SYS_FLISTXATTR] = (syscall_handle_t)sys_flistxattr;
+    syscall_handlers[SYS_REMOVEXATTR] = (syscall_handle_t)sys_removexattr;
+    syscall_handlers[SYS_LREMOVEXATTR] = (syscall_handle_t)sys_lremovexattr;
+    syscall_handlers[SYS_FREMOVEXATTR] = (syscall_handle_t)sys_fremovexattr;
     syscall_handlers[SYS_TKILL] = (syscall_handle_t)sys_tkill;
     // syscall_handlers[SYS_TIME] = (syscall_handle_t)sys_time;
     syscall_handlers[SYS_FUTEX_] = (syscall_handle_t)sys_futex;
@@ -700,8 +700,8 @@ void syscall_handler_init() {
     syscall_handlers[SYS_OPEN_BY_HANDLE_AT] =
         (syscall_handle_t)sys_open_by_handle_at;
     // syscall_handlers[SYS_CLOCK_ADJTIME] =
-    // (syscall_handle_t)sys_clock_adjtime; syscall_handlers[SYS_SYNCFS] =
-    // (syscall_handle_t)sys_syncfs;
+    // (syscall_handle_t)sys_clock_adjtime;
+    syscall_handlers[SYS_SYNCFS] = (syscall_handle_t)sys_syncfs;
     syscall_handlers[SYS_SENDMMSG] = (syscall_handle_t)sys_sendmmsg;
     syscall_handlers[SYS_SETNS] = (syscall_handle_t)sys_setns;
     syscall_handlers[SYS_GETCPU] = (syscall_handle_t)sys_getcpu;
@@ -750,7 +750,7 @@ void syscall_handler_init() {
     syscall_handlers[SYS_FSOPEN] = (syscall_handle_t)sys_fsopen;
     syscall_handlers[SYS_FSCONFIG] = (syscall_handle_t)sys_fsconfig;
     syscall_handlers[SYS_FSMOUNT] = (syscall_handle_t)sys_fsmount;
-    // syscall_handlers[SYS_FSPICK] = (syscall_handle_t)sys_fspick;
+    syscall_handlers[SYS_FSPICK] = (syscall_handle_t)sys_fspick;
     syscall_handlers[SYS_PIDFD_OPEN] = (syscall_handle_t)sys_pidfd_open;
     syscall_handlers[SYS_CLONE3] = (syscall_handle_t)sys_clone3;
     syscall_handlers[SYS_CLOSE_RANGE] = (syscall_handle_t)sys_close_range;

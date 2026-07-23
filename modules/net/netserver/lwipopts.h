@@ -4,6 +4,15 @@
 #define SYS_LIGHTWEIGHT_PROT 1
 #define LWIP_COMPAT_MUTEX 0
 
+#define SYS_ARCH_INC(var, val)                                                 \
+    __atomic_fetch_add(&(var), (__typeof__(var))(val), __ATOMIC_RELAXED)
+#define SYS_ARCH_DEC(var, val)                                                 \
+    __atomic_fetch_sub(&(var), (__typeof__(var))(val), __ATOMIC_RELAXED)
+#define SYS_ARCH_GET(var, ret)                                                 \
+    do {                                                                       \
+        (ret) = __atomic_load_n(&(var), __ATOMIC_ACQUIRE);                     \
+    } while (0)
+
 #define MEM_ALIGNMENT 8
 #define MEM_LIBC_MALLOC 0
 #define MEMP_MEM_MALLOC 0

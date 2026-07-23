@@ -252,6 +252,38 @@ typedef struct ext_inode_disk {
     uint32_t i_projid;
 } __attribute__((packed)) ext_inode_disk_t;
 
+#define EXT4_XATTR_MAGIC 0xEA020000u
+#define EXT4_XATTR_INDEX_USER 1
+#define EXT4_XATTR_INDEX_POSIX_ACL_ACCESS 2
+#define EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT 3
+#define EXT4_XATTR_INDEX_TRUSTED 4
+#define EXT4_XATTR_INDEX_SECURITY 6
+#define EXT4_XATTR_INDEX_SYSTEM 7
+#define EXT4_XATTR_INDEX_RICHACL 8
+
+typedef struct ext_xattr_header {
+    uint32_t h_magic;
+    uint32_t h_refcount;
+    uint32_t h_blocks;
+    uint32_t h_hash;
+    uint32_t h_checksum;
+    uint32_t h_reserved[3];
+} __attribute__((packed)) ext_xattr_header_t;
+
+typedef struct ext_xattr_ibody_header {
+    uint32_t h_magic;
+} __attribute__((packed)) ext_xattr_ibody_header_t;
+
+typedef struct ext_xattr_entry {
+    uint8_t e_name_len;
+    uint8_t e_name_index;
+    uint16_t e_value_offs;
+    uint32_t e_value_inum;
+    uint32_t e_value_size;
+    uint32_t e_hash;
+    char e_name[];
+} __attribute__((packed)) ext_xattr_entry_t;
+
 typedef struct ext_dir_entry {
     uint32_t inode;
     uint16_t rec_len;
