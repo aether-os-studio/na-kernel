@@ -13,7 +13,17 @@
 #include <libs/flanterm/flanterm_backends/fb_private.h>
 #include <libs/flanterm/flanterm_backends/fb.h>
 
-void terminal_flush(tty_t *session) { flanterm_flush(session->terminal); }
+void terminal_flush(tty_t *session) {
+    if (session && session->terminal)
+        flanterm_flush(session->terminal);
+}
+
+static void *terminal_alloc(size_t size) { return malloc(size); }
+
+static void terminal_free(void *ptr, size_t size) {
+    (void)size;
+    free(ptr);
+}
 
 extern void send_process_group_signal(int pgid, int sig);
 
@@ -119,6 +129,8 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
         if (arg != KD_TEXT && arg != KD_GRAPHICS)
             return -EINVAL;
         device->tty_mode = arg;
+        if (arg == KD_TEXT && tty_vt_is_active(device) && device->terminal)
+            flanterm_full_refresh(device->terminal);
         return 0;
     case KDGKBMODE: {
         int kbmode = device->tty_kbmode;
@@ -129,11 +141,17 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
     case KDSKBMODE:
         device->tty_kbmode = arg;
         return 0;
-    case VT_SETMODE:
-        if (!arg || copy_from_user(&device->current_vt_mode, (void *)arg,
-                                   sizeof(struct vt_mode)))
+    case VT_SETMODE: {
+        struct vt_mode mode;
+        if (!arg || copy_from_user(&mode, (void *)arg, sizeof(mode)))
             return -EFAULT;
+        if (mode.mode != VT_AUTO && mode.mode != VT_PROCESS)
+            return -EINVAL;
+        device->current_vt_mode = mode;
+        device->vt_controller_tgid =
+            mode.mode == VT_PROCESS ? task_effective_tgid(current_task) : 0;
         return 0;
+    }
     case VT_GETMODE:
         if (!arg || copy_to_user((void *)arg, &device->current_vt_mode,
                                  sizeof(struct vt_mode)))
@@ -142,7 +160,7 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
     case VT_ACTIVATE:
         return tty_vt_activate((unsigned int)arg);
     case VT_WAITACTIVE:
-        return 0;
+        return tty_vt_waitactive((unsigned int)arg);
     case VT_GETSTATE: {
         struct vt_state state = {0};
         int ret = tty_vt_get_state(&state);
@@ -153,11 +171,15 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
         return 0;
     }
     case VT_OPENQRY: {
-        int query = 1;
+        int query = tty_vt_openqry();
         if (!arg || copy_to_user((void *)arg, &query, sizeof(query)))
             return -EFAULT;
         return 0;
     }
+    case VT_RELDISP:
+        return tty_vt_reldisp(device, (unsigned int)arg);
+    case VT_DISALLOCATE:
+        return tty_vt_disallocate((unsigned int)arg);
     case TIOCNOTTY:
         tty_session_detach_current(device);
         return 0;
@@ -207,6 +229,17 @@ size_t terminal_write(tty_t *device, const char *buf, size_t count) {
     return count;
 }
 
+void terminal_set_active(tty_t *tty, bool active) {
+    if (!tty || !tty->terminal)
+        return;
+
+    spin_lock(&terminal_write_lock);
+    flanterm_set_output_enabled(tty->terminal, active);
+    if (active && tty->tty_mode == KD_TEXT)
+        flanterm_full_refresh(tty->terminal);
+    spin_unlock(&terminal_write_lock);
+}
+
 uint64_t create_session_terminal(tty_t *session) {
     if (session->device == NULL)
         return -ENODEV;
@@ -216,8 +249,8 @@ uint64_t create_session_terminal(tty_t *session) {
     struct flanterm_context *fl_context =
         framebuffer->address
             ? flanterm_fb_init(
-                  NULL, NULL, (void *)framebuffer->address, framebuffer->width,
-                  framebuffer->height, framebuffer->pitch,
+                  terminal_alloc, terminal_free, (void *)framebuffer->address,
+                  framebuffer->width, framebuffer->height, framebuffer->pitch,
                   framebuffer->red_mask_size, framebuffer->red_mask_shift,
                   framebuffer->green_mask_size, framebuffer->green_mask_shift,
                   framebuffer->blue_mask_size, framebuffer->blue_mask_shift,

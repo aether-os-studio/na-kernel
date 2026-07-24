@@ -84,6 +84,25 @@
 typedef struct notifyfs_watch notifyfs_watch_t;
 typedef struct notifyfs_handle notifyfs_handle_t;
 
+#define FAN_CLOEXEC 0x00000001U
+#define FAN_NONBLOCK 0x00000002U
+#define FAN_CLASS_NOTIF 0x00000000U
+#define FAN_ALL_CLASS_BITS 0x0000000cU
+#define FAN_REPORT_FID 0x00000200U
+#define FAN_REPORT_DIR_FID 0x00000400U
+#define FAN_REPORT_NAME 0x00000800U
+#define FAN_REPORT_DFID_NAME (FAN_REPORT_DIR_FID | FAN_REPORT_NAME)
+
+#define FAN_MARK_ADD 0x00000001U
+#define FAN_MARK_REMOVE 0x00000002U
+#define FAN_MARK_DONT_FOLLOW 0x00000004U
+#define FAN_MARK_ONLYDIR 0x00000008U
+#define FAN_MARK_MOUNT 0x00000010U
+#define FAN_MARK_FILESYSTEM 0x00000100U
+
+#define FAN_EVENT_ON_CHILD 0x08000000U
+#define FAN_ONDIR 0x40000000U
+
 notifyfs_handle_t *notifyfs_file_handle(struct vfs_file *file);
 int notifyfs_is_file(struct vfs_file *file);
 
@@ -95,6 +114,11 @@ int notifyfs_handle_add_watch(notifyfs_handle_t *handle,
                               struct vfs_inode *watch_inode, uint64_t mask,
                               uint64_t *wd_out);
 int notifyfs_handle_remove_watch(notifyfs_handle_t *handle, uint64_t wd);
+int notifyfs_handle_remove_watch_inode(notifyfs_handle_t *handle,
+                                       struct vfs_inode *watch_inode);
+int notifyfs_handle_set_fanotify(notifyfs_handle_t *handle,
+                                 unsigned int init_flags);
+bool notifyfs_handle_is_fanotify(notifyfs_handle_t *handle);
 
 uint32_t notifyfs_next_cookie(void);
 bool notifyfs_queue_inode_event(struct vfs_inode *watch_inode,

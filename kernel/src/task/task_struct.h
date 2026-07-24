@@ -101,6 +101,8 @@ typedef struct kernel_timer {
     int sigev_signo;
     union sigval sigev_value;
     int sigev_notify;
+    int sigev_notify_thread_id;
+    int overrun;
     uint64_t expires;
     uint64_t interval;
 } kernel_timer_t;

@@ -870,14 +870,45 @@ static int generic_do_utimensat(int dfd, const char *pathname,
 
 static int generic_chown_path(const struct vfs_path *path, uint64_t uid,
                               uint64_t gid) {
-    bool set_uid = uid != (uint64_t)-1;
-    bool set_gid = gid != (uint64_t)-1;
+    struct vfs_inode *inode;
+    uid32_t new_uid = (uid32_t)uid;
+    gid32_t new_gid = (gid32_t)gid;
+    uid32_t fsuid;
+    bool set_uid = new_uid != (uid32_t)-1;
+    bool set_gid = new_gid != (gid32_t)-1;
+
+    if (!path || !path->dentry || !path->dentry->d_inode)
+        return -ENOENT;
+
+    inode = path->dentry->d_inode;
 
     if (!set_uid && !set_gid)
         return 0;
 
-    return generic_setattr_path(path, false, 0, set_uid, (uid32_t)uid, set_gid,
-                                (gid32_t)gid, false, 0);
+    /*
+     * uid_t and gid_t are 32-bit Linux syscall arguments.  In particular,
+     * userspace passes (uid_t)-1 as 0xffffffff (normally zero-extended in the
+     * syscall register), not as UINT64_MAX.  Treating only UINT64_MAX as the
+     * sentinel stored uid 4294967295 in the inode instead of leaving the
+     * owner unchanged.
+     *
+     * Without capabilities/user namespaces, fsuid 0 is the privileged case.
+     * An unprivileged owner may keep the current uid and may select one of its
+     * own groups, matching Linux chown permission semantics.
+     */
+    fsuid = vfs_current_fsuid();
+    if (fsuid != 0) {
+        if (fsuid != inode->i_uid)
+            return -EPERM;
+        if (set_uid && new_uid != inode->i_uid)
+            return -EPERM;
+        if (set_gid && new_gid != vfs_current_fsgid() &&
+            !task_in_supplementary_group(current_task, new_gid))
+            return -EPERM;
+    }
+
+    return generic_setattr_path(path, false, 0, set_uid, new_uid, set_gid,
+                                new_gid, false, 0);
 }
 
 static int generic_link_pathat(const struct vfs_path *old_path, int newdfd,
@@ -1889,7 +1920,7 @@ uint64_t sys_inotify_add_watch(uint64_t notifyfd, const char *path,
     }
 
     handle = notifyfs_file_handle(notify_file);
-    if (!handle) {
+    if (!handle || notifyfs_handle_is_fanotify(handle)) {
         vfs_file_put(notify_file);
         return (uint64_t)-EINVAL;
     }
@@ -1929,12 +1960,118 @@ uint64_t sys_inotify_rm_watch(uint64_t watchfd, uint64_t wd) {
     }
 
     handle = notifyfs_file_handle(notify_file);
-    if (!handle) {
+    if (!handle || notifyfs_handle_is_fanotify(handle)) {
         vfs_file_put(notify_file);
         return (uint64_t)-EINVAL;
     }
 
     ret = notifyfs_handle_remove_watch(handle, wd);
+    vfs_file_put(notify_file);
+    return (uint64_t)ret;
+}
+
+uint64_t sys_fanotify_init(uint64_t flags, uint64_t event_f_flags) {
+    const uint64_t allowed_flags =
+        FAN_CLOEXEC | FAN_NONBLOCK | FAN_REPORT_FID | FAN_REPORT_DFID_NAME;
+    const uint64_t allowed_event_flags = O_ACCMODE_FLAGS | O_LARGEFILE |
+                                         O_CLOEXEC | O_NONBLOCK | O_APPEND |
+                                         O_DSYNC | O_NOATIME | O_SYNC;
+    struct vfs_file *file = NULL;
+    notifyfs_handle_t *handle = NULL;
+    int ret;
+
+    if ((flags & FAN_ALL_CLASS_BITS) != FAN_CLASS_NOTIF)
+        return (uint64_t)-EINVAL;
+    if (flags & ~allowed_flags)
+        return (uint64_t)-EINVAL;
+    if ((flags & FAN_REPORT_NAME) && !(flags & FAN_REPORT_DIR_FID))
+        return (uint64_t)-EINVAL;
+    if ((flags & FAN_REPORT_DIR_FID) && !(flags & FAN_REPORT_NAME))
+        return (uint64_t)-EINVAL;
+    if (event_f_flags & ~allowed_event_flags)
+        return (uint64_t)-EINVAL;
+
+    ret = notifyfs_create_handle_file(
+        &file, (flags & FAN_NONBLOCK) ? O_NONBLOCK : 0, &handle);
+    if (ret < 0)
+        return (uint64_t)ret;
+
+    ret = notifyfs_handle_set_fanotify(handle, (unsigned int)flags);
+    if (ret < 0) {
+        vfs_file_put(file);
+        return (uint64_t)ret;
+    }
+
+    ret = task_install_file(current_task, file,
+                            (flags & FAN_CLOEXEC) ? FD_CLOEXEC : 0, 0);
+    vfs_file_put(file);
+    return (uint64_t)ret;
+}
+
+uint64_t sys_fanotify_mark(uint64_t fanotify_fd, uint64_t flags, uint64_t mask,
+                           int dfd, const char *path) {
+    const uint64_t allowed_flags = FAN_MARK_ADD | FAN_MARK_REMOVE |
+                                   FAN_MARK_DONT_FOLLOW | FAN_MARK_ONLYDIR;
+    const uint64_t allowed_mask =
+        IN_ALL_EVENTS | FAN_EVENT_ON_CHILD | FAN_ONDIR;
+    struct vfs_file *notify_file = NULL;
+    notifyfs_handle_t *handle;
+    struct vfs_path target = {0};
+    unsigned int lookup_flags;
+    uint64_t wd = 0;
+    int ret;
+
+    if (!path)
+        return (uint64_t)-EFAULT;
+    if (flags & ~allowed_flags)
+        return (uint64_t)-EINVAL;
+    if (!!(flags & FAN_MARK_ADD) == !!(flags & FAN_MARK_REMOVE))
+        return (uint64_t)-EINVAL;
+    if (!mask || (mask & ~allowed_mask))
+        return (uint64_t)-EINVAL;
+
+    notify_file = task_get_file(current_task, (int)fanotify_fd);
+    if (!notify_file)
+        return (uint64_t)-EBADF;
+    handle = notifyfs_file_handle(notify_file);
+    if (!notifyfs_is_file(notify_file) ||
+        !notifyfs_handle_is_fanotify(handle)) {
+        vfs_file_put(notify_file);
+        return (uint64_t)-EINVAL;
+    }
+
+    lookup_flags =
+        (flags & FAN_MARK_DONT_FOLLOW) ? LOOKUP_NOFOLLOW : LOOKUP_FOLLOW;
+    ret = vfs_filename_lookup(dfd, path, lookup_flags, &target);
+    if (ret < 0) {
+        vfs_file_put(notify_file);
+        return (uint64_t)ret;
+    }
+    if (!target.dentry || !target.dentry->d_inode) {
+        vfs_path_put(&target);
+        vfs_file_put(notify_file);
+        return (uint64_t)-ENOENT;
+    }
+    if ((flags & FAN_MARK_ONLYDIR) &&
+        !S_ISDIR(target.dentry->d_inode->i_mode)) {
+        vfs_path_put(&target);
+        vfs_file_put(notify_file);
+        return (uint64_t)-ENOTDIR;
+    }
+
+    if (flags & FAN_MARK_ADD) {
+        uint64_t inotify_mask = mask & IN_ALL_EVENTS;
+        if (flags & FAN_MARK_ONLYDIR)
+            inotify_mask |= IN_ONLYDIR;
+        ret = notifyfs_handle_add_watch(handle, notify_file->f_inode,
+                                        target.dentry->d_inode, inotify_mask,
+                                        &wd);
+    } else {
+        ret =
+            notifyfs_handle_remove_watch_inode(handle, target.dentry->d_inode);
+    }
+
+    vfs_path_put(&target);
     vfs_file_put(notify_file);
     return (uint64_t)ret;
 }
@@ -4296,11 +4433,8 @@ uint64_t sys_mknod(const char *name_user, uint16_t umode, int dev) {
         masked_mode =
             (umode & S_IFMT) | ((umode & 0777) & ~current_task->fs->umask);
 
-    int ret = vfs_mknodat(AT_FDCWD, name, masked_mode, (dev64_t)dev, false);
-    if (ret < 0)
-        return (uint64_t)-EINVAL;
-
-    return 0;
+    return (uint64_t)vfs_mknodat(AT_FDCWD, name, masked_mode, (dev64_t)dev,
+                                 false);
 }
 
 uint64_t sys_mknodat(uint64_t fd, const char *path_user, uint16_t umode,
@@ -4314,11 +4448,8 @@ uint64_t sys_mknodat(uint64_t fd, const char *path_user, uint16_t umode,
         masked_mode =
             (umode & S_IFMT) | ((umode & 0777) & ~current_task->fs->umask);
 
-    int ret = vfs_mknodat((int)fd, path, masked_mode, (dev64_t)dev, false);
-    if (ret < 0)
-        return (uint64_t)-EINVAL;
-
-    return 0;
+    return (uint64_t)vfs_mknodat((int)fd, path, masked_mode, (dev64_t)dev,
+                                 false);
 }
 
 uint64_t sys_chmod(const char *name_user, uint16_t mode) {

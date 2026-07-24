@@ -4110,6 +4110,18 @@ uint64_t sys_rseq(void *rseq, uint32_t rseq_len, int flags, uint32_t sig) {
     return (uint64_t)-ENOSYS;
 }
 
+static task_t *task_posix_timer_owner(void) {
+    uint64_t tgid;
+    task_t *owner;
+
+    if (!current_task)
+        return NULL;
+
+    tgid = task_effective_tgid(current_task);
+    owner = task_find_by_pid(tgid);
+    return owner ? owner : current_task;
+}
+
 size_t sys_setitimer(int which, struct itimerval *value,
                      struct itimerval *old) {
     if (which != 0)
@@ -4141,58 +4153,58 @@ size_t sys_setitimer(int which, struct itimerval *value,
 }
 
 uint64_t sys_timer_create(clockid_t clockid, struct sigevent *sevp,
-                          timer_t *timerid) {
-    kernel_timer_t *kt = NULL;
-    struct sigevent ksev;
-    timer_t created_timerid;
-    uint64_t i;
+                          int *timerid) {
+    task_t *owner = task_posix_timer_owner();
+    kernel_timer_t *kt;
+    struct sigevent ksev = {0};
+    int created_timerid = -1;
 
+    if (!owner)
+        return -ESRCH;
     if (!timerid)
         return -EFAULT;
     if (!timer_clockid_supported(clockid))
         return -EINVAL;
 
-    spin_lock(&current_task->timers_lock);
-    for (i = 0; i < MAX_TIMERS_NUM; i++) {
-        if (current_task->timers[i] == NULL) {
-            kt = malloc(sizeof(kernel_timer_t));
-            current_task->timers[i] = kt;
-            break;
-        }
-    }
-    spin_unlock(&current_task->timers_lock);
-
+    kt = calloc(1, sizeof(*kt));
     if (!kt)
         return -ENOMEM;
-
-    memset(kt, 0, sizeof(kernel_timer_t));
 
     kt->clock_type = clockid;
     kt->sigev_notify = SIGEV_SIGNAL;
     kt->sigev_signo = SIGALRM;
-
-    created_timerid = (timer_t)(uintptr_t)i;
-    kt->sigev_value.sival_ptr = created_timerid;
+    kt->sigev_value.sival_int = 0;
 
     if (sevp) {
         if (copy_from_user(&ksev, sevp, sizeof(ksev))) {
-            current_task->timers[i] = NULL;
             free(kt);
             return -EFAULT;
         }
 
         if (ksev.sigev_notify != SIGEV_SIGNAL &&
-            ksev.sigev_notify != SIGEV_NONE) {
-            current_task->timers[i] = NULL;
+            ksev.sigev_notify != SIGEV_NONE &&
+            ksev.sigev_notify != SIGEV_THREAD_ID) {
             free(kt);
             return -EINVAL;
         }
 
-        if (ksev.sigev_notify == SIGEV_SIGNAL &&
+        if ((ksev.sigev_notify == SIGEV_SIGNAL ||
+             ksev.sigev_notify == SIGEV_THREAD_ID) &&
             !signal_sig_in_range(ksev.sigev_signo)) {
-            current_task->timers[i] = NULL;
             free(kt);
             return -EINVAL;
+        }
+
+        if (ksev.sigev_notify == SIGEV_THREAD_ID) {
+            task_t *target = task_find_by_pid(
+                (uint64_t)ksev.__sev_fields.sigev_notify_thread_id);
+            if (!target || task_effective_tgid(target) !=
+                               task_effective_tgid(current_task)) {
+                free(kt);
+                return -EINVAL;
+            }
+            kt->sigev_notify_thread_id =
+                ksev.__sev_fields.sigev_notify_thread_id;
         }
 
         kt->sigev_signo = ksev.sigev_signo;
@@ -4200,8 +4212,27 @@ uint64_t sys_timer_create(clockid_t clockid, struct sigevent *sevp,
         kt->sigev_notify = ksev.sigev_notify;
     }
 
+    spin_lock(&owner->timers_lock);
+    for (int i = 0; i < MAX_TIMERS_NUM; i++) {
+        if (!owner->timers[i]) {
+            owner->timers[i] = kt;
+            created_timerid = i;
+            break;
+        }
+    }
+    spin_unlock(&owner->timers_lock);
+
+    if (created_timerid < 0) {
+        free(kt);
+        return -EAGAIN;
+    }
+    if (!sevp)
+        kt->sigev_value.sival_int = created_timerid;
+
     if (copy_to_user(timerid, &created_timerid, sizeof(created_timerid))) {
-        current_task->timers[i] = NULL;
+        spin_lock(&owner->timers_lock);
+        owner->timers[created_timerid] = NULL;
+        spin_unlock(&owner->timers_lock);
         free(kt);
         return -EFAULT;
     }
@@ -4209,25 +4240,24 @@ uint64_t sys_timer_create(clockid_t clockid, struct sigevent *sevp,
     return 0;
 }
 
-uint64_t sys_timer_settime(timer_t timerid, int flags,
+uint64_t sys_timer_settime(int timerid, int flags,
                            const struct itimerspec *new_value,
                            struct itimerspec *old_value) {
-    uint64_t idx = (uint64_t)timerid;
+    task_t *owner = task_posix_timer_owner();
     struct itimerspec kts;
+    struct itimerspec old = {0};
     uint64_t interval;
     uint64_t value;
     uint64_t now;
     uint64_t expires;
 
-    if (idx >= MAX_TIMERS_NUM)
+    if (!owner)
+        return -ESRCH;
+    if (timerid < 0 || timerid >= MAX_TIMERS_NUM)
         return -EINVAL;
     if (!new_value)
         return -EINVAL;
     if (flags & ~TIMER_ABSTIME)
-        return -EINVAL;
-
-    kernel_timer_t *kt = current_task->timers[idx];
-    if (!kt)
         return -EINVAL;
 
     if (copy_from_user(&kts, new_value, sizeof(kts)))
@@ -4237,16 +4267,20 @@ uint64_t sys_timer_settime(timer_t timerid, int flags,
 
     interval = timer_spec_to_ns(&kts.it_interval);
     value = timer_spec_to_ns(&kts.it_value);
+
+    spin_lock(&owner->timers_lock);
+    kernel_timer_t *kt = owner->timers[timerid];
+    if (!kt) {
+        spin_unlock(&owner->timers_lock);
+        return -EINVAL;
+    }
     now = timer_current_time_ns(kt->clock_type);
 
     if (old_value) {
-        struct itimerspec old = {0};
         uint64_t remaining = kt->expires > now ? kt->expires - now : 0;
 
         timer_ns_to_spec(kt->interval, &old.it_interval);
         timer_ns_to_spec(remaining, &old.it_value);
-        if (copy_to_user(old_value, &old, sizeof(old)))
-            return -EFAULT;
     }
 
     if (flags & TIMER_ABSTIME) {
@@ -4257,8 +4291,82 @@ uint64_t sys_timer_settime(timer_t timerid, int flags,
 
     kt->interval = interval;
     kt->expires = expires;
-    task_refresh_tick_work_state(current_task);
+    kt->overrun = 0;
+    spin_unlock(&owner->timers_lock);
 
+    if (old_value && copy_to_user(old_value, &old, sizeof(old)))
+        return -EFAULT;
+    task_refresh_tick_work_state(owner);
+
+    return 0;
+}
+
+uint64_t sys_timer_gettime(int timerid, struct itimerspec *value) {
+    task_t *owner = task_posix_timer_owner();
+    struct itimerspec current = {0};
+
+    if (!owner)
+        return -ESRCH;
+    if (timerid < 0 || timerid >= MAX_TIMERS_NUM)
+        return -EINVAL;
+    if (!value)
+        return -EFAULT;
+
+    spin_lock(&owner->timers_lock);
+    kernel_timer_t *kt = owner->timers[timerid];
+    if (!kt) {
+        spin_unlock(&owner->timers_lock);
+        return -EINVAL;
+    }
+    uint64_t now = timer_current_time_ns(kt->clock_type);
+    uint64_t remaining = kt->expires > now ? kt->expires - now : 0;
+    timer_ns_to_spec(kt->interval, &current.it_interval);
+    timer_ns_to_spec(remaining, &current.it_value);
+    spin_unlock(&owner->timers_lock);
+
+    return copy_to_user(value, &current, sizeof(current)) ? (uint64_t)-EFAULT
+                                                          : 0;
+}
+
+uint64_t sys_timer_getoverrun(int timerid) {
+    task_t *owner = task_posix_timer_owner();
+    int overrun;
+
+    if (!owner)
+        return -ESRCH;
+    if (timerid < 0 || timerid >= MAX_TIMERS_NUM)
+        return -EINVAL;
+
+    spin_lock(&owner->timers_lock);
+    kernel_timer_t *kt = owner->timers[timerid];
+    if (!kt) {
+        spin_unlock(&owner->timers_lock);
+        return -EINVAL;
+    }
+    overrun = kt->overrun;
+    spin_unlock(&owner->timers_lock);
+    return (uint64_t)overrun;
+}
+
+uint64_t sys_timer_delete(int timerid) {
+    task_t *owner = task_posix_timer_owner();
+    kernel_timer_t *kt;
+
+    if (!owner)
+        return -ESRCH;
+    if (timerid < 0 || timerid >= MAX_TIMERS_NUM)
+        return -EINVAL;
+
+    spin_lock(&owner->timers_lock);
+    kt = owner->timers[timerid];
+    if (kt)
+        owner->timers[timerid] = NULL;
+    spin_unlock(&owner->timers_lock);
+    if (!kt)
+        return -EINVAL;
+
+    free(kt);
+    task_refresh_tick_work_state(owner);
     return 0;
 }
 

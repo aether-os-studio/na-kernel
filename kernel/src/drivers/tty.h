@@ -64,6 +64,10 @@ typedef struct tty_session { // 一个 TTY 会话
     struct vt_mode current_vt_mode;
     int tty_kbmode;
     int tty_mode;
+    unsigned int vtnr;
+    bool vt_allocated;
+    unsigned int vt_open_count;
+    uint64_t vt_controller_tgid;
     uint64_t at_session_id;
     uint64_t at_process_group_id;
     char input_buf[1024];
@@ -112,7 +116,14 @@ ssize_t tty_input_read(tty_t *tty, char *buf, size_t count, fd_t *fd);
 int tty_input_poll(tty_t *tty, int events);
 void tty_input_flush(tty_t *tty);
 int tty_vt_activate(unsigned int vtnr);
+int tty_vt_waitactive(unsigned int vtnr);
+int tty_vt_openqry(void);
+int tty_vt_reldisp(tty_t *tty, unsigned int action);
+int tty_vt_disallocate(unsigned int vtnr);
 int tty_vt_get_state(struct vt_state *state);
+bool tty_vt_is_active(const tty_t *tty);
+tty_t *tty_vt_active(void);
+void terminal_set_active(tty_t *tty, bool active);
 void tty_sysfs_register(uint64_t dev, const char *name);
 void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
                      int32_t value);

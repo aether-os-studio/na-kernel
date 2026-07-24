@@ -69,6 +69,7 @@ struct flanterm_fb_context {
     size_t offset_x, offset_y;
 
     volatile uint32_t *framebuffer;
+    bool output_enabled;
     size_t pitch;
     size_t width;
     size_t height;

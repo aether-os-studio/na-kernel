@@ -24,6 +24,35 @@ static void input_sysfs_write_file(const char *path, const char *content) {
     vfs_iput(node);
 }
 
+static void input_sysfs_emit_add(const char *device_path,
+                                 dev_input_event_t *input_event) {
+    char path[512];
+    char content[1024];
+    vfs_node_t *uevent;
+
+    if (!device_path || !device_path[0] || !input_event)
+        return;
+
+    snprintf(path, sizeof(path), "%s/uevent", device_path);
+    uevent = sysfs_ensure_file(path);
+    if (!uevent)
+        return;
+
+    snprintf(content, sizeof(content),
+             "SUBSYSTEM=input\nPRODUCT=%x/%x/%x/%x\nNAME=%s\nPHYS=%s\n"
+             "UNIQ=%s\nPROP=%lx\nMODALIAS=input:b%04Xv%04Xp%04Xe%04X\n",
+             input_event->inputid.bustype, input_event->inputid.vendor,
+             input_event->inputid.product, input_event->inputid.version,
+             input_event->devname ? input_event->devname : "",
+             input_event->physloc ? input_event->physloc : "",
+             input_event->uniq, input_event->properties,
+             input_event->inputid.bustype, input_event->inputid.vendor,
+             input_event->inputid.product, input_event->inputid.version);
+    sysfs_write_node(uevent, content, strlen(content), 0);
+    sysfs_trigger_uevent(uevent, "add");
+    vfs_iput(uevent);
+}
+
 static void input_bitmap_to_string(char *out, size_t out_size,
                                    const uint8_t *bitmap, size_t bitmap_bytes) {
     if (!out || out_size == 0)
@@ -238,6 +267,8 @@ static void input_sysfs_publish_metadata(dev_input_event_t *input_event,
                                sizeof(input_event->absbit));
         input_sysfs_write_file(path, content);
     }
+
+    input_sysfs_emit_add(input_dir_path, input_event);
 }
 
 static size_t input_event_bit(void *data, uint64_t request, void *arg) {

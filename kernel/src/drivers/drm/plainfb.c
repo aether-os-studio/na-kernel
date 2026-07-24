@@ -508,7 +508,7 @@ static int plainfb_add_fb(drm_device_t *drm_dev, struct drm_mode_fb_cmd *fb_cmd,
     }
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_alloc(&device->resource_mgr, device);
+        drm_framebuffer_alloc(&drm_dev->resource_mgr, device);
     if (!fb) {
         return -ENOMEM;
     }
@@ -536,7 +536,7 @@ static int plainfb_dirty_fb(drm_device_t *drm_dev,
     }
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_get(&gpu_dev->resource_mgr, cmd->fb_id);
+        drm_framebuffer_get(&drm_dev->resource_mgr, cmd->fb_id);
     if (!fb) {
         return -ENOENT;
     }
@@ -544,7 +544,7 @@ static int plainfb_dirty_fb(drm_device_t *drm_dev,
     uint32_t idx = 0;
     if (!plainfb_handle_to_index(fb->handle, &idx) ||
         !gpu_dev->dumbbuffers[idx].used) {
-        drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
         return -EINVAL;
     }
 
@@ -586,7 +586,7 @@ static int plainfb_dirty_fb(drm_device_t *drm_dev,
                 ret = plainfb_present_dumbbuffer(gpu_dev, idx, bbox_x1, bbox_y1,
                                                  bbox_x2 - bbox_x1,
                                                  bbox_y2 - bbox_y1);
-                drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+                drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
                 return ret;
             }
         }
@@ -609,7 +609,7 @@ static int plainfb_dirty_fb(drm_device_t *drm_dev,
         }
     }
 
-    drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
     return ret;
 }
 
@@ -632,7 +632,7 @@ static int plainfb_add_fb2(drm_device_t *drm_dev,
     }
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_alloc(&device->resource_mgr, device);
+        drm_framebuffer_alloc(&drm_dev->resource_mgr, device);
     if (!fb) {
         return -ENOMEM;
     }
@@ -787,7 +787,7 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
 
                 if (value != 0) {
                     drm_framebuffer_t *fb = drm_framebuffer_get(
-                        &gpu_dev->resource_mgr, (uint32_t)value);
+                        &drm_dev->resource_mgr, (uint32_t)value);
                     if (!fb) {
                         if (connector) {
                             drm_connector_free(&gpu_dev->resource_mgr,
@@ -803,7 +803,7 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
                     uint32_t fb_idx = 0;
                     if (!plainfb_handle_to_index(fb->handle, &fb_idx) ||
                         !gpu_dev->dumbbuffers[fb_idx].used) {
-                        drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+                        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
                         if (connector) {
                             drm_connector_free(&gpu_dev->resource_mgr,
                                                connector->id);
@@ -815,7 +815,7 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
                         return -EINVAL;
                     }
 
-                    drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+                    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
                 }
 
                 if (!test_only) {
@@ -961,7 +961,7 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
     }
 
     drm_framebuffer_t *scanout_fb =
-        drm_framebuffer_get(&gpu_dev->resource_mgr, committed_fb_id);
+        drm_framebuffer_get(&drm_dev->resource_mgr, committed_fb_id);
     if (!scanout_fb) {
         return -ENOENT;
     }
@@ -969,17 +969,17 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
     uint32_t scanout_idx = 0;
     if (!plainfb_handle_to_index(scanout_fb->handle, &scanout_idx) ||
         !gpu_dev->dumbbuffers[scanout_idx].used) {
-        drm_framebuffer_free(&gpu_dev->resource_mgr, scanout_fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, scanout_fb->id);
         return -EINVAL;
     }
 
     int ret = plainfb_present_dumbbuffer(gpu_dev, scanout_idx, 0, 0, 0, 0);
     if (ret != 0) {
-        drm_framebuffer_free(&gpu_dev->resource_mgr, scanout_fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, scanout_fb->id);
         return ret;
     }
 
-    drm_framebuffer_free(&gpu_dev->resource_mgr, scanout_fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, scanout_fb->id);
 
     if (atomic->flags & DRM_MODE_PAGE_FLIP_EVENT) {
         ret = drm_defer_event(drm_dev, fd, DRM_EVENT_FLIP_COMPLETE,
@@ -1044,7 +1044,7 @@ static int plainfb_set_crtc(drm_device_t *drm_dev, struct drm_mode_crtc *crtc,
     }
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_get(&gpu_dev->resource_mgr, crtc->fb_id);
+        drm_framebuffer_get(&drm_dev->resource_mgr, crtc->fb_id);
     if (!fb) {
         return -ENOENT;
     }
@@ -1052,12 +1052,12 @@ static int plainfb_set_crtc(drm_device_t *drm_dev, struct drm_mode_crtc *crtc,
     uint32_t idx = 0;
     if (!plainfb_handle_to_index(fb->handle, &idx) ||
         !gpu_dev->dumbbuffers[idx].used) {
-        drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
         return -EINVAL;
     }
 
     int ret = plainfb_present_dumbbuffer(gpu_dev, idx, 0, 0, 0, 0);
-    drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
     return ret;
 }
 
@@ -1077,13 +1077,13 @@ static int plainfb_page_flip(drm_device_t *drm_dev,
     drm_crtc_free(&gpu_dev->resource_mgr, crtc->id);
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_get(&gpu_dev->resource_mgr, flip->fb_id);
+        drm_framebuffer_get(&drm_dev->resource_mgr, flip->fb_id);
     if (!fb) {
         return -EINVAL;
     }
 
     uint32_t handle = fb->handle;
-    drm_framebuffer_free(&gpu_dev->resource_mgr, fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
 
     uint32_t idx = 0;
     if (!plainfb_handle_to_index(handle, &idx) ||

@@ -1164,7 +1164,7 @@ struct k_drm_event {
     struct drm_file *file;
 };
 
-#define DRM_MAX_EVENTS_COUNT 64
+#define DRM_MAX_EVENTS_COUNT 128
 
 struct drm_connector;
 typedef struct drm_connector drm_connector_t;

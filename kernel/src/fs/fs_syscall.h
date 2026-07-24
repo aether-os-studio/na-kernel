@@ -590,6 +590,10 @@ uint64_t sys_inotify_add_watch(uint64_t notifyfd, const char *path,
  */
 uint64_t sys_inotify_rm_watch(uint64_t watchfd, uint64_t wd);
 
+uint64_t sys_fanotify_init(uint64_t flags, uint64_t event_f_flags);
+uint64_t sys_fanotify_mark(uint64_t fanotify_fd, uint64_t flags, uint64_t mask,
+                           int dfd, const char *path);
+
 /**
  * Linux contract: flush file data and metadata as required by fsync(2).
  * Current kernel: delegates to vfs_fsync_file().

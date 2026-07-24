@@ -405,22 +405,22 @@ uint64_t sys_rseq(void *rseq, uint32_t rseq_len, int flags, uint32_t sig);
 uint64_t sys_alarm(uint64_t seconds);
 /**
  * Linux contract: create a POSIX timer.
- * Current kernel: supports CLOCK_REALTIME and CLOCK_MONOTONIC with SIGEV_NONE
- * or SIGEV_SIGNAL delivery.
- * Gaps: Linux timer notification modes beyond those two are rejected.
+ * Supports CLOCK_REALTIME and CLOCK_MONOTONIC with SIGEV_NONE, SIGEV_SIGNAL,
+ * and Linux's SIGEV_THREAD_ID notification mode.
  */
 uint64_t sys_timer_create(clockid_t clockid, struct sigevent *sevp,
-                          timer_t *timerid);
+                          int *timerid);
 /**
  * Linux contract: arm or disarm a POSIX timer.
  * Current kernel: supports relative and absolute expiry for the timer objects
  * created by sys_timer_create().
- * Gaps: only the create/settime subset is present; matching gettime/delete
- * syscalls are not wired in the syscall tables yet.
  */
-uint64_t sys_timer_settime(timer_t timerid, int flags,
+uint64_t sys_timer_settime(int timerid, int flags,
                            const struct itimerspec *new_value,
                            struct itimerspec *old_value);
+uint64_t sys_timer_gettime(int timerid, struct itimerspec *value);
+uint64_t sys_timer_getoverrun(int timerid);
+uint64_t sys_timer_delete(int timerid);
 
 /**
  * Linux contract: reboot, halt, or power off the machine after validating the

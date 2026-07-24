@@ -1132,7 +1132,7 @@ static int virtio_gpu_drm_add_fb(drm_device_t *drm_dev,
         return -EINVAL;
     }
 
-    drm_framebuffer_t *fb = drm_framebuffer_alloc(&gpu->resource_mgr, gpu);
+    drm_framebuffer_t *fb = drm_framebuffer_alloc(&drm_dev->resource_mgr, gpu);
     if (!fb) {
         return -ENOMEM;
     }
@@ -1174,7 +1174,7 @@ static int virtio_gpu_drm_add_fb2(drm_device_t *drm_dev,
         return -EINVAL;
     }
 
-    drm_framebuffer_t *fb = drm_framebuffer_alloc(&gpu->resource_mgr, gpu);
+    drm_framebuffer_t *fb = drm_framebuffer_alloc(&drm_dev->resource_mgr, gpu);
     if (!fb) {
         return -ENOMEM;
     }
@@ -1217,7 +1217,8 @@ static int virtio_gpu_drm_dirty_fb(drm_device_t *drm_dev,
         return -EINVAL;
     }
 
-    drm_framebuffer_t *fb = drm_framebuffer_get(&gpu->resource_mgr, cmd->fb_id);
+    drm_framebuffer_t *fb =
+        drm_framebuffer_get(&drm_dev->resource_mgr, cmd->fb_id);
     if (!fb) {
         return -ENOENT;
     }
@@ -1225,7 +1226,7 @@ static int virtio_gpu_drm_dirty_fb(drm_device_t *drm_dev,
     uint32_t idx = 0;
     if (!virtio_gpu_handle_to_index(fb->handle, &idx) ||
         !gpu->buffers[idx].used) {
-        drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
         return -EINVAL;
     }
 
@@ -1251,7 +1252,7 @@ static int virtio_gpu_drm_dirty_fb(drm_device_t *drm_dev,
         }
     }
 
-    drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
     return ret;
 }
 
@@ -1295,7 +1296,7 @@ static int virtio_gpu_drm_set_crtc(drm_device_t *drm_dev,
     }
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_get(&gpu->resource_mgr, crtc->fb_id);
+        drm_framebuffer_get(&drm_dev->resource_mgr, crtc->fb_id);
     if (!fb) {
         return -ENOENT;
     }
@@ -1303,12 +1304,12 @@ static int virtio_gpu_drm_set_crtc(drm_device_t *drm_dev,
     uint32_t idx = 0;
     if (!virtio_gpu_handle_to_index(fb->handle, &idx) ||
         !gpu->buffers[idx].used) {
-        drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
         return -EINVAL;
     }
 
     int ret = virtio_gpu_present(gpu, &gpu->buffers[idx], 0, 0, 0, 0, true);
-    drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
     return ret;
 }
 
@@ -1329,7 +1330,7 @@ static int virtio_gpu_drm_page_flip(drm_device_t *drm_dev,
     drm_crtc_free(&gpu->resource_mgr, crtc->id);
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_get(&gpu->resource_mgr, flip->fb_id);
+        drm_framebuffer_get(&drm_dev->resource_mgr, flip->fb_id);
     if (!fb) {
         return -EINVAL;
     }
@@ -1337,12 +1338,12 @@ static int virtio_gpu_drm_page_flip(drm_device_t *drm_dev,
     uint32_t idx = 0;
     if (!virtio_gpu_handle_to_index(fb->handle, &idx) ||
         !gpu->buffers[idx].used) {
-        drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
         return -EINVAL;
     }
 
     int ret = virtio_gpu_present(gpu, &gpu->buffers[idx], 0, 0, 0, 0, true);
-    drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
     if (ret != 0) {
         return ret;
     }
@@ -1471,7 +1472,7 @@ static int virtio_gpu_drm_atomic_commit(drm_device_t *drm_dev,
                 if (plane) {
                     if (value != 0) {
                         drm_framebuffer_t *fb = drm_framebuffer_get(
-                            &gpu->resource_mgr, (uint32_t)value);
+                            &drm_dev->resource_mgr, (uint32_t)value);
                         if (!fb) {
                             err = -ENOENT;
                             goto out_obj;
@@ -1480,7 +1481,7 @@ static int virtio_gpu_drm_atomic_commit(drm_device_t *drm_dev,
                         bool valid =
                             virtio_gpu_handle_to_index(fb->handle, &fb_idx) &&
                             gpu->buffers[fb_idx].used;
-                        drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+                        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
                         if (!valid) {
                             err = -EINVAL;
                             goto out_obj;
@@ -1597,19 +1598,19 @@ static int virtio_gpu_drm_atomic_commit(drm_device_t *drm_dev,
     }
 
     drm_framebuffer_t *fb =
-        drm_framebuffer_get(&gpu->resource_mgr, committed_fb_id);
+        drm_framebuffer_get(&drm_dev->resource_mgr, committed_fb_id);
     if (!fb) {
         return -ENOENT;
     }
     uint32_t idx = 0;
     if (!virtio_gpu_handle_to_index(fb->handle, &idx) ||
         !gpu->buffers[idx].used) {
-        drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+        drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
         return -EINVAL;
     }
 
     int ret = virtio_gpu_present(gpu, &gpu->buffers[idx], 0, 0, 0, 0, true);
-    drm_framebuffer_free(&gpu->resource_mgr, fb->id);
+    drm_framebuffer_free(&drm_dev->resource_mgr, fb->id);
     if (ret != 0) {
         return ret;
     }

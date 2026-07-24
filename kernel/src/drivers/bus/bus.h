@@ -17,6 +17,7 @@ typedef struct vfs_inode vfs_node_t;
 #define K_XLATE 0x01     // 转换模式（生成ASCII）
 #define K_MEDIUMRAW 0x02 // 中等原始模式
 #define K_UNICODE 0x03   // Unicode模式
+#define K_OFF 0x04       // 禁止内核键盘转换
 
 #define VT_OPENQRY 0x5600 /* get next available vt */
 #define VT_GETMODE 0x5601 /* get mode of active vt */
@@ -24,9 +25,11 @@ typedef struct vfs_inode vfs_node_t;
 
 #define VT_GETSTATE 0x5603
 #define VT_SENDSIG 0x5604
+#define VT_RELDISP 0x5605
 
 #define VT_ACTIVATE 0x5606   /* make vt active */
 #define VT_WAITACTIVE 0x5607 /* wait for vt active */
+#define VT_DISALLOCATE 0x5608
 
 struct vt_state {
     uint16_t v_active; // 活动终端号
@@ -44,6 +47,7 @@ struct vt_mode {
 
 #define VT_AUTO 0x00    // 自动切换模式
 #define VT_PROCESS 0x01 // 进程控制模式
+#define VT_ACKACQ 0x02  // 确认已获取显示
 
 typedef size_t (*event_bit_t)(void *data, uint64_t request, void *arg);
 

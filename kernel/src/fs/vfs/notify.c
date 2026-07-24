@@ -13,6 +13,8 @@ typedef struct vfs_notify_event {
     uint64_t mask;
     uint32_t cookie;
     int wd;
+    struct vfs_inode *fid_inode;
+    int32_t pid;
 } vfs_notify_event_t;
 
 typedef struct notifyfs_watch_bucket_entry {
@@ -46,6 +48,8 @@ struct notifyfs_handle {
     uint64_t next_wd;
     uint32_t event_count;
     bool overflow_queued;
+    bool fanotify;
+    unsigned int fanotify_flags;
 };
 
 typedef struct notifyfs_fs_info {
@@ -64,6 +68,37 @@ struct inotify_event {
     unsigned int len;
     char name[];
 };
+
+struct fanotify_event_metadata {
+    uint32_t event_len;
+    uint8_t vers;
+    uint8_t reserved;
+    uint16_t metadata_len;
+    uint64_t mask;
+    int32_t fd;
+    int32_t pid;
+};
+
+struct fanotify_event_info_header {
+    uint8_t info_type;
+    uint8_t pad;
+    uint16_t len;
+};
+
+struct fanotify_event_info_fid_prefix {
+    struct fanotify_event_info_header hdr;
+    int32_t fsid[2];
+    uint32_t handle_bytes;
+    int32_t handle_type;
+    uint64_t ino;
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct fanotify_event_info_fid_prefix) == 28,
+               "fanotify FID info must match the Linux userspace ABI");
+
+#define FANOTIFY_METADATA_VERSION 3U
+#define FAN_EVENT_INFO_TYPE_DFID_NAME 2U
+#define FAN_NOFD (-1)
 
 static struct vfs_file_system_type notifyfs_fs_type;
 static const struct vfs_super_operations notifyfs_super_ops;
@@ -119,8 +154,9 @@ static size_t notify_event_name_len(const vfs_notify_event_t *event) {
     return (len + sizeof(uint32_t) - 1) & ~(sizeof(uint32_t) - 1);
 }
 
-static vfs_notify_event_t *
-notifyfs_event_alloc(int wd, const char *name, uint64_t mask, uint32_t cookie) {
+static vfs_notify_event_t *notifyfs_event_alloc(int wd, const char *name,
+                                                uint64_t mask, uint32_t cookie,
+                                                struct vfs_inode *fid_inode) {
     vfs_notify_event_t *event;
 
     event = calloc(1, sizeof(*event));
@@ -131,6 +167,8 @@ notifyfs_event_alloc(int wd, const char *name, uint64_t mask, uint32_t cookie) {
     event->mask = mask;
     event->cookie = cookie;
     event->wd = wd;
+    event->fid_inode = fid_inode ? vfs_igrab(fid_inode) : NULL;
+    event->pid = current_task ? (int32_t)task_effective_tgid(current_task) : 0;
 
     if (name && name[0]) {
         size_t name_len = strlen(name);
@@ -156,12 +194,15 @@ static void notifyfs_event_free(vfs_notify_event_t *event) {
         return;
 
     free(event->name);
+    if (event->fid_inode)
+        vfs_iput(event->fid_inode);
     free(event);
 }
 
 static bool notifyfs_handle_queue_event(notifyfs_handle_t *handle, int wd,
                                         const char *name, uint64_t mask,
-                                        uint32_t cookie) {
+                                        uint32_t cookie,
+                                        struct vfs_inode *fid_inode) {
     vfs_notify_event_t *event;
     vfs_notify_event_t *overflow = NULL;
     bool queued = false;
@@ -169,12 +210,12 @@ static bool notifyfs_handle_queue_event(notifyfs_handle_t *handle, int wd,
     if (!handle || !mask)
         return false;
 
-    event = notifyfs_event_alloc(wd, name, mask, cookie);
+    event = notifyfs_event_alloc(wd, name, mask, cookie, fid_inode);
     if (!event)
         return false;
 
     if (mask != IN_Q_OVERFLOW)
-        overflow = notifyfs_event_alloc(-1, NULL, IN_Q_OVERFLOW, 0);
+        overflow = notifyfs_event_alloc(-1, NULL, IN_Q_OVERFLOW, 0, NULL);
 
     spin_lock(&handle->events_lock);
     if (handle->event_count >= NOTIFYFS_MAX_QUEUED_EVENTS) {
@@ -311,7 +352,7 @@ static void notifyfs_watch_deactivate_locked(notifyfs_watch_t *watch,
         return;
 
     if (notifyfs_handle_queue_event(watch->handle, (int)watch->wd, NULL,
-                                    IN_IGNORED, 0))
+                                    IN_IGNORED, 0, watch->watch_inode))
         notifyfs_signal_owner(watch);
 }
 
@@ -329,7 +370,7 @@ notifyfs_watch_deactivate_bucket_locked(notifyfs_watch_t *watch,
         return;
 
     if (notifyfs_handle_queue_event(watch->handle, (int)watch->wd, NULL,
-                                    IN_IGNORED, 0))
+                                    IN_IGNORED, 0, watch->watch_inode))
         notifyfs_signal_owner(watch);
 }
 
@@ -423,6 +464,83 @@ notifyfs_drain_events_locked(notifyfs_handle_t *handle, void *addr, size_t size,
     llist_for_each(watch, watch_tmp, &handle->watches, node)
         notifyfs_maybe_collect_stale_watch_locked(watch, stale_watches);
     spin_unlock(&handle->lock);
+    return (ssize_t)total_write;
+}
+
+static size_t notifyfs_fanotify_event_size(const vfs_notify_event_t *event) {
+    size_t name_len;
+    size_t info_len;
+
+    if (!event || (event->mask & IN_Q_OVERFLOW))
+        return sizeof(struct fanotify_event_metadata);
+
+    name_len = event->name ? (size_t)event->name_len + 1 : 1;
+    info_len = sizeof(struct fanotify_event_info_fid_prefix) + name_len;
+    info_len = (info_len + 7U) & ~7U;
+    return sizeof(struct fanotify_event_metadata) + info_len;
+}
+
+static ssize_t notifyfs_drain_fanotify_events(notifyfs_handle_t *handle,
+                                              void *addr, size_t size) {
+    uint8_t *write_pos = addr;
+    size_t total_write = 0;
+
+    if (!handle || !addr)
+        return -EINVAL;
+
+    spin_lock(&handle->events_lock);
+    vfs_notify_event_t *event, *event_tmp;
+    llist_for_each(event, event_tmp, &handle->events, node) {
+        size_t event_len = notifyfs_fanotify_event_size(event);
+        if (total_write + event_len > size) {
+            spin_unlock(&handle->events_lock);
+            return total_write ? (ssize_t)total_write : -EINVAL;
+        }
+
+        llist_delete(&event->node);
+        if (handle->event_count)
+            handle->event_count--;
+        if (event->mask & IN_Q_OVERFLOW)
+            handle->overflow_queued = false;
+
+        memset(write_pos, 0, event_len);
+        struct fanotify_event_metadata *metadata =
+            (struct fanotify_event_metadata *)write_pos;
+        metadata->event_len = (uint32_t)event_len;
+        metadata->vers = FANOTIFY_METADATA_VERSION;
+        metadata->metadata_len = sizeof(*metadata);
+        metadata->mask = event->mask;
+        metadata->fd = FAN_NOFD;
+        metadata->pid = event->pid;
+
+        if (!(event->mask & IN_Q_OVERFLOW)) {
+            struct fanotify_event_info_fid_prefix *info =
+                (struct fanotify_event_info_fid_prefix *)(write_pos +
+                                                          sizeof(*metadata));
+            size_t info_len = event_len - sizeof(*metadata);
+            dev64_t dev = event->fid_inode && event->fid_inode->i_sb
+                              ? event->fid_inode->i_sb->s_dev
+                              : 0;
+
+            info->hdr.info_type = FAN_EVENT_INFO_TYPE_DFID_NAME;
+            info->hdr.len = (uint16_t)info_len;
+            info->fsid[0] = (int32_t)(uint32_t)dev;
+            info->fsid[1] = (int32_t)(uint32_t)(dev >> 32);
+            info->handle_bytes = sizeof(uint64_t);
+            info->handle_type = 1;
+            info->ino = event->fid_inode ? event->fid_inode->i_ino : 0;
+
+            char *name = (char *)(info + 1);
+            if (event->name && event->name_len)
+                memcpy(name, event->name, event->name_len);
+            name[event->name_len] = '\0';
+        }
+
+        write_pos += event_len;
+        total_write += event_len;
+        notifyfs_event_free(event);
+    }
+    spin_unlock(&handle->events_lock);
     return (ssize_t)total_write;
 }
 
@@ -552,6 +670,42 @@ int notifyfs_handle_remove_watch(notifyfs_handle_t *handle, uint64_t wd) {
     return -EINVAL;
 }
 
+int notifyfs_handle_remove_watch_inode(notifyfs_handle_t *handle,
+                                       struct vfs_inode *watch_inode) {
+    notifyfs_watch_t *watch, *tmp;
+
+    if (!handle || !watch_inode)
+        return -EINVAL;
+
+    spin_lock(&handle->lock);
+    llist_for_each(watch, tmp, &handle->watches, node) {
+        if (watch->watch_inode != watch_inode || !watch->active)
+            continue;
+        notifyfs_watch_deactivate_locked(watch, false);
+        llist_delete(&watch->node);
+        spin_unlock(&handle->lock);
+        notifyfs_free_watch(watch);
+        return 0;
+    }
+    spin_unlock(&handle->lock);
+    return -ENOENT;
+}
+
+int notifyfs_handle_set_fanotify(notifyfs_handle_t *handle,
+                                 unsigned int init_flags) {
+    if (!handle)
+        return -EINVAL;
+    if (!llist_empty(&handle->watches) || !llist_empty(&handle->events))
+        return -EBUSY;
+    handle->fanotify = true;
+    handle->fanotify_flags = init_flags;
+    return 0;
+}
+
+bool notifyfs_handle_is_fanotify(notifyfs_handle_t *handle) {
+    return handle && handle->fanotify;
+}
+
 uint32_t notifyfs_next_cookie(void) {
     uint32_t cookie =
         __atomic_add_fetch(&notifyfs_cookie_seq, 1, __ATOMIC_ACQ_REL);
@@ -597,7 +751,7 @@ bool notifyfs_queue_inode_event(struct vfs_inode *watch_inode,
             continue;
 
         if (!notifyfs_handle_queue_event(watch->handle, (int)watch->wd, name,
-                                         event_mask, cookie))
+                                         event_mask, cookie, watch_inode))
             continue;
 
         notifyfs_signal_owner(watch);
@@ -630,7 +784,10 @@ static ssize_t notifyfs_read(struct vfs_file *file, void *addr, size_t size,
         ssize_t ret;
 
         llist_init_head(&stale_watches);
-        ret = notifyfs_drain_events_locked(handle, addr, size, &stale_watches);
+        ret = handle && handle->fanotify
+                  ? notifyfs_drain_fanotify_events(handle, addr, size)
+                  : notifyfs_drain_events_locked(handle, addr, size,
+                                                 &stale_watches);
         notifyfs_free_watch_list(&stale_watches);
         if (ret != 0)
             return ret;
@@ -660,8 +817,9 @@ static long notifyfs_ioctl(struct vfs_file *file, unsigned long cmd,
         spin_lock(&handle->events_lock);
         vfs_notify_event_t *event, *event_tmp;
         llist_for_each(event, event_tmp, &handle->events, node) {
-            total +=
-                sizeof(struct inotify_event) + notify_event_name_len(event);
+            total += handle->fanotify ? notifyfs_fanotify_event_size(event)
+                                      : sizeof(struct inotify_event) +
+                                            notify_event_name_len(event);
         }
         spin_unlock(&handle->events_lock);
 

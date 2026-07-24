@@ -35,6 +35,8 @@ vfs_node_t *sysfs_child_append_symlink(vfs_node_t *parent, const char *name,
                                        const char *target_path);
 int sysfs_write_node(vfs_node_t *node, const void *buf, size_t len,
                      size_t offset);
+int sysfs_trigger_uevent(vfs_node_t *node, const char *action);
+void sysfs_notify_node(vfs_node_t *node);
 char *sysfs_node_path(vfs_node_t *node);
 
 void sysfs_register_device(bus_device_t *device);

@@ -6,6 +6,7 @@
 typedef struct sysfs_entry {
     struct llist_header sibling;
     struct llist_header children;
+    struct llist_header inodes;
     struct sysfs_entry *parent;
     char *name;
     char *path;
@@ -14,13 +15,19 @@ typedef struct sysfs_entry {
     char *content;
     size_t size;
     size_t capacity;
+    uint64_t notify_seq;
     char *link_target;
     bus_device_t *bin_device;
     bin_attribute_t *bin_attr;
 } sysfs_entry_t;
 
+typedef struct sysfs_file_context {
+    uint64_t seen_notify_seq;
+} sysfs_file_context_t;
+
 typedef struct sysfs_inode_info {
     struct vfs_inode vfs_inode;
+    struct llist_header entry_node;
     sysfs_entry_t *entry;
     char *path;
 } sysfs_inode_info_t;
@@ -80,6 +87,7 @@ static void sysfs_registry_init(void) {
     memset(&sysfs_tree_root, 0, sizeof(sysfs_tree_root));
     llist_init_head(&sysfs_tree_root.sibling);
     llist_init_head(&sysfs_tree_root.children);
+    llist_init_head(&sysfs_tree_root.inodes);
     sysfs_tree_root.name = "sys";
     sysfs_tree_root.path = "/sys";
     sysfs_tree_root.mode = S_IFDIR | 0755;
@@ -136,6 +144,7 @@ static sysfs_entry_t *sysfs_new_entry(sysfs_entry_t *parent, const char *name,
     entry->ino = (ino64_t)(uintptr_t)entry;
     llist_init_head(&entry->sibling);
     llist_init_head(&entry->children);
+    llist_init_head(&entry->inodes);
     llist_append(&parent->children, &entry->sibling);
     return entry;
 
@@ -267,6 +276,7 @@ static vfs_node_t *sysfs_new_inode(struct vfs_super_block *sb,
     if (!inode || !entry)
         return NULL;
     info = sysfs_i(inode);
+    llist_init_head(&info->entry_node);
 
     inode->i_op = &sysfs_inode_ops;
     inode->i_ino = entry->ino;
@@ -281,6 +291,9 @@ static vfs_node_t *sysfs_new_inode(struct vfs_super_block *sb,
         vfs_iput(inode);
         return NULL;
     }
+    spin_lock(&sysfs_oplock);
+    llist_append(&entry->inodes, &info->entry_node);
+    spin_unlock(&sysfs_oplock);
     return inode;
 }
 
@@ -418,8 +431,8 @@ static ssize_t sysfs_uevent_write(sysfs_entry_t *entry, const void *buf,
     const char *content = entry->content ? entry->content : "";
     int seqnum = alloc_seq_num();
     size_t buffer_len =
-        snprintf(NULL, 0, "add@%s\nACTION=add\nSEQNUM=%d\n%s%s", devpath,
-                 seqnum, content,
+        snprintf(NULL, 0, "add@%s\nACTION=add\nDEVPATH=%s\nSEQNUM=%d\n%s%s",
+                 devpath, devpath, seqnum, content,
                  content[0] && content[strlen(content) - 1] == '\n' ? ""
                                                                     : "\n") +
         1;
@@ -427,7 +440,8 @@ static ssize_t sysfs_uevent_write(sysfs_entry_t *entry, const void *buf,
     if (!event_buffer)
         return -ENOMEM;
 
-    snprintf(event_buffer, buffer_len, "add@%s\nACTION=add\nSEQNUM=%d\n%s%s",
+    snprintf(event_buffer, buffer_len,
+             "add@%s\nACTION=add\nDEVPATH=%s\nSEQNUM=%d\n%s%s", devpath,
              devpath, seqnum, content,
              content[0] && content[strlen(content) - 1] == '\n' ? "" : "\n");
 
@@ -552,21 +566,38 @@ static int sysfs_iterate_shared(struct vfs_file *file,
 static int sysfs_open_file(struct vfs_inode *inode, struct vfs_file *file) {
     if (!inode || !file)
         return -EINVAL;
+
+    sysfs_entry_t *entry = sysfs_entry_from_inode(inode);
+    sysfs_file_context_t *context = calloc(1, sizeof(*context));
+    if (!context)
+        return -ENOMEM;
+    context->seen_notify_seq = entry ? entry->notify_seq : 0;
+    file->private_data = context;
     file->f_op = inode->i_fop;
     return 0;
 }
 
 static int sysfs_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     (void)inode;
-    (void)file;
+    if (file) {
+        free(file->private_data);
+        file->private_data = NULL;
+    }
     return 0;
 }
 
 static __poll_t sysfs_poll_file(struct vfs_file *file,
                                 struct vfs_poll_table *pt) {
-    (void)file;
+    sysfs_entry_t *entry = sysfs_entry_from_inode(file ? file->f_inode : NULL);
+    sysfs_file_context_t *context = file ? file->private_data : NULL;
+    __poll_t events = EPOLLIN | EPOLLOUT;
+
     (void)pt;
-    return EPOLLIN | EPOLLOUT;
+    if (entry && context && context->seen_notify_seq != entry->notify_seq) {
+        context->seen_notify_seq = entry->notify_seq;
+        events |= EPOLLPRI | EPOLLERR;
+    }
+    return events;
 }
 
 static struct vfs_inode *sysfs_alloc_inode(struct vfs_super_block *sb) {
@@ -584,6 +615,10 @@ static void sysfs_destroy_inode(struct vfs_inode *inode) {
     info = sysfs_i(inode);
     if (!info)
         return;
+    spin_lock(&sysfs_oplock);
+    if (!llist_empty(&info->entry_node))
+        llist_delete(&info->entry_node);
+    spin_unlock(&sysfs_oplock);
     free(info->path);
     free(info);
 }
@@ -707,6 +742,27 @@ int sysfs_write_node(vfs_node_t *node, const void *buf, size_t len,
     if (ret >= 0 && node && entry)
         node->i_size = entry->size;
     return (int)ret;
+}
+
+int sysfs_trigger_uevent(vfs_node_t *node, const char *action) {
+    sysfs_entry_t *entry = sysfs_entry_from_inode(node);
+
+    if (!entry || !action)
+        return -EINVAL;
+    return (int)sysfs_uevent_write(entry, action, strlen(action));
+}
+
+void sysfs_notify_node(vfs_node_t *node) {
+    sysfs_entry_t *entry = sysfs_entry_from_inode(node);
+    sysfs_inode_info_t *info, *tmp;
+
+    if (!node || !entry)
+        return;
+    __atomic_add_fetch(&entry->notify_seq, 1, __ATOMIC_RELEASE);
+    spin_lock(&sysfs_oplock);
+    llist_for_each(info, tmp, &entry->inodes, entry_node)
+        vfs_poll_notify_inode(&info->vfs_inode, EPOLLPRI | EPOLLERR);
+    spin_unlock(&sysfs_oplock);
 }
 
 char *sysfs_node_path(vfs_node_t *node) {

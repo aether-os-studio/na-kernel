@@ -476,6 +476,8 @@ static void plot_char_scaled_canvas(struct flanterm_context *_ctx,
                                     struct flanterm_fb_char *c, size_t x,
                                     size_t y) {
     struct flanterm_fb_context *ctx = (void *)_ctx;
+    if (!ctx->output_enabled)
+        return;
 
     if (x >= _ctx->cols || y >= _ctx->rows) {
         return;
@@ -538,6 +540,8 @@ static void plot_char_scaled_uncanvas(struct flanterm_context *_ctx,
                                       struct flanterm_fb_char *c, size_t x,
                                       size_t y) {
     struct flanterm_fb_context *ctx = (void *)_ctx;
+    if (!ctx->output_enabled)
+        return;
 
     if (x >= _ctx->cols || y >= _ctx->rows) {
         return;
@@ -601,6 +605,8 @@ static void plot_char_unscaled_canvas(struct flanterm_context *_ctx,
                                       struct flanterm_fb_char *c, size_t x,
                                       size_t y) {
     struct flanterm_fb_context *ctx = (void *)_ctx;
+    if (!ctx->output_enabled)
+        return;
 
     if (x >= _ctx->cols || y >= _ctx->rows) {
         return;
@@ -658,6 +664,8 @@ static void plot_char_unscaled_uncanvas(struct flanterm_context *_ctx,
                                         struct flanterm_fb_char *c, size_t x,
                                         size_t y) {
     struct flanterm_fb_context *ctx = (void *)_ctx;
+    if (!ctx->output_enabled)
+        return;
 
     if (x >= _ctx->cols || y >= _ctx->rows) {
         return;
@@ -1104,6 +1112,13 @@ static void flanterm_fb_deinit(struct flanterm_context *_ctx,
     _free(ctx, sizeof(struct flanterm_fb_context));
 }
 
+void flanterm_set_output_enabled(struct flanterm_context *_ctx, bool enabled) {
+    struct flanterm_fb_context *ctx = (void *)_ctx;
+
+    if (ctx)
+        ctx->output_enabled = enabled;
+}
+
 struct flanterm_context *flanterm_fb_init(
     void *(*_malloc)(size_t), void (*_free)(void *, size_t),
     uint32_t *framebuffer, size_t width, size_t height, size_t pitch,
@@ -1179,6 +1194,7 @@ struct flanterm_context *flanterm_fb_init(
 
     struct flanterm_context *_ctx = (void *)ctx;
     memset(ctx, 0, sizeof(struct flanterm_fb_context));
+    ctx->output_enabled = true;
 
     ctx->red_mask_size = red_mask_size;
     ctx->red_mask_shift = red_mask_shift + (red_mask_size - 8);

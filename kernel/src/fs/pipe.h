@@ -49,6 +49,12 @@ typedef struct pipe_specific pipe_specific_t;
 struct pipe_specific {
     bool read;
     bool write;
+    /*
+     * POLLHUP on a FIFO reader means that a writer which was visible to this
+     * open file description has gone away.  A nonblocking reader opened
+     * before the first writer must not report POLLHUP immediately.
+     */
+    bool seen_writer;
     pipe_info_t *info;
 };
 

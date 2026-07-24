@@ -586,11 +586,10 @@ void syscall_handler_init() {
     syscall_handlers[SYS_CLOCK_GETTIME_TIME32] =
         (syscall_handle_t)sys_clock_gettime;
     syscall_handlers[SYS_TIMER_SETTIME] = (syscall_handle_t)sys_timer_settime;
-    // syscall_handlers[SYS_TIMER_GETTIME] =
-    // (syscall_handle_t)sys_timer_gettime;
-    // syscall_handlers[SYS_TIMER_GETOVERRUN] =
-    //     (syscall_handle_t)sys_timer_getoverrun;
-    // syscall_handlers[SYS_TIMER_DELETE] = (syscall_handle_t)sys_timer_delete;
+    syscall_handlers[SYS_TIMER_GETTIME] = (syscall_handle_t)sys_timer_gettime;
+    syscall_handlers[SYS_TIMER_GETOVERRUN] =
+        (syscall_handle_t)sys_timer_getoverrun;
+    syscall_handlers[SYS_TIMER_DELETE] = (syscall_handle_t)sys_timer_delete;
     // syscall_handlers[SYS_CLOCK_SETTIME] =
     // (syscall_handle_t)sys_clock_settime;
     syscall_handlers[SYS_CLOCK_GETTIME_TIME32] =
@@ -692,8 +691,8 @@ void syscall_handler_init() {
     //     (syscall_handle_t)sys_perf_event_open;
     syscall_handlers[SYS_RECVMMSG_TIME32] = (syscall_handle_t)sys_recvmmsg;
     // syscall_handlers[SYS_FANOTIFY_INIT] =
-    // (syscall_handle_t)sys_fanotify_init; syscall_handlers[SYS_FANOTIFY_MARK]
-    // = (syscall_handle_t)sys_fanotify_mark;
+    syscall_handlers[SYS_FANOTIFY_INIT] = (syscall_handle_t)sys_fanotify_init;
+    syscall_handlers[SYS_FANOTIFY_MARK] = (syscall_handle_t)sys_fanotify_mark;
     syscall_handlers[SYS_PRLIMIT64] = (syscall_handle_t)sys_prlimit64;
     syscall_handlers[SYS_NAME_TO_HANDLE_AT] =
         (syscall_handle_t)sys_name_to_handle_at;

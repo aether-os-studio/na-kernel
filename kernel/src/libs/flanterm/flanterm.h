@@ -66,6 +66,7 @@ void flanterm_write(struct flanterm_context *ctx, const char *buf,
                     size_t count);
 void flanterm_flush(struct flanterm_context *ctx);
 void flanterm_full_refresh(struct flanterm_context *ctx);
+void flanterm_set_output_enabled(struct flanterm_context *ctx, bool enabled);
 void flanterm_deinit(struct flanterm_context *ctx,
                      void (*_free)(void *ptr, size_t size));
 

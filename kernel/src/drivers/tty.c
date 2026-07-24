@@ -14,7 +14,11 @@ tty_t *kernel_session = NULL; // 内核会话
 static spinlock_t tty_vt_lock = SPIN_INIT;
 static uint64_t tty_vt_present;
 static unsigned int tty_active_vt = 1;
+static unsigned int tty_pending_vt;
 static vfs_node_t *tty_active_node;
+static tty_t *tty_vts[64];
+static tty_t *tty0_proxy;
+static wait_queue_head_t tty_vt_wait;
 
 extern void send_process_group_signal(int pgid, int sig);
 
@@ -620,7 +624,7 @@ void tty_input_flush(tty_t *tty) {
 
 void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
                      int32_t value) {
-    tty_t *tty = kernel_session;
+    tty_t *tty = tty_vt_active();
     char out[8];
     size_t out_len = 0;
 
@@ -666,6 +670,9 @@ void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
             return;
         }
     }
+
+    if (tty->tty_kbmode == K_OFF)
+        return;
 
     if (!tty_translate_key(tty, code, out, &out_len))
         return;
@@ -750,7 +757,7 @@ next:
 }
 
 void tty_init() {
-    kernel_session = malloc(sizeof(tty_t));
+    wait_queue_init(&tty_vt_wait);
 
     boot_framebuffer_t *framebuffer = boot_get_framebuffer();
 
@@ -798,7 +805,7 @@ void tty_init() {
     }
 }
 
-extern void create_session_terminal(tty_t *tty);
+extern uint64_t create_session_terminal(tty_t *tty);
 extern void create_session_terminal_serial(tty_t *tty);
 
 static int tty_name_to_vtnr(const char *name, unsigned int *ret) {
@@ -829,8 +836,10 @@ static void tty_sysfs_update_active_locked(void) {
         return;
 
     len = snprintf(value, sizeof(value), "tty%u\n", tty_active_vt);
-    if (len > 0)
+    if (len > 0) {
         sysfs_write_node(tty_active_node, value, (size_t)len, 0);
+        sysfs_notify_node(tty_active_node);
+    }
 }
 
 void tty_sysfs_register(uint64_t dev, const char *name) {
@@ -856,8 +865,6 @@ void tty_sysfs_register(uint64_t dev, const char *name) {
                 vfs_iput(tty_active_node);
             tty_active_node = sysfs_child_append(root, "active", false);
             tty_sysfs_update_active_locked();
-        } else {
-            tty_vt_present |= 1ULL << vtnr;
         }
         spin_unlock(&tty_vt_lock);
     }
@@ -866,20 +873,205 @@ void tty_sysfs_register(uint64_t dev, const char *name) {
 }
 
 int tty_vt_activate(unsigned int vtnr) {
-    int ret = 0;
+    tty_t *old_tty;
+    tty_t *new_tty;
+    uint64_t controller = 0;
+    int relsig = 0;
 
     if (vtnr == 0 || vtnr > 63)
         return -EINVAL;
 
     spin_lock(&tty_vt_lock);
-    if (!(tty_vt_present & (1ULL << vtnr)))
-        ret = -ENXIO;
-    else {
-        tty_active_vt = vtnr;
-        tty_sysfs_update_active_locked();
+    new_tty = tty_vts[vtnr];
+    if (!new_tty) {
+        spin_unlock(&tty_vt_lock);
+        return -ENXIO;
+    }
+
+    new_tty->vt_allocated = true;
+    tty_vt_present |= 1ULL << vtnr;
+    if (tty_active_vt == vtnr) {
+        spin_unlock(&tty_vt_lock);
+        return 0;
+    }
+    if (tty_pending_vt) {
+        int ret = tty_pending_vt == vtnr ? 0 : -EBUSY;
+        spin_unlock(&tty_vt_lock);
+        return ret;
+    }
+
+    old_tty = tty_vts[tty_active_vt];
+    if (old_tty && old_tty->current_vt_mode.mode == VT_PROCESS &&
+        old_tty->vt_controller_tgid && old_tty->current_vt_mode.relsig > 0) {
+        tty_pending_vt = vtnr;
+        controller = old_tty->vt_controller_tgid;
+        relsig = old_tty->current_vt_mode.relsig;
+        spin_unlock(&tty_vt_lock);
+
+        if (task_kill_thread_group(controller, relsig) > 0)
+            return 0;
+
+        spin_lock(&tty_vt_lock);
+        if (tty_pending_vt != vtnr) {
+            spin_unlock(&tty_vt_lock);
+            return 0;
+        }
+    }
+
+    old_tty = tty_vts[tty_active_vt];
+    tty_active_vt = vtnr;
+    tty_pending_vt = 0;
+    tty_sysfs_update_active_locked();
+    spin_unlock(&tty_vt_lock);
+
+    terminal_set_active(old_tty, false);
+    terminal_set_active(new_tty, true);
+    wait_queue_wake_all(&tty_vt_wait, 0, EOK);
+
+    if (new_tty->current_vt_mode.mode == VT_PROCESS &&
+        new_tty->vt_controller_tgid && new_tty->current_vt_mode.acqsig > 0)
+        task_kill_thread_group(new_tty->vt_controller_tgid,
+                               new_tty->current_vt_mode.acqsig);
+    return 0;
+}
+
+bool tty_vt_is_active(const tty_t *tty) {
+    bool active;
+
+    if (!tty || tty->vtnr == 0)
+        return false;
+    spin_lock(&tty_vt_lock);
+    active = tty_active_vt == tty->vtnr;
+    spin_unlock(&tty_vt_lock);
+    return active;
+}
+
+tty_t *tty_vt_active(void) {
+    tty_t *tty;
+
+    spin_lock(&tty_vt_lock);
+    tty = tty_vts[tty_active_vt];
+    spin_unlock(&tty_vt_lock);
+    return tty ? tty : kernel_session;
+}
+
+int tty_vt_waitactive(unsigned int vtnr) {
+    if (vtnr == 0 || vtnr > 63 || !tty_vts[vtnr])
+        return -ENXIO;
+
+    for (;;) {
+        wait_queue_entry_t wait;
+
+        spin_lock(&tty_vt_lock);
+        bool active = tty_active_vt == vtnr;
+        spin_unlock(&tty_vt_lock);
+        if (active)
+            return 0;
+        if (task_signal_has_deliverable(current_task))
+            return -EINTR;
+
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&tty_vt_wait, &wait);
+
+        spin_lock(&tty_vt_lock);
+        active = tty_active_vt == vtnr;
+        spin_unlock(&tty_vt_lock);
+        if (active) {
+            wait_queue_remove(&tty_vt_wait, &wait);
+            task_cancel_block_prepare(current_task);
+            return 0;
+        }
+
+        int reason =
+            task_block(current_task, TASK_BLOCKING, -1, "tty_vt_waitactive");
+        wait_queue_remove(&tty_vt_wait, &wait);
+        task_cancel_block_prepare(current_task);
+        if (reason < 0)
+            return reason;
+        if (task_signal_has_deliverable(current_task))
+            return -EINTR;
+    }
+}
+
+int tty_vt_openqry(void) {
+    int ret = -1;
+
+    spin_lock(&tty_vt_lock);
+    for (unsigned int i = 1; i < 64; i++) {
+        if (tty_vts[i] && !tty_vts[i]->vt_allocated) {
+            ret = (int)i;
+            break;
+        }
     }
     spin_unlock(&tty_vt_lock);
     return ret;
+}
+
+int tty_vt_reldisp(tty_t *tty, unsigned int action) {
+    tty_t *old_tty;
+    tty_t *new_tty;
+    unsigned int target;
+
+    if (!tty || tty->vtnr == 0)
+        return -EINVAL;
+    if (action == VT_ACKACQ)
+        return 0;
+    if (action > 1)
+        return -EINVAL;
+
+    spin_lock(&tty_vt_lock);
+    if (tty_active_vt != tty->vtnr || !tty_pending_vt) {
+        spin_unlock(&tty_vt_lock);
+        return -EINVAL;
+    }
+    if (action == 0) {
+        tty_pending_vt = 0;
+        spin_unlock(&tty_vt_lock);
+        return 0;
+    }
+
+    target = tty_pending_vt;
+    old_tty = tty_vts[tty_active_vt];
+    new_tty = tty_vts[target];
+    tty_active_vt = target;
+    tty_pending_vt = 0;
+    tty_sysfs_update_active_locked();
+    spin_unlock(&tty_vt_lock);
+
+    terminal_set_active(old_tty, false);
+    terminal_set_active(new_tty, true);
+    wait_queue_wake_all(&tty_vt_wait, 0, EOK);
+    if (new_tty && new_tty->current_vt_mode.mode == VT_PROCESS &&
+        new_tty->vt_controller_tgid && new_tty->current_vt_mode.acqsig > 0)
+        task_kill_thread_group(new_tty->vt_controller_tgid,
+                               new_tty->current_vt_mode.acqsig);
+    return 0;
+}
+
+int tty_vt_disallocate(unsigned int vtnr) {
+    if (vtnr > 63)
+        return -EINVAL;
+
+    spin_lock(&tty_vt_lock);
+    if (vtnr && vtnr == tty_active_vt) {
+        spin_unlock(&tty_vt_lock);
+        return -EBUSY;
+    }
+    for (unsigned int i = vtnr ? vtnr : 1; i < 64; i++) {
+        tty_t *tty = tty_vts[i];
+        if (!tty || i == tty_active_vt)
+            goto next;
+        tty->vt_allocated = false;
+        tty->current_vt_mode.mode = VT_AUTO;
+        tty->vt_controller_tgid = 0;
+        tty_vt_present &= ~(1ULL << i);
+    next:
+        if (vtnr)
+            break;
+    }
+    spin_unlock(&tty_vt_lock);
+    return 0;
 }
 
 int tty_vt_get_state(struct vt_state *state) {
@@ -895,28 +1087,71 @@ int tty_vt_get_state(struct vt_state *state) {
 }
 
 int tty_ioctl(void *dev, int cmd, void *args) {
-    tty_t *tty = dev;
+    tty_t *tty = dev == tty0_proxy ? tty_vt_active() : dev;
+    if (!tty)
+        return -ENXIO;
     return tty->ops.ioctl(tty, cmd, (uint64_t)args);
 }
 
 int tty_poll(void *dev, int events, fd_t *fd) {
-    tty_t *tty = dev;
+    tty_t *tty = dev == tty0_proxy ? tty_vt_active() : dev;
+    if (!tty)
+        return -ENXIO;
     (void)fd;
     return tty->ops.poll(tty, events);
 }
 
 int tty_read(void *dev, void *buf, uint64_t offset, size_t size, fd_t *fd) {
-    tty_t *tty = dev;
+    tty_t *tty = dev == tty0_proxy ? tty_vt_active() : dev;
+    if (!tty)
+        return -ENXIO;
     (void)offset;
     return tty->ops.read(tty, buf, size, fd);
 }
 
 int tty_write(void *dev, const void *buf, uint64_t offset, size_t size,
               fd_t *fd) {
-    tty_t *tty = dev;
+    tty_t *tty = dev == tty0_proxy ? tty_vt_active() : dev;
+    if (!tty)
+        return -ENXIO;
     (void)offset;
     (void)fd;
     return tty->ops.write(tty, buf, size);
+}
+
+static ssize_t tty_vt_open(void *dev, void *arg) {
+    tty_t *tty = dev;
+    (void)arg;
+
+    if (!tty)
+        return -ENXIO;
+    if (tty->vtnr) {
+        spin_lock(&tty_vt_lock);
+        tty->vt_open_count++;
+        tty->vt_allocated = true;
+        tty_vt_present |= 1ULL << tty->vtnr;
+        spin_unlock(&tty_vt_lock);
+    }
+    return 0;
+}
+
+static ssize_t tty_vt_close(void *dev, void *arg) {
+    tty_t *tty = dev;
+    (void)arg;
+
+    if (!tty || !tty->vtnr)
+        return 0;
+
+    spin_lock(&tty_vt_lock);
+    if (tty->vt_open_count > 0)
+        tty->vt_open_count--;
+    if (tty->vt_open_count == 0 && tty->vtnr != tty_active_vt &&
+        tty->at_session_id == 0) {
+        tty->vt_allocated = false;
+        tty_vt_present &= ~(1ULL << tty->vtnr);
+    }
+    spin_unlock(&tty_vt_lock);
+    return 0;
 }
 
 void tty_init_session() {
@@ -928,23 +1163,43 @@ void tty_init_session() {
         device = container_of(tty_device_list.prev, tty_device_t, node);
     }
 
-    tty_t *tty = calloc(1, sizeof(tty_t));
-    tty->device = device;
-    spin_init(&tty->input_lock);
-    wait_queue_init(&tty->input_wait);
-    llist_init_head(&tty->node);
-    create_session_terminal(tty);
-    tty_register_session(tty);
-    uint64_t tty0_dev =
-        device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, NULL, NULL,
-                       tty_ioctl, tty_poll, tty_read, tty_write, NULL);
-    uint64_t tty1_dev =
-        device_install(DEV_CHAR, DEV_TTY, tty, "tty1", 0, NULL, NULL, tty_ioctl,
-                       tty_poll, tty_read, tty_write, NULL);
-    tty_sysfs_register(tty1_dev, "tty1");
+    tty0_proxy = calloc(1, sizeof(*tty0_proxy));
+    uint64_t tty0_dev = device_install(DEV_CHAR, DEV_TTY, tty0_proxy, tty_name,
+                                       0, tty_vt_open, tty_vt_close, tty_ioctl,
+                                       tty_poll, tty_read, tty_write, NULL);
     tty_sysfs_register(tty0_dev, tty_name);
 
-    kernel_session = tty;
+    for (unsigned int i = 1; i < 64; i++) {
+        char name[16];
+        tty_t *tty = calloc(1, sizeof(*tty));
+        if (!tty)
+            break;
+
+        tty->device = device;
+        tty->vtnr = i;
+        tty->vt_allocated = i == 1;
+        spin_init(&tty->input_lock);
+        wait_queue_init(&tty->input_wait);
+        llist_init_head(&tty->node);
+        if ((int64_t)create_session_terminal(tty) < 0) {
+            free(tty);
+            break;
+        }
+        terminal_set_active(tty, i == 1);
+        tty_register_session(tty);
+        tty_vts[i] = tty;
+        if (i == 1)
+            tty_vt_present |= 1ULL << i;
+
+        snprintf(name, sizeof(name), "tty%u", i);
+        uint64_t dev = device_install(DEV_CHAR, DEV_TTY, tty, name, 0,
+                                      tty_vt_open, tty_vt_close, tty_ioctl,
+                                      tty_poll, tty_read, tty_write, NULL);
+        tty_sysfs_register(dev, name);
+    }
+
+    kernel_session = tty_vts[1];
+    terminal_set_active(kernel_session, true);
 }
 
 void tty_init_session_serial() {

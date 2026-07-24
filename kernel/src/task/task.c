@@ -890,6 +890,7 @@ static inline uint64_t task_signal_timer_compute_deadline_locked(task_t *task) {
         next = task->itimer_real.at * 1000000ULL;
     }
 
+    spin_lock(&task->timers_lock);
     for (int i = 0; i < MAX_TIMERS_NUM; i++) {
         kernel_timer_t *kt = task->timers[i];
 
@@ -902,6 +903,7 @@ static inline uint64_t task_signal_timer_compute_deadline_locked(task_t *task) {
         if (expires < next)
             next = expires;
     }
+    spin_unlock(&task->timers_lock);
 
     return next;
 }
@@ -2656,6 +2658,7 @@ static void sched_update_itimer_task(task_t *task, uint64_t now_ms) {
         }
     }
 
+    spin_lock(&task->timers_lock);
     for (int j = 0; j < MAX_TIMERS_NUM; j++) {
         if (task->timers[j] == NULL)
             continue;
@@ -2663,26 +2666,38 @@ static void sched_update_itimer_task(task_t *task, uint64_t now_ms) {
         uint64_t now_ns = task_timer_current_time_ns(kt->clock_type);
 
         if (kt->expires && now_ns >= kt->expires) {
-            if (kt->sigev_notify == SIGEV_SIGNAL) {
+            uint64_t periods = 1;
+            if (kt->interval)
+                periods = (now_ns - kt->expires) / kt->interval + 1;
+            kt->overrun =
+                periods > (uint64_t)INT32_MAX ? INT32_MAX : (int)(periods - 1);
+
+            if (kt->sigev_notify == SIGEV_SIGNAL ||
+                kt->sigev_notify == SIGEV_THREAD_ID) {
                 siginfo_t info;
                 memset(&info, 0, sizeof(info));
                 info.si_signo = kt->sigev_signo;
                 info.si_code = SI_TIMER;
                 info._sifields._timer._tid = j;
-                info._sifields._timer._overrun = 0;
+                info._sifields._timer._overrun = kt->overrun;
                 info._sifields._timer._sigval = kt->sigev_value;
-                task_commit_signal(task, kt->sigev_signo, &info);
+                task_t *target = task;
+                if (kt->sigev_notify == SIGEV_THREAD_ID)
+                    target =
+                        task_find_by_pid((uint64_t)kt->sigev_notify_thread_id);
+                if (target &&
+                    task_effective_tgid(target) == task_effective_tgid(task))
+                    task_commit_signal(target, kt->sigev_signo, &info);
             }
 
             if (kt->interval) {
-                uint64_t delta = now_ns - kt->expires;
-                uint64_t periods = delta / kt->interval + 1;
                 kt->expires += periods * kt->interval;
             } else {
                 kt->expires = 0;
             }
         }
     }
+    spin_unlock(&task->timers_lock);
 
     task_refresh_tick_work_state(task);
 }

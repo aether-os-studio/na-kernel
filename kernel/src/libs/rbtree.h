@@ -2,8 +2,6 @@
 
 #include <libs/klibc.h>
 
-typedef struct rbnode rbnode_t;
-
 #define KRB_RED 0
 #define KRB_BLACK 1
 

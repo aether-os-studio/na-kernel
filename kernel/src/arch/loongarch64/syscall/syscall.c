@@ -479,6 +479,12 @@ void syscall_handler_init() {
                            (syscall_handle_t)sys_timer_create);
     regist_syscall_handler(SYS_TIMER_SETTIME,
                            (syscall_handle_t)sys_timer_settime);
+    regist_syscall_handler(SYS_TIMER_GETTIME,
+                           (syscall_handle_t)sys_timer_gettime);
+    regist_syscall_handler(SYS_TIMER_GETOVERRUN,
+                           (syscall_handle_t)sys_timer_getoverrun);
+    regist_syscall_handler(SYS_TIMER_DELETE,
+                           (syscall_handle_t)sys_timer_delete);
     regist_syscall_handler(SYS_CLOCK_GETTIME,
                            (syscall_handle_t)sys_clock_gettime);
     regist_syscall_handler(SYS_CLOCK_GETRES,
@@ -499,6 +505,10 @@ void syscall_handler_init() {
                            (syscall_handle_t)sys_inotify_add_watch);
     regist_syscall_handler(SYS_INOTIFY_RM_WATCH,
                            (syscall_handle_t)sys_inotify_rm_watch);
+    regist_syscall_handler(SYS_FANOTIFY_INIT,
+                           (syscall_handle_t)sys_fanotify_init);
+    regist_syscall_handler(SYS_FANOTIFY_MARK,
+                           (syscall_handle_t)sys_fanotify_mark);
     regist_syscall_handler(SYS_OPENAT, (syscall_handle_t)sys_openat);
     regist_syscall_handler(SYS_MKDIRAT, (syscall_handle_t)sys_mkdirat);
     regist_syscall_handler(SYS_MKNODAT, (syscall_handle_t)sys_mknodat);

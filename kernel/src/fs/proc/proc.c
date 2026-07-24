@@ -42,6 +42,9 @@ typedef struct procfs_inode_info {
 
 typedef struct procfs_mount_watch_state {
     uint64_t seen_seq;
+    uint64_t snapshot_seq;
+    char *snapshot;
+    size_t snapshot_len;
 } procfs_mount_watch_state_t;
 
 typedef struct procfs_task_snapshot {
@@ -966,6 +969,51 @@ static ssize_t procfs_read(struct vfs_file *file, void *addr, size_t count,
     procfs_fill_handle(&handle, file->f_inode);
     if (!handle.name[0])
         return -EINVAL;
+
+    if (procfs_dispatch_is_mount_watch(info->dispatch_name)) {
+        procfs_mount_watch_state_t *state =
+            (procfs_mount_watch_state_t *)file->private_data;
+        uint64_t seq = vfs_mount_seq_read();
+        bool mountinfo = !strcmp(info->dispatch_name, "proc_mountinfo");
+
+        if (!state)
+            return -EIO;
+
+        /*
+         * Linux exposes these files through seq_file: one sequential read
+         * does not rebuild the whole mount table for every userspace buffer.
+         * Keep an open-file snapshot, and refresh it after a rewind when the
+         * mount namespace sequence has changed.
+         */
+        if (!state->snapshot || (*ppos == 0 && state->snapshot_seq != seq)) {
+            task_t *task = procfs_handle_task_or_current(&handle);
+            char *snapshot;
+            size_t snapshot_len = 0;
+
+            snapshot =
+                procfs_generate_mount_table(task, mountinfo, &snapshot_len);
+            if (!snapshot)
+                return -ENOMEM;
+
+            free(state->snapshot);
+            state->snapshot = snapshot;
+            state->snapshot_len = snapshot_len;
+            state->snapshot_seq = seq;
+        }
+
+        if ((size_t)*ppos >= state->snapshot_len)
+            return 0;
+
+        size_t copied = MIN(count, state->snapshot_len - (size_t)*ppos);
+        memcpy(addr, state->snapshot + (size_t)*ppos, copied);
+        *ppos += (loff_t)copied;
+        /* Do not acknowledge a mount change that happened after this
+         * snapshot was generated.  poll() must still report that newer
+         * generation to the reader. */
+        state->seen_seq = state->snapshot_seq;
+        return (ssize_t)copied;
+    }
+
     ssize_t ret =
         (ssize_t)procfs_read_dispatch(&handle, addr, (size_t)*ppos, count);
     if (ret > 0) {
@@ -1302,9 +1350,17 @@ static int procfs_open_file(struct vfs_inode *inode, struct vfs_file *file) {
 
 static int procfs_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     (void)inode;
-    free(file ? file->private_data : NULL);
-    if (file)
+    if (file && file->private_data) {
+        procfs_inode_info_t *info = procfs_i(file->f_inode);
+
+        if (info && procfs_dispatch_is_mount_watch(info->dispatch_name)) {
+            procfs_mount_watch_state_t *state =
+                (procfs_mount_watch_state_t *)file->private_data;
+            free(state->snapshot);
+        }
+        free(file->private_data);
         file->private_data = NULL;
+    }
     return 0;
 }
 

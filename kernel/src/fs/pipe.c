@@ -511,9 +511,11 @@ static __poll_t pipefs_poll_mask_locked(pipe_specific_t *spec,
         return EPOLLNVAL;
 
     if (spec->read) {
+        if (pipe->write_fds > 0)
+            spec->seen_writer = true;
         if (pipe->ptr > 0)
             out |= EPOLLIN | EPOLLRDNORM;
-        if (pipe->write_fds == 0)
+        if (pipe->write_fds == 0 && spec->seen_writer)
             out |= EPOLLHUP;
     }
 
@@ -941,13 +943,85 @@ int pipefs_named_open(struct vfs_inode *inode, struct vfs_file *file) {
     spec->info = pipe;
 
     spin_lock(&pipe->lock);
+    /*
+     * Account the endpoint before waiting.  This lets two blocking opens on
+     * opposite sides rendezvous, as required by fifo(7).
+     */
     pipefs_account_open_locked(spec);
+    if (spec->read && pipe->write_fds > 0)
+        spec->seen_writer = true;
     pipe->read_node = inode;
     pipe->write_node = inode;
     spin_unlock(&pipe->lock);
 
     file->private_data = spec;
     file->f_mode |= VFS_FMODE_NO_POS_LOCK;
+
+    /* Opening both ends never blocks. */
+    if (spec->read && spec->write) {
+        pipefs_notify_node(inode,
+                           EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
+        return 0;
+    }
+
+    if (spec->write && (file->f_flags & O_NONBLOCK)) {
+        bool have_reader;
+
+        spin_lock(&pipe->lock);
+        have_reader = pipe->read_fds > 0;
+        spin_unlock(&pipe->lock);
+        if (!have_reader) {
+            pipefs_named_release(inode, file);
+            return -ENXIO;
+        }
+    }
+
+    pipefs_notify_node(inode, EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
+
+    if (!(file->f_flags & O_NONBLOCK)) {
+        while (true) {
+            vfs_poll_wait_table_t table;
+            bool have_peer;
+            int reason;
+
+            vfs_poll_wait_table_init(&table, current_task);
+            vfs_poll_wait(file, &table.pt);
+            reason = vfs_poll_wait_table_error(&table);
+            if (reason) {
+                vfs_poll_wait_table_cleanup(&table);
+                pipefs_named_release(inode, file);
+                return reason;
+            }
+
+            spin_lock(&pipe->lock);
+            have_peer = spec->read ? pipe->write_fds > 0 : pipe->read_fds > 0;
+            if (spec->read && pipe->write_fds > 0)
+                spec->seen_writer = true;
+            spin_unlock(&pipe->lock);
+            if (have_peer) {
+                vfs_poll_wait_table_cleanup(&table);
+                break;
+            }
+            if (task_signal_has_deliverable(current_task)) {
+                vfs_poll_wait_table_cleanup(&table);
+                pipefs_named_release(inode, file);
+                return -EINTR;
+            }
+            if (vfs_poll_wait_table_seq_changed(&table)) {
+                vfs_poll_wait_table_cleanup(&table);
+                continue;
+            }
+
+            reason = task_block(current_task, TASK_BLOCKING, -1, "fifo_open");
+            vfs_poll_wait_table_cleanup(&table);
+            if (reason < 0 ||
+                (reason != EOK && task_signal_has_deliverable(current_task))) {
+                pipefs_named_release(inode, file);
+                return reason < 0 ? reason : -EINTR;
+            }
+        }
+    }
+
     return 0;
 }
 
