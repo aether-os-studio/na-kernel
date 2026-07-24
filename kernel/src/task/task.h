@@ -27,6 +27,7 @@ typedef struct task_index_bucket {
 #define IDLE_PRIORITY 20
 #define NORMAL_PRIORITY 0
 #define KTHREAD_PRIORITY (-5)
+#define TASK_NGROUPS_MAX 65536U
 
 #define AT_NULL 0
 #define AT_IGNORE 1
@@ -338,6 +339,11 @@ void task_schedule_reap(void);
 void task_enqueue_mm_free(task_mm_info_t *mm);
 void task_detach_children_from_parent_locked(task_t *owner);
 void task_detach_children_from_parent(task_t *owner);
+int task_groups_set(task_t *task, const uint32_t *groups, size_t count);
+int task_groups_copy(task_t *task, uint32_t *groups, size_t capacity);
+int task_groups_inherit(task_t *child, task_t *parent);
+void task_groups_release(task_t *task);
+bool task_in_supplementary_group(task_t *task, uint32_t gid);
 
 task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
                     int priority);

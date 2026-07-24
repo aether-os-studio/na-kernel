@@ -469,8 +469,7 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_SETREUID, (syscall_handle_t)sys_setreuid);
     regist_syscall_handler(SYS_SETREGID, (syscall_handle_t)sys_setregid);
     regist_syscall_handler(SYS_GETGROUPS, (syscall_handle_t)sys_getgroups);
-    regist_syscall_handler(SYS_SETGROUPS,
-                           (syscall_handle_t)dummy_syscall_handler);
+    regist_syscall_handler(SYS_SETGROUPS, (syscall_handle_t)sys_setgroups);
     regist_syscall_handler(SYS_SETRESUID, (syscall_handle_t)sys_setresuid);
     regist_syscall_handler(SYS_GETRESUID, (syscall_handle_t)sys_getresuid);
     regist_syscall_handler(SYS_SETRESGID, (syscall_handle_t)sys_setresgid);

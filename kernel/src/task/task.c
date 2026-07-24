@@ -47,6 +47,108 @@ DEFINE_LLIST(should_free_tasks);
 static spinlock_t should_free_mm_lock = SPIN_INIT;
 static DEFINE_LLIST(should_free_mms);
 
+int task_groups_set(task_t *task, const uint32_t *groups, size_t count) {
+    uint32_t *replacement = NULL;
+    uint32_t *old_groups;
+
+    if (!task || count > TASK_NGROUPS_MAX || (count && !groups))
+        return -EINVAL;
+
+    if (count) {
+        replacement = malloc(count * sizeof(*replacement));
+        if (!replacement)
+            return -ENOMEM;
+        memcpy(replacement, groups, count * sizeof(*replacement));
+    }
+
+    spin_lock(&task->groups_lock);
+    old_groups = task->supplementary_groups;
+    task->supplementary_groups = replacement;
+    task->supplementary_group_count = (uint32_t)count;
+    spin_unlock(&task->groups_lock);
+
+    free(old_groups);
+    return 0;
+}
+
+int task_groups_copy(task_t *task, uint32_t *groups, size_t capacity) {
+    uint32_t count;
+
+    if (!task)
+        return -EINVAL;
+
+    spin_lock(&task->groups_lock);
+    count = task->supplementary_group_count;
+    if (!groups) {
+        spin_unlock(&task->groups_lock);
+        return (int)count;
+    }
+    if (capacity < count) {
+        spin_unlock(&task->groups_lock);
+        return -EINVAL;
+    }
+    if (count)
+        memcpy(groups, task->supplementary_groups, count * sizeof(*groups));
+    spin_unlock(&task->groups_lock);
+    return (int)count;
+}
+
+int task_groups_inherit(task_t *child, task_t *parent) {
+    uint32_t *groups = NULL;
+    uint32_t count;
+
+    if (!child || !parent)
+        return -EINVAL;
+
+    spin_lock(&parent->groups_lock);
+    count = parent->supplementary_group_count;
+    if (count) {
+        groups = malloc((size_t)count * sizeof(*groups));
+        if (!groups) {
+            spin_unlock(&parent->groups_lock);
+            return -ENOMEM;
+        }
+        memcpy(groups, parent->supplementary_groups,
+               (size_t)count * sizeof(*groups));
+    }
+    spin_unlock(&parent->groups_lock);
+
+    child->supplementary_groups = groups;
+    child->supplementary_group_count = count;
+    return 0;
+}
+
+void task_groups_release(task_t *task) {
+    uint32_t *groups;
+
+    if (!task)
+        return;
+
+    spin_lock(&task->groups_lock);
+    groups = task->supplementary_groups;
+    task->supplementary_groups = NULL;
+    task->supplementary_group_count = 0;
+    spin_unlock(&task->groups_lock);
+    free(groups);
+}
+
+bool task_in_supplementary_group(task_t *task, uint32_t gid) {
+    bool found = false;
+
+    if (!task)
+        return false;
+
+    spin_lock(&task->groups_lock);
+    for (uint32_t i = 0; i < task->supplementary_group_count; i++) {
+        if (task->supplementary_groups[i] == gid) {
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&task->groups_lock);
+    return found;
+}
+
 typedef struct deferred_mm_free {
     struct llist_header node;
     task_mm_info_t *mm;
@@ -1769,6 +1871,7 @@ task_t *get_free_task() {
             llist_init_head(&task->tick_work_node);
             spin_init(&task->block_lock);
             spin_init(&task->fd_info_lock);
+            spin_init(&task->groups_lock);
             wait_queue_init(&task->child_wait);
             task->tick_work_queue_id = UINT32_MAX;
             task->state = TASK_CREATING;
@@ -1792,6 +1895,7 @@ task_t *get_free_task() {
     llist_init_head(&task->tick_work_node);
     spin_init(&task->block_lock);
     spin_init(&task->fd_info_lock);
+    spin_init(&task->groups_lock);
     wait_queue_init(&task->child_wait);
     task->tick_work_queue_id = UINT32_MAX;
     task->state = TASK_CREATING;

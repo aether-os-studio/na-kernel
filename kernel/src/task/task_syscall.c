@@ -917,6 +917,7 @@ void task_cleanup_partial(task_t *task, bool kernel_mm) {
     }
 
     task_keyring_release_task(task);
+    task_groups_release(task);
 
     if (task->arch_context) {
         arch_context_free(task->arch_context);
@@ -1020,6 +1021,7 @@ void free_task(task_t *ptr) {
     ptr->env_end = 0;
 
     task_keyring_release_task(ptr);
+    task_groups_release(ptr);
 
     task_signal_free(ptr->signal);
     ptr->signal = NULL;
@@ -3424,6 +3426,8 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     child->sgid = self->sgid;
     child->fsuid = self->fsuid;
     child->fsgid = self->fsgid;
+    if (task_groups_inherit(child, self) < 0)
+        goto fail;
     child->cap_effective = self->cap_effective;
     child->cap_permitted = self->cap_permitted;
     child->cap_inheritable = self->cap_inheritable;

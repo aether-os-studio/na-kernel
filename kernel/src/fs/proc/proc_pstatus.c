@@ -136,6 +136,27 @@ char *proc_gen_status_file(task_t *task, size_t *content_len) {
                                  : 0),
         ignored, caught);
 
+    int group_count = task_groups_copy(task, NULL, 0);
+    uint32_t *groups = NULL;
+    if (group_count > 0) {
+        groups = malloc((size_t)group_count * sizeof(*groups));
+        if (groups) {
+            int copied = task_groups_copy(task, groups, (size_t)group_count);
+            if (copied >= 0)
+                group_count = copied;
+            else
+                group_count = 0;
+        } else {
+            group_count = 0;
+        }
+    }
+
+    string_builder_append(builder, "Groups:\t");
+    for (int i = 0; i < group_count; i++)
+        string_builder_append(builder, "%u ", groups[i]);
+    string_builder_append(builder, "\n");
+    free(groups);
+
     char *data = builder->data;
     *content_len = builder->size;
     free(builder);

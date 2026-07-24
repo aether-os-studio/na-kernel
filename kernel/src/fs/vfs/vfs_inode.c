@@ -239,7 +239,8 @@ int vfs_inode_permission(struct vfs_inode *inode, int mask) {
     mode = inode->i_mode;
     if (fsuid == inode->i_uid)
         granted = (mode >> 6) & 7;
-    else if (fsgid == inode->i_gid)
+    else if (fsgid == inode->i_gid ||
+             task_in_supplementary_group(current_task, inode->i_gid))
         granted = (mode >> 3) & 7;
     else
         granted = mode & 7;

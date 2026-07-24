@@ -456,7 +456,7 @@ void syscall_handler_init() {
     syscall_handlers[SYS_GETPPID] = (syscall_handle_t)sys_getppid;
     syscall_handlers[SYS_SETSID] = (syscall_handle_t)sys_setsid;
     syscall_handlers[SYS_GETGROUPS] = (syscall_handle_t)sys_getgroups;
-    syscall_handlers[SYS_SETGROUPS] = (syscall_handle_t)dummy_syscall_handler;
+    syscall_handlers[SYS_SETGROUPS] = (syscall_handle_t)sys_setgroups;
     syscall_handlers[SYS_SETREUID] = (syscall_handle_t)sys_setreuid;
     syscall_handlers[SYS_SETREGID] = (syscall_handle_t)sys_setregid;
     syscall_handlers[SYS_SETRESUID_] = (syscall_handle_t)sys_setresuid;

@@ -354,6 +354,9 @@ typedef struct task {
     int64_t sgid;
     int64_t fsuid;
     int64_t fsgid;
+    spinlock_t groups_lock;
+    uint32_t *supplementary_groups;
+    uint32_t supplementary_group_count;
     uint64_t cap_effective;
     uint64_t cap_permitted;
     uint64_t cap_inheritable;

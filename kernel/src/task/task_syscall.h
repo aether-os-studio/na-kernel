@@ -747,29 +747,83 @@ static inline uint64_t sys_getppid() { return task_parent_pid(current_task); }
  */
 static inline uint64_t sys_getpgrp() { return current_task->pgid; }
 
-/**
- * Linux contract: report the supplementary group list.
- * Current kernel: exposes exactly one synthetic group entry.
- * Gaps: real supplementary group tracking is not implemented.
- */
+/** Linux contract: report the supplementary group list. */
 static inline uint64_t sys_getgroups(int gidsetsize, int *gids) {
+    uint32_t *groups = NULL;
+    int count;
+
     if (gidsetsize < 0)
         return (uint64_t)-EINVAL;
 
+    count = task_groups_copy(current_task, NULL, 0);
+    if (count < 0)
+        return (uint64_t)count;
+
     if (gidsetsize == 0)
-        return 1;
-
-    if (gidsetsize < 1)
+        return (uint64_t)count;
+    if (gidsetsize < count)
         return (uint64_t)-EINVAL;
-
-    if (!gids)
+    if (count && !gids)
         return (uint64_t)-EFAULT;
 
-    int gid = 0;
-    if (copy_to_user(gids, &gid, sizeof(gid)))
-        return (uint64_t)-EFAULT;
+    if (count) {
+        groups = malloc((size_t)count * sizeof(*groups));
+        if (!groups)
+            return (uint64_t)-ENOMEM;
+        int copied = task_groups_copy(current_task, groups, (size_t)count);
+        if (copied < 0) {
+            free(groups);
+            return (uint64_t)copied;
+        }
+        count = copied;
+    }
 
-    return 1;
+    if (count && copy_to_user(gids, groups, (size_t)count * sizeof(*groups))) {
+        free(groups);
+        return (uint64_t)-EFAULT;
+    }
+
+    free(groups);
+    return (uint64_t)count;
+}
+
+/** Linux contract: replace the supplementary group list. */
+static inline uint64_t sys_setgroups(int gidsetsize, const uint32_t *gids) {
+    uint32_t *groups = NULL;
+    int ret;
+
+    if (gidsetsize < 0 || (uint32_t)gidsetsize > TASK_NGROUPS_MAX)
+        return (uint64_t)-EINVAL;
+    if (gidsetsize && !gids)
+        return (uint64_t)-EFAULT;
+    if (current_task->euid != 0 &&
+        !(current_task->cap_effective & (UINT64_C(1) << 6)))
+        return (uint64_t)-EPERM;
+    if (current_task->nsproxy && current_task->nsproxy->user_ns &&
+        current_task->nsproxy->user_ns->setgroups_state ==
+            TASK_USERNS_SETGROUPS_DENY)
+        return (uint64_t)-EPERM;
+
+    if (gidsetsize) {
+        groups = malloc((size_t)gidsetsize * sizeof(*groups));
+        if (!groups)
+            return (uint64_t)-ENOMEM;
+        if (copy_from_user(groups, gids,
+                           (size_t)gidsetsize * sizeof(*groups))) {
+            free(groups);
+            return (uint64_t)-EFAULT;
+        }
+        for (int i = 0; i < gidsetsize; i++) {
+            if (groups[i] == UINT32_MAX) {
+                free(groups);
+                return (uint64_t)-EINVAL;
+            }
+        }
+    }
+
+    ret = task_groups_set(current_task, groups, (size_t)gidsetsize);
+    free(groups);
+    return (uint64_t)ret;
 }
 
 /**
