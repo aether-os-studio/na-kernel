@@ -2,6 +2,7 @@
 #include <fs/fs_syscall.h>
 #include <boot/boot.h>
 #include <net/socket.h>
+#include <net/net_syscall.h>
 #include <fs/pipe.h>
 #include <fs/vfs/notify.h>
 #include <mm/cache.h>
@@ -1712,6 +1713,7 @@ uint64_t sys_name_to_handle_at(int dfd, const char *name,
                                struct file_handle *handle, int *mnt_id,
                                int flag) {
     linux_file_handle_prefix_t prefix;
+    struct vfs_path path = {0};
     struct vfs_kstat stat;
     int ret;
     const unsigned int required_size = sizeof(uint64_t);
@@ -1720,6 +1722,9 @@ uint64_t sys_name_to_handle_at(int dfd, const char *name,
         check_user_overflow((uint64_t)handle, sizeof(prefix))) {
         return (uint64_t)-EFAULT;
     }
+
+    if (flag & ~(AT_EMPTY_PATH | AT_SYMLINK_FOLLOW))
+        return (uint64_t)-EINVAL;
 
     ret = generic_copy_file_handle_prefix_from_user(handle, &prefix);
     if (ret < 0)
@@ -1731,9 +1736,27 @@ uint64_t sys_name_to_handle_at(int dfd, const char *name,
         return (uint64_t)-EOVERFLOW;
     }
 
-    ret = vfs_statx(dfd, name,
-                    (flag & AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0, 0,
-                    &stat);
+    if ((flag & AT_EMPTY_PATH) && name[0] == '\0') {
+        ret = generic_get_empty_path(dfd, &path);
+        if (ret < 0)
+            return (uint64_t)ret;
+
+        if (path.dentry->d_inode && path.dentry->d_inode->i_op &&
+            path.dentry->d_inode->i_op->getattr) {
+            ret = path.dentry->d_inode->i_op->getattr(&path, &stat, 0, 0);
+        } else {
+            vfs_fill_generic_kstat(&path, &stat);
+            ret = 0;
+        }
+        vfs_path_put(&path);
+    } else {
+        /* name_to_handle_at() does not follow the final symlink unless
+         * AT_SYMLINK_FOLLOW is explicitly requested. vfs_statx() expresses
+         * the inverse policy through AT_SYMLINK_NOFOLLOW. */
+        ret = vfs_statx(dfd, name,
+                        (flag & AT_SYMLINK_FOLLOW) ? 0 : AT_SYMLINK_NOFOLLOW, 0,
+                        &stat);
+    }
     if (ret < 0)
         return (uint64_t)ret;
 
@@ -2805,6 +2828,19 @@ static uint64_t generic_do_preadv(uint64_t fd, struct iovec *iovec,
         free(kiov);
         return (uint64_t)-EISDIR;
     }
+    if (S_ISSOCK(file->f_inode->i_mode)) {
+        int64_t io_ret;
+
+        if (!use_f_pos) {
+            vfs_file_put(file);
+            free(kiov);
+            return (uint64_t)-ESPIPE;
+        }
+        vfs_file_put(file);
+        io_ret = socket_recv_iov((int)fd, kiov, count, 0);
+        free(kiov);
+        return (uint64_t)io_ret;
+    }
 
     for (uint64_t i = 0; i < count; i++) {
         size_t len = kiov[i].len;
@@ -2879,6 +2915,19 @@ static uint64_t generic_do_pwritev(uint64_t fd, struct iovec *iovec,
         vfs_file_put(file);
         free(kiov);
         return (uint64_t)-EISDIR;
+    }
+    if (S_ISSOCK(file->f_inode->i_mode)) {
+        int64_t io_ret;
+
+        if (!use_f_pos) {
+            vfs_file_put(file);
+            free(kiov);
+            return (uint64_t)-ESPIPE;
+        }
+        vfs_file_put(file);
+        io_ret = socket_send_iov((int)fd, kiov, count, 0);
+        free(kiov);
+        return (uint64_t)io_ret;
     }
 
     append = (flags & RWF_APPEND) || (file->f_flags & O_APPEND);

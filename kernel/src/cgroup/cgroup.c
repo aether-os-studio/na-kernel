@@ -24,6 +24,7 @@ struct cgroup {
     char *name;
     uint32_t subtree_control;
     bool frozen;
+    uint64_t runtime_ns;
     volatile int ref_count;
 };
 
@@ -33,9 +34,32 @@ static cgroup_t *cgroup_root_node;
 static uint64_t cgroup_next_hierarchy_id = 1;
 DEFINE_LLIST(cgroup_hierarchies);
 
+static cgroup_t *
+cgroup_task_cgroup_for_hierarchy_locked(uint64_t pid,
+                                        cgroup_hierarchy_t *hierarchy);
+
 void cgroup_lock(void) { spin_lock(&cgroup_global_lock); }
 
 void cgroup_unlock(void) { spin_unlock(&cgroup_global_lock); }
+
+void cgroup_account_runtime_ns(task_t *task, uint64_t delta_ns) {
+    cgroup_hierarchy_t *hierarchy;
+    cgroup_t *cgroup;
+
+    if (!task || !delta_ns)
+        return;
+
+    cgroup_lock();
+    hierarchy = cgroup_unified_hierarchy;
+    cgroup = cgroup_task_cgroup_for_hierarchy_locked(task->pid, hierarchy);
+    for (; cgroup; cgroup = cgroup_parent(cgroup))
+        __atomic_add_fetch(&cgroup->runtime_ns, delta_ns, __ATOMIC_RELAXED);
+    cgroup_unlock();
+}
+
+uint64_t cgroup_runtime_ns(cgroup_t *cgroup) {
+    return cgroup ? __atomic_load_n(&cgroup->runtime_ns, __ATOMIC_RELAXED) : 0;
+}
 
 cgroup_t *cgroup_get(cgroup_t *cgroup) {
     if (!cgroup)

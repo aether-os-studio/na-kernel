@@ -111,5 +111,8 @@ int tty_input_available(tty_t *tty);
 ssize_t tty_input_read(tty_t *tty, char *buf, size_t count, fd_t *fd);
 int tty_input_poll(tty_t *tty, int events);
 void tty_input_flush(tty_t *tty);
+int tty_vt_activate(unsigned int vtnr);
+int tty_vt_get_state(struct vt_state *state);
+void tty_sysfs_register(uint64_t dev, const char *name);
 void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
                      int32_t value);

@@ -1632,8 +1632,7 @@ ssize_t kmsg_read(void *data, void *buf, uint64_t offset, uint64_t len,
 
 ssize_t kmsg_poll(void *dev, int events, fd_t *fd) {
     (void)dev;
-    (void)fd;
-    return logger_kmsg_poll(events);
+    return logger_kmsg_poll(fd, events);
 }
 
 ssize_t kmsg_write(void *data, const void *buf, uint64_t offset, uint64_t len,

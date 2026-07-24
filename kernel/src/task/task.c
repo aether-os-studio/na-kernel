@@ -639,8 +639,12 @@ task_signal_info_t *task_signal_reset_after_exec(task_t *task) {
         return NULL;
 
     spin_lock(&task->signal->sighand->siglock);
-    if (task->signal->sighand->actions[SIGCHLD].sa_handler == SIG_IGN) {
-        signal->sighand->actions[SIGCHLD].sa_handler = SIG_IGN;
+    // exec resets caught signals to SIG_DFL, but ignored dispositions remain
+    // ignored.  Programs use this inherited state as part of their exec
+    // protocol, so preserving only SIGCHLD is not sufficient.
+    for (int sig = MINSIG; sig < MAXSIG; sig++) {
+        if (task->signal->sighand->actions[sig].sa_handler == SIG_IGN)
+            signal->sighand->actions[sig].sa_handler = SIG_IGN;
     }
     signal->blocked = task->signal->blocked;
     signal->signal = task->signal->signal;

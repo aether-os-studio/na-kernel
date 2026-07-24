@@ -17,7 +17,7 @@ int snprintf(char *buffer, size_t capacity, const char *fmt, ...);
 size_t logger_kmsg_buffer_size(void);
 ssize_t logger_kmsg_read(fd_t *file, void *buf, size_t len, uint64_t flags);
 ssize_t logger_kmsg_write(const void *buf, size_t len);
-ssize_t logger_kmsg_poll(int events);
+ssize_t logger_kmsg_poll(fd_t *file, int events);
 void logger_kmsg_bind_node(vfs_node_t *node);
 
 uint64_t sys_syslog(int type, const char *buf, size_t len);

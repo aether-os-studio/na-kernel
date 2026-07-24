@@ -194,6 +194,9 @@ static inline task_index_bucket_t *task_index_bucket_lookup(hashmap_t *map,
 uint32_t alloc_cpu_id();
 task_t *get_free_task();
 
+/* Charge scheduler-accounted CPU time to the task's cgroup hierarchy. */
+void cgroup_account_runtime_ns(task_t *task, uint64_t delta_ns);
+
 static inline uint64_t task_self_user_ns(task_t *task) {
     if (!task)
         return 0;
@@ -225,6 +228,7 @@ static inline uint64_t task_account_runtime_ns(task_t *task, uint64_t now_ns) {
     if (task->signal && task->signal->cpu_account)
         __atomic_add_fetch(&task->signal->cpu_account->runtime_ns, delta,
                            __ATOMIC_RELAXED);
+    cgroup_account_runtime_ns(task, delta);
     return delta;
 }
 

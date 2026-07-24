@@ -2394,6 +2394,9 @@ ssize_t drm_ioctl_get_cap(drm_device_t *dev, void *arg) {
     case DRM_CAP_PRIME:
         cap->value = DRM_PRIME_CAP_EXPORT | DRM_PRIME_CAP_IMPORT;
         return 0;
+    case DRM_CAP_ASYNC_PAGE_FLIP:
+        cap->value = 0;
+        return 0;
     case DRM_CAP_ADDFB2_MODIFIERS:
         cap->value = 0;
         return 0;
@@ -2401,7 +2404,7 @@ ssize_t drm_ioctl_get_cap(drm_device_t *dev, void *arg) {
         cap->value = (dev && !dev->render_node_registered) ? 1 : 0;
         return 0;
     case DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP:
-        cap->value = (dev && dev->render_node_registered) ? 1 : 0;
+        cap->value = 0;
         return 0;
     case DRM_CAP_SYNCOBJ:
         cap->value = 1;
@@ -4172,29 +4175,41 @@ ssize_t drm_ioctl_set_client_cap(drm_device_t *dev, void *arg) {
 /**
  * drm_ioctl_wait_vblank - Handle DRM_IOCTL_WAIT_VBLANK
  */
-ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg) {
+ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg, fd_t *fd) {
     union drm_wait_vblank *vbl = (union drm_wait_vblank *)arg;
 
     if (!dev || !vbl)
         return -EINVAL;
 
-    uint64_t target_seq = 0;
-    bool target_set = false;
+    uint32_t type = vbl->request.type;
+    uint32_t sequence = vbl->request.sequence;
+    uint64_t user_data = vbl->request.signal;
+    uint32_t allowed = _DRM_VBLANK_TYPES_MASK | _DRM_VBLANK_FLAGS_MASK |
+                       _DRM_VBLANK_FLIP | _DRM_VBLANK_HIGH_CRTC_MASK;
+
+    if (type & ~allowed)
+        return -EINVAL;
+    if (type & _DRM_VBLANK_SIGNAL)
+        return -EINVAL;
+
+    spin_lock(&dev->event_lock);
+    uint64_t seq = dev->vblank_counter;
+    spin_unlock(&dev->event_lock);
+
+    uint64_t target_seq =
+        (type & _DRM_VBLANK_RELATIVE) ? seq + sequence : sequence;
+
+    if (target_seq <= seq && (type & _DRM_VBLANK_NEXTONMISS))
+        target_seq = seq + 1;
+
+    if (type & _DRM_VBLANK_EVENT)
+        return drm_defer_event_at(dev, fd, DRM_EVENT_VBLANK, user_data,
+                                  target_seq);
 
     while (true) {
-        uint64_t seq = 0;
-
         spin_lock(&dev->event_lock);
         seq = dev->vblank_counter;
         spin_unlock(&dev->event_lock);
-
-        if (!target_set) {
-            if (vbl->request.type & _DRM_VBLANK_RELATIVE)
-                target_seq = seq + vbl->request.sequence;
-            else
-                target_seq = vbl->request.sequence;
-            target_set = true;
-        }
 
         if (seq >= target_seq) {
             vbl->reply.sequence = seq;
@@ -4915,7 +4930,7 @@ ssize_t drm_ioctl(void *data, ssize_t cmd, ssize_t arg, fd_t *fd) {
         ret = drm_ioctl_atomic(dev, ioarg, fd);
         break;
     case DRM_IOCTL_WAIT_VBLANK:
-        ret = drm_ioctl_wait_vblank(dev, ioarg);
+        ret = drm_ioctl_wait_vblank(dev, ioarg, fd);
         break;
     case DRM_IOCTL_GET_UNIQUE:
         ret = drm_ioctl_get_unique(dev, ioarg);

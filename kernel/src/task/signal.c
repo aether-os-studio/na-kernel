@@ -877,6 +877,9 @@ uint64_t sys_rt_sigtimedwait(const sigset_t *uthese, siginfo_t *uinfo,
         deadline = nano_time() + wait_ns;
     }
 
+    bool irq_state = arch_interrupt_enabled();
+    arch_enable_interrupt();
+
     while (true) {
         siginfo_t info;
         int sig = 0;
@@ -907,12 +910,11 @@ uint64_t sys_rt_sigtimedwait(const sigset_t *uthese, siginfo_t *uinfo,
             return (uint64_t)-EAGAIN;
         }
 
-        arch_enable_interrupt();
-
         arch_wait_for_interrupt();
     }
 
-    arch_disable_interrupt();
+    if (!irq_state)
+        arch_disable_interrupt();
 }
 
 uint64_t sys_rt_sigqueueinfo(uint64_t tgid, uint64_t sig, siginfo_t *info) {

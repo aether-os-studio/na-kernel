@@ -3199,6 +3199,25 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
                 return -EFAULT;
             return 0;
         }
+    case TIOCOUTQ:
+        if (!arg)
+            return -EFAULT;
+        {
+            int value = 0;
+            socket_t *peer = unix_socket_get_peer_ref(sock);
+
+            if (peer) {
+                spin_lock(&peer->lock);
+                size_t queued = unix_socket_recv_used_locked(peer);
+                value = (int)MIN(queued, (size_t)INT_MAX);
+                spin_unlock(&peer->lock);
+                unix_socket_free(peer);
+            }
+
+            if (copy_to_user((void *)arg, &value, sizeof(value)))
+                return -EFAULT;
+            return 0;
+        }
     case FIONBIO:
         return 0;
     case TCGETS2:
@@ -3214,6 +3233,9 @@ int socket_ioctl(fd_t *fd, ssize_t cmd, ssize_t arg) {
         if (!sock->net_ns)
             return -EINVAL;
         return procfs_create_nsfd_for_netns(sock->net_ns);
+    case TIOCGPGRP:
+    case TIOCGWINSZ:
+        return -ENOTTY;
     default:
         printk("Unsupported unix socket ioctl cmd = %#010x\n", cmd);
         return -ENOTTY;

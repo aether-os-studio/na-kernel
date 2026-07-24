@@ -1160,6 +1160,7 @@ struct k_drm_event {
     uint64_t user_data;
     struct timespec timestamp;
     uint64_t sequence;
+    uint64_t target_sequence;
     struct drm_file *file;
 };
 
@@ -1382,6 +1383,8 @@ int drm_post_event(drm_device_t *dev, fd_t *fd, uint32_t type,
                    uint64_t user_data);
 int drm_defer_event(drm_device_t *dev, fd_t *fd, uint32_t type,
                     uint64_t user_data);
+int drm_defer_event_at(drm_device_t *dev, fd_t *fd, uint32_t type,
+                       uint64_t user_data, uint64_t target_sequence);
 void drm_cancel_file_events(drm_file_t *file);
 int drm_notify_hotplug(drm_device_t *dev);
 void drm_handle_vblank_tick(void);

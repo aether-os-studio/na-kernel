@@ -181,15 +181,42 @@ static ssize_t kmsg_snapshot_all(char **snapshot_out, bool clear_after) {
 size_t logger_kmsg_buffer_size(void) { return KMSG_TEXT_BUFFER_SIZE; }
 
 static inline uint64_t kmsg_file_seq_get(fd_t *file, uint64_t fallback) {
-    if (!file || !file->private_data)
+    void *private_data;
+
+    if (!file)
         return fallback;
-    return (uint64_t)((uintptr_t)file->private_data - 1U);
+    private_data = __atomic_load_n(&file->private_data, __ATOMIC_ACQUIRE);
+    if (!private_data)
+        return fallback;
+    return (uint64_t)((uintptr_t)private_data - 1U);
 }
 
 static inline void kmsg_file_seq_set(fd_t *file, uint64_t seq) {
     if (!file)
         return;
-    file->private_data = (void *)(uintptr_t)(seq + 1U);
+    __atomic_store_n(&file->private_data, (void *)(uintptr_t)(seq + 1U),
+                     __ATOMIC_RELEASE);
+}
+
+static bool kmsg_file_has_unread_locked(fd_t *file) {
+    uint64_t oldest;
+    uint64_t seq;
+
+    if (kmsg_record_count == 0)
+        return false;
+
+    oldest = kmsg_oldest_seq_locked();
+    seq = kmsg_file_seq_get(file, oldest);
+    if (seq < oldest)
+        seq = oldest;
+    return seq < kmsg_next_seq;
+}
+
+static void kmsg_notify_readers(void) {
+    vfs_node_t *node = __atomic_load_n(&kmsg_poll_node, __ATOMIC_ACQUIRE);
+
+    if (node)
+        vfs_poll_notify_inode(node, EPOLLIN | EPOLLRDNORM);
 }
 
 void logger_kmsg_bind_node(vfs_node_t *node) {
@@ -197,16 +224,19 @@ void logger_kmsg_bind_node(vfs_node_t *node) {
         return;
 
     spin_lock(&printk_lock);
-    if (!kmsg_poll_node)
-        kmsg_poll_node = vfs_igrab(node);
+    if (!__atomic_load_n(&kmsg_poll_node, __ATOMIC_RELAXED))
+        __atomic_store_n(&kmsg_poll_node, vfs_igrab(node), __ATOMIC_RELEASE);
     spin_unlock(&printk_lock);
 }
 
-ssize_t logger_kmsg_poll(int events) {
+ssize_t logger_kmsg_poll(fd_t *file, int events) {
     ssize_t revents = 0;
 
+    if (file)
+        logger_kmsg_bind_node(file->f_inode);
+
     spin_lock(&printk_lock);
-    if ((events & EPOLLIN) && kmsg_record_count > 0)
+    if ((events & (EPOLLIN | EPOLLRDNORM)) && kmsg_file_has_unread_locked(file))
         revents |= EPOLLIN | EPOLLRDNORM;
     spin_unlock(&printk_lock);
 
@@ -231,24 +261,29 @@ ssize_t logger_kmsg_read(fd_t *file, void *buf, size_t len, uint64_t flags) {
 
     logger_kmsg_bind_node(file->f_inode);
 
-    spin_lock(&printk_lock);
-    if (kmsg_record_count == 0) {
-        spin_unlock(&printk_lock);
-        return (flags & O_NONBLOCK) ? -EWOULDBLOCK : 0;
-    }
+    while (true) {
+        spin_lock(&printk_lock);
+        if (!kmsg_file_has_unread_locked(file)) {
+            spin_unlock(&printk_lock);
+            if (flags & O_NONBLOCK)
+                return -EWOULDBLOCK;
 
-    oldest = kmsg_oldest_seq_locked();
-    seq = kmsg_file_seq_get(file, oldest);
-    if (seq < oldest)
-        seq = oldest;
-    if (seq >= kmsg_next_seq) {
-        spin_unlock(&printk_lock);
-        return (flags & O_NONBLOCK) ? -EWOULDBLOCK : 0;
-    }
+            int reason = vfs_poll_wait_interruptible(
+                file, EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLNVAL);
+            if (reason < 0)
+                return reason;
+            continue;
+        }
 
-    record = *kmsg_record_at_seq_locked(seq);
-    kmsg_copy_from_ring_locked(record.text_off, text, record.text_len);
-    spin_unlock(&printk_lock);
+        oldest = kmsg_oldest_seq_locked();
+        seq = kmsg_file_seq_get(file, oldest);
+        if (seq < oldest)
+            seq = oldest;
+        record = *kmsg_record_at_seq_locked(seq);
+        kmsg_copy_from_ring_locked(record.text_off, text, record.text_len);
+        spin_unlock(&printk_lock);
+        break;
+    }
 
     text_len = kmsg_trim_record_text(text, record.text_len);
     text[text_len] = '\0';
@@ -290,6 +325,7 @@ ssize_t logger_kmsg_write(const void *buf, size_t len) {
         spin_lock(&printk_lock);
         kmsg_append_record_locked(chunk, part, 6);
         spin_unlock(&printk_lock);
+        kmsg_notify_readers();
 
         offset += part;
         written += (ssize_t)part;
@@ -661,6 +697,8 @@ int printk(const char *fmt, ...) {
 #endif
 
     spin_unlock(&printk_lock);
+    if (len > 0)
+        kmsg_notify_readers();
 
     return len;
 }
@@ -688,6 +726,8 @@ int serial_fprintk(const char *fmt, ...) {
     serial_printk(buf, len);
 
     spin_unlock(&printk_lock);
+    if (len > 0)
+        kmsg_notify_readers();
 
     return len;
 }

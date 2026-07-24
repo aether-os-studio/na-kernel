@@ -19,6 +19,8 @@ typedef struct pty_pair {
     int slaveFds;
 
     termios term;
+    uint32_t input_speed;
+    uint32_t output_speed;
     struct winsize win;
     uint8_t *bufferMaster;
     uint8_t *bufferSlave;

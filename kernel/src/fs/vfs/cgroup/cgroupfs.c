@@ -1,6 +1,7 @@
 #include <fs/vfs/cgroup/cgroupfs.h>
 #include <cgroup/cgroup.h>
 #include <fs/fs_syscall.h>
+#include <fs/vfs/notify.h>
 #include <fs/vfs/vfs.h>
 #include <libs/string_builder.h>
 #include <task/task.h>
@@ -28,6 +29,7 @@ typedef enum cgroupfs_inode_kind {
     CGROUPFS_INODE_CGROUP_MAX_DEPTH,
     CGROUPFS_INODE_CGROUP_MAX_DESCENDANTS,
     CGROUPFS_INODE_CGROUP_STAT,
+    CGROUPFS_INODE_CPU_STAT,
 } cgroupfs_inode_kind_t;
 
 typedef struct cgroupfs_dirent {
@@ -44,6 +46,7 @@ typedef struct cgroupfs_fs_info {
 typedef struct cgroupfs_inode_info {
     struct vfs_inode vfs_inode;
     struct llist_header children;
+    struct llist_header events_node;
     cgroup_t *cgroup;
     cgroupfs_inode_kind_t kind;
 } cgroupfs_inode_info_t;
@@ -54,6 +57,8 @@ static const struct vfs_super_operations cgroupfs_super_ops;
 static const struct vfs_inode_operations cgroupfs_inode_ops;
 static const struct vfs_file_operations cgroupfs_dir_file_ops;
 static const struct vfs_file_operations cgroupfs_file_ops;
+static spinlock_t cgroupfs_events_lock = SPIN_INIT;
+static DEFINE_LLIST(cgroupfs_events_inodes);
 
 static inline cgroupfs_inode_info_t *cgroupfs_i(struct vfs_inode *inode) {
     return inode ? container_of(inode, cgroupfs_inode_info_t, vfs_inode) : NULL;
@@ -79,6 +84,13 @@ static void cgroupfs_evict_inode(struct vfs_inode *inode) {
 
     if (!info)
         return;
+
+    if (info->kind == CGROUPFS_INODE_CGROUP_EVENTS) {
+        spin_lock(&cgroupfs_events_lock);
+        if (!llist_empty(&info->events_node))
+            llist_delete(&info->events_node);
+        spin_unlock(&cgroupfs_events_lock);
+    }
 
     if (info->kind == CGROUPFS_INODE_DIR) {
         llist_for_each(de, tmp, &info->children, node) {
@@ -111,10 +123,9 @@ static int cgroupfs_statfs(struct vfs_path *path, void *buf) {
     return 0;
 }
 
-static struct vfs_inode *cgroupfs_new_inode(struct vfs_super_block *sb,
-                                            cgroup_t *cgroup,
-                                            cgroupfs_inode_kind_t kind,
-                                            umode_t mode) {
+static struct vfs_inode *
+cgroupfs_new_inode(struct vfs_super_block *sb, struct vfs_inode *dir,
+                   cgroup_t *cgroup, cgroupfs_inode_kind_t kind, umode_t mode) {
     struct vfs_inode *inode = vfs_alloc_inode(sb);
     cgroupfs_inode_info_t *info = cgroupfs_i(inode);
 
@@ -122,20 +133,67 @@ static struct vfs_inode *cgroupfs_new_inode(struct vfs_super_block *sb,
         return NULL;
 
     llist_init_head(&info->children);
+    llist_init_head(&info->events_node);
     info->kind = kind;
     info->cgroup = cgroup_get(cgroup);
 
     inode->i_op = &cgroupfs_inode_ops;
     inode->i_fop = kind == CGROUPFS_INODE_DIR ? &cgroupfs_dir_file_ops
                                               : &cgroupfs_file_ops;
-    inode->i_mode = mode;
-    inode->i_uid = 0;
-    inode->i_gid = 0;
+    vfs_inode_init_owner(inode, dir, mode);
     inode->i_nlink = kind == CGROUPFS_INODE_DIR ? 2 : 1;
     inode->i_ino = (ino64_t)(uintptr_t)inode;
     inode->inode = inode->i_ino;
     inode->i_blkbits = 12;
+
+    if (kind == CGROUPFS_INODE_CGROUP_EVENTS) {
+        spin_lock(&cgroupfs_events_lock);
+        llist_append(&cgroupfs_events_inodes, &info->events_node);
+        spin_unlock(&cgroupfs_events_lock);
+    }
     return inode;
+}
+
+static void cgroupfs_notify_events(cgroup_t *cgroup) {
+    cgroupfs_inode_info_t *info, *tmp;
+    struct vfs_inode **inodes;
+    size_t count = 0;
+    size_t index = 0;
+
+    if (!cgroup)
+        return;
+
+    cgroup_lock();
+    spin_lock(&cgroupfs_events_lock);
+    llist_for_each(info, tmp, &cgroupfs_events_inodes, events_node) {
+        if (cgroup_is_descendant_of(cgroup, info->cgroup))
+            count++;
+    }
+    spin_unlock(&cgroupfs_events_lock);
+    cgroup_unlock();
+    if (!count)
+        return;
+
+    inodes = calloc(count, sizeof(*inodes));
+    if (!inodes)
+        return;
+
+    cgroup_lock();
+    spin_lock(&cgroupfs_events_lock);
+    llist_for_each(info, tmp, &cgroupfs_events_inodes, events_node) {
+        if (cgroup_is_descendant_of(cgroup, info->cgroup) && index < count)
+            inodes[index++] = vfs_igrab(&info->vfs_inode);
+    }
+    spin_unlock(&cgroupfs_events_lock);
+    cgroup_unlock();
+
+    for (size_t i = 0; i < index; i++) {
+        if (!inodes[i])
+            continue;
+        notifyfs_queue_inode_event(inodes[i], inodes[i], NULL, IN_MODIFY, 0);
+        vfs_iput(inodes[i]);
+    }
+    free(inodes);
 }
 
 static cgroupfs_dirent_t *cgroupfs_find_dirent(struct vfs_inode *dir,
@@ -264,6 +322,7 @@ static int cgroupfs_target_cgroup_from_fd(int fd, cgroup_t **ret_cgroup) {
 
 int cgroupfs_set_task_cgroup_by_fd(task_t *task, int fd) {
     cgroup_t *cgroup = NULL;
+    cgroup_t *old_cgroup;
     int ret;
 
     if (!task)
@@ -273,17 +332,38 @@ int cgroupfs_set_task_cgroup_by_fd(task_t *task, int fd) {
     if (ret < 0)
         return ret;
 
+    old_cgroup = cgroup_task_cgroup(task);
     cgroup_lock();
     ret = cgroup_attach_task_pid_locked(task->pid, cgroup);
     cgroup_unlock();
 
+    if (ret == 0) {
+        cgroupfs_notify_events(old_cgroup);
+        if (old_cgroup != cgroup)
+            cgroupfs_notify_events(cgroup);
+    }
+
+    cgroup_put(old_cgroup);
     cgroup_put(cgroup);
     return ret;
 }
 
-void cgroupfs_on_new_task(task_t *task) { cgroup_on_new_task(task); }
+void cgroupfs_on_new_task(task_t *task) {
+    cgroup_t *cgroup;
 
-void cgroupfs_on_exit_task(task_t *task) { cgroup_on_exit_task(task); }
+    cgroup_on_new_task(task);
+    cgroup = cgroup_task_cgroup(task);
+    cgroupfs_notify_events(cgroup);
+    cgroup_put(cgroup);
+}
+
+void cgroupfs_on_exit_task(task_t *task) {
+    cgroup_t *cgroup = cgroup_task_cgroup(task);
+
+    cgroup_on_exit_task(task);
+    cgroupfs_notify_events(cgroup);
+    cgroup_put(cgroup);
+}
 
 static size_t cgroupfs_collect_members(cgroup_t *cgroup, bool threads,
                                        uint64_t *ids, size_t capacity) {
@@ -473,6 +553,11 @@ static char *cgroupfs_build_file(cgroupfs_inode_info_t *info,
             "nr_dying_descendants 0\n",
             (unsigned long long)cgroup_descendant_count(info->cgroup));
         break;
+    case CGROUPFS_INODE_CPU_STAT:
+        string_builder_append(
+            builder, "usage_usec %llu\n",
+            (unsigned long long)(cgroup_runtime_ns(info->cgroup) / 1000));
+        break;
     default:
         string_builder_append(builder, "\n");
         break;
@@ -512,6 +597,7 @@ static int cgroupfs_parse_u64(const char *buf, uint64_t *value) {
 static int cgroupfs_write_procs(cgroup_t *cgroup, uint64_t pid, bool threads) {
     task_t *task = NULL;
     uint64_t *pids = NULL;
+    cgroup_t **old_cgroups = NULL;
     size_t max_pids = MAX((size_t)1, hashmap_size(&task_pid_map));
     size_t count = 0;
     int ret = 0;
@@ -521,8 +607,12 @@ static int cgroupfs_write_procs(cgroup_t *cgroup, uint64_t pid, bool threads) {
         return -ESRCH;
 
     pids = calloc(max_pids, sizeof(*pids));
-    if (!pids)
+    old_cgroups = calloc(max_pids, sizeof(*old_cgroups));
+    if (!pids || !old_cgroups) {
+        free(pids);
+        free(old_cgroups);
         return -ENOMEM;
+    }
 
     spin_lock(&task_queue_lock);
     if (threads) {
@@ -546,6 +636,16 @@ static int cgroupfs_write_procs(cgroup_t *cgroup, uint64_t pid, bool threads) {
     }
     spin_unlock(&task_queue_lock);
 
+    /* Settle a currently running task against its old cgroup before moving it.
+     */
+    for (size_t i = 0; i < count; ++i) {
+        task_t *member = task_find_by_pid(pids[i]);
+        if (member) {
+            task_account_runtime_ns(member, nano_time());
+            old_cgroups[i] = cgroup_task_cgroup(member);
+        }
+    }
+
     cgroup_lock();
     for (size_t i = 0; i < count; ++i) {
         ret = cgroup_attach_task_pid_locked(pids[i], cgroup);
@@ -554,6 +654,17 @@ static int cgroupfs_write_procs(cgroup_t *cgroup, uint64_t pid, bool threads) {
     }
     cgroup_unlock();
 
+    if (ret == 0) {
+        for (size_t i = 0; i < count; i++) {
+            cgroupfs_notify_events(old_cgroups[i]);
+            if (old_cgroups[i] != cgroup)
+                cgroupfs_notify_events(cgroup);
+        }
+    }
+
+    for (size_t i = 0; i < count; i++)
+        cgroup_put(old_cgroups[i]);
+    free(old_cgroups);
     free(pids);
     return ret;
 }
@@ -663,7 +774,7 @@ static int cgroupfs_create_control_file(struct vfs_inode *dir, const char *name,
                                         cgroupfs_inode_kind_t kind,
                                         umode_t mode) {
     struct vfs_inode *inode = cgroupfs_new_inode(
-        dir->i_sb, cgroupfs_i(dir)->cgroup, kind, S_IFREG | mode);
+        dir->i_sb, dir, cgroupfs_i(dir)->cgroup, kind, S_IFREG | mode);
     int ret;
 
     if (!inode)
@@ -708,6 +819,9 @@ static int cgroupfs_populate_dir(struct vfs_inode *dir) {
     if (cgroupfs_create_control_file(dir, "cgroup.stat",
                                      CGROUPFS_INODE_CGROUP_STAT, 0444) < 0)
         return -ENOMEM;
+    if (cgroupfs_create_control_file(dir, "cpu.stat", CGROUPFS_INODE_CPU_STAT,
+                                     0444) < 0)
+        return -ENOMEM;
     return 0;
 }
 
@@ -729,7 +843,7 @@ static int cgroupfs_mkdir(struct vfs_inode *dir, struct vfs_dentry *dentry,
     llist_append(cgroup_children(parent), cgroup_sibling_node(child));
     cgroup_unlock();
 
-    inode = cgroupfs_new_inode(dir->i_sb, child, CGROUPFS_INODE_DIR,
+    inode = cgroupfs_new_inode(dir->i_sb, dir, child, CGROUPFS_INODE_DIR,
                                (mode & 07777) | S_IFDIR);
     if (!inode) {
         ret = -ENOMEM;
@@ -928,8 +1042,9 @@ static int cgroupfs_get_tree(struct vfs_fs_context *fc) {
     sb->s_type = fc->fs_type;
     sb->s_fs_info = fsi;
 
-    root_inode = cgroupfs_new_inode(sb, cgroup_hierarchy_root(fsi->hierarchy),
-                                    CGROUPFS_INODE_DIR, S_IFDIR | 0755);
+    root_inode =
+        cgroupfs_new_inode(sb, NULL, cgroup_hierarchy_root(fsi->hierarchy),
+                           CGROUPFS_INODE_DIR, S_IFDIR | 0755);
     if (!root_inode) {
         free(fsi);
         fc->fs_private = NULL;

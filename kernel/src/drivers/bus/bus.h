@@ -30,6 +30,7 @@ typedef struct vfs_inode vfs_node_t;
 
 struct vt_state {
     uint16_t v_active; // 活动终端号
+    uint16_t v_signal; // 等待切换时的信号
     uint16_t v_state;  // 终端状态标志
 };
 

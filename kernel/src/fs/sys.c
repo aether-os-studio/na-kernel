@@ -999,6 +999,7 @@ void sysfs_init(void) {
     sysfs_ensure_dir("/sys/class/input");
     sysfs_ensure_dir("/sys/class/drm");
     sysfs_ensure_dir("/sys/class/net");
+    sysfs_ensure_dir("/sys/class/tty");
 }
 
 void sysfs_init_umount(void) {

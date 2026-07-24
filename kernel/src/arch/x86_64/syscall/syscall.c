@@ -346,7 +346,7 @@ uint64_t sys_uname(uint64_t arg1) {
         (task && task->nsproxy) ? task->nsproxy->uts_ns : NULL;
     const char *nodename = uts_ns ? uts_ns->nodename : "aether";
     const char *machine = uts_ns ? uts_ns->machine : "x86_64";
-    const char *sysname = uts_ns ? uts_ns->sysname : "aether-kernel";
+    const char *sysname = uts_ns ? uts_ns->sysname : "na-kernel";
     const char *release = uts_ns ? uts_ns->release : BUILD_VERSION;
     const char *version = uts_ns ? uts_ns->version : BUILD_VERSION;
 

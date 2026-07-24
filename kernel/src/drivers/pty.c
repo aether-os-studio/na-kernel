@@ -93,6 +93,31 @@ static inline void pty_packet_termios_changed_locked(
     pty_packet_queue_locked(pair, status, notify_master);
 }
 
+static void pty_get_termios2_locked(const pty_pair_t *pair,
+                                    struct termios2 *term2) {
+    memset(term2, 0, sizeof(*term2));
+    term2->c_iflag = pair->term.c_iflag;
+    term2->c_oflag = pair->term.c_oflag;
+    term2->c_cflag = pair->term.c_cflag;
+    term2->c_lflag = pair->term.c_lflag;
+    term2->c_line = pair->term.c_line;
+    memcpy(term2->c_cc, pair->term.c_cc, sizeof(term2->c_cc));
+    term2->c_ispeed = pair->input_speed;
+    term2->c_ospeed = pair->output_speed;
+}
+
+static void pty_set_termios2_locked(pty_pair_t *pair,
+                                    const struct termios2 *term2) {
+    pair->term.c_iflag = term2->c_iflag;
+    pair->term.c_oflag = term2->c_oflag;
+    pair->term.c_cflag = term2->c_cflag;
+    pair->term.c_lflag = term2->c_lflag;
+    pair->term.c_line = term2->c_line;
+    memcpy(pair->term.c_cc, term2->c_cc, sizeof(pair->term.c_cc));
+    pair->input_speed = term2->c_ispeed;
+    pair->output_speed = term2->c_ospeed;
+}
+
 static void pty_notify_master(pty_pair_t *pair, uint32_t events) {
     vfs_node_t *node = NULL;
 
@@ -606,6 +631,8 @@ static int ptmx_open_file(struct vfs_inode *inode, struct vfs_file *file) {
     }
 
     pty_termios_default(&pair->term);
+    pair->input_speed = 38400;
+    pair->output_speed = 38400;
     pair->win.ws_row = 24;
     pair->win.ws_col = 80;
     pair->tty_kbmode = K_XLATE;
@@ -843,6 +870,14 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
                       ? -EFAULT
                       : 0;
             break;
+        case TCGETS2: {
+            struct termios2 term2;
+            pty_get_termios2_locked(pair, &term2);
+            ret = (!arg || copy_to_user((void *)arg, &term2, sizeof(term2)))
+                      ? -EFAULT
+                      : 0;
+            break;
+        }
         case TCSETS:
         case TCSETSW:
         case TCSETSF: {
@@ -855,6 +890,25 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
                 pty_packet_termios_changed_locked(pair, &old_term,
                                                   &notify_master);
                 if ((request & 0xffffffffU) == TCSETSF)
+                    ret = pty_tcflush_locked(pair, TCIFLUSH, &notify_master,
+                                             &notify_slave, &packet_status);
+            }
+            break;
+        }
+        case TCSETS2:
+        case TCSETSW2:
+        case TCSETSF2: {
+            struct termios old_term = pair->term;
+            struct termios2 term2;
+            ret = (!arg ||
+                   copy_from_user(&term2, (const void *)arg, sizeof(term2)))
+                      ? -EFAULT
+                      : 0;
+            if (!ret) {
+                pty_set_termios2_locked(pair, &term2);
+                pty_packet_termios_changed_locked(pair, &old_term,
+                                                  &notify_master);
+                if ((request & 0xffffffffU) == TCSETSF2)
                     ret = pty_tcflush_locked(pair, TCIFLUSH, &notify_master,
                                              &notify_slave, &packet_status);
             }
@@ -935,8 +989,8 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
             ret = 0;
             break;
         default:
-            ret = pts_ioctl(pair, request, (void *)arg);
-            break;
+            spin_unlock(&pair->lock);
+            return pts_ioctl(pair, request, (void *)arg);
         }
     }
     if (!ret)
@@ -1187,6 +1241,12 @@ int pts_ioctl(pty_pair_t *pair, uint64_t request, void *arg) {
                   ? -EFAULT
                   : 0;
         break;
+    case TCGETS2: {
+        struct termios2 term2;
+        pty_get_termios2_locked(pair, &term2);
+        ret = (!arg || copy_to_user(arg, &term2, sizeof(term2))) ? -EFAULT : 0;
+        break;
+    }
     case TCSETS:
     case TCSETSW:
     case TCSETSF: {
@@ -1197,6 +1257,22 @@ int pts_ioctl(pty_pair_t *pair, uint64_t request, void *arg) {
         if (!ret) {
             pty_packet_termios_changed_locked(pair, &old_term, &notify_master);
             if (request == TCSETSF)
+                ret = pty_tcflush_locked(pair, TCIFLUSH, &notify_master,
+                                         &notify_slave, &packet_status);
+        }
+        break;
+    }
+    case TCSETS2:
+    case TCSETSW2:
+    case TCSETSF2: {
+        struct termios old_term = pair->term;
+        struct termios2 term2;
+        ret =
+            (!arg || copy_from_user(&term2, arg, sizeof(term2))) ? -EFAULT : 0;
+        if (!ret) {
+            pty_set_termios2_locked(pair, &term2);
+            pty_packet_termios_changed_locked(pair, &old_term, &notify_master);
+            if (request == TCSETSF2)
                 ret = pty_tcflush_locked(pair, TCIFLUSH, &notify_master,
                                          &notify_slave, &packet_status);
         }

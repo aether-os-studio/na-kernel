@@ -205,7 +205,7 @@ ssize_t drm_ioctl_set_client_cap(drm_device_t *dev, void *arg);
  * @dev: DRM device
  * @arg: ioctl argument
  */
-ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg);
+ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg, fd_t *fd);
 
 /**
  * drm_ioctl_get_unique - Handle DRM_IOCTL_GET_UNIQUE

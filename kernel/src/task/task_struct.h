@@ -109,7 +109,7 @@ typedef struct kernel_timer {
 
 #define FD_TABLE_INITIAL_SIZE 64
 #define DEFAULT_NOFILE_LIMIT 1024
-#define MAX_FD_NUM 131072
+#define MAX_FD_NUM 1048576
 #define MAX_SHM_NUM 32
 
 typedef struct fd_entry {

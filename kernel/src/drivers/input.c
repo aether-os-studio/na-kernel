@@ -242,6 +242,12 @@ static void input_sysfs_publish_metadata(dev_input_event_t *input_event,
 
 static size_t input_event_bit(void *data, uint64_t request, void *arg) {
     dev_input_event_t *event = data;
+
+    // Non-evdev ioctls, such as TCGETS2 used to probe for a tty, must fail
+    // without being interpreted as EVIOC* requests.
+    if (_IOC_TYPE(request) != 'E')
+        return (size_t)-ENOTTY;
+
     size_t number = _IOC_NR(request);
     size_t size = _IOC_SIZE(request);
 

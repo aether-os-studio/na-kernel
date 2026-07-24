@@ -5,10 +5,16 @@
 #include <task/task.h>
 #include <task/signal.h>
 #include <fs/vfs/fcntl.h>
+#include <fs/sys.h>
 
 DEFINE_LLIST(tty_device_list);
 DEFINE_LLIST(tty_session_list);
 tty_t *kernel_session = NULL; // 内核会话
+
+static spinlock_t tty_vt_lock = SPIN_INIT;
+static uint64_t tty_vt_present;
+static unsigned int tty_active_vt = 1;
+static vfs_node_t *tty_active_node;
 
 extern void send_process_group_signal(int pgid, int sig);
 
@@ -645,6 +651,22 @@ void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
     if (value == 0)
         return;
 
+    if (tty->key_ctrl && tty->key_alt) {
+        unsigned int vtnr = 0;
+
+        if (code >= KEY_F1 && code <= KEY_F10)
+            vtnr = (unsigned int)(code - KEY_F1 + 1);
+        else if (code == KEY_F11)
+            vtnr = 11;
+        else if (code == KEY_F12)
+            vtnr = 12;
+
+        if (vtnr) {
+            (void)tty_vt_activate(vtnr);
+            return;
+        }
+    }
+
     if (!tty_translate_key(tty, code, out, &out_len))
         return;
 
@@ -779,6 +801,99 @@ void tty_init() {
 extern void create_session_terminal(tty_t *tty);
 extern void create_session_terminal_serial(tty_t *tty);
 
+static int tty_name_to_vtnr(const char *name, unsigned int *ret) {
+    unsigned int n = 0;
+    const char *p;
+
+    if (!name || strncmp(name, "tty", 3) != 0 || !name[3])
+        return -EINVAL;
+
+    for (p = name + 3; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return -EINVAL;
+        n = n * 10 + (unsigned int)(*p - '0');
+        if (n > 63)
+            return -ERANGE;
+    }
+
+    if (ret)
+        *ret = n;
+    return 0;
+}
+
+static void tty_sysfs_update_active_locked(void) {
+    char value[16];
+    int len;
+
+    if (!tty_active_node)
+        return;
+
+    len = snprintf(value, sizeof(value), "tty%u\n", tty_active_vt);
+    if (len > 0)
+        sysfs_write_node(tty_active_node, value, (size_t)len, 0);
+}
+
+void tty_sysfs_register(uint64_t dev, const char *name) {
+    char device_path[128];
+    unsigned int vtnr;
+    vfs_node_t *root;
+
+    if (!dev || !name)
+        return;
+
+    snprintf(device_path, sizeof(device_path), "/sys/devices/virtual/tty/%s",
+             name);
+    root = sysfs_regist_dev('c', (int)((dev >> 8) & 0xff), (int)(dev & 0xff),
+                            device_path, name, "SUBSYSTEM=tty\n",
+                            "/sys/class/tty", "/sys/class/tty", name, NULL);
+    if (!root)
+        return;
+
+    if (tty_name_to_vtnr(name, &vtnr) == 0) {
+        spin_lock(&tty_vt_lock);
+        if (vtnr == 0) {
+            if (tty_active_node)
+                vfs_iput(tty_active_node);
+            tty_active_node = sysfs_child_append(root, "active", false);
+            tty_sysfs_update_active_locked();
+        } else {
+            tty_vt_present |= 1ULL << vtnr;
+        }
+        spin_unlock(&tty_vt_lock);
+    }
+
+    vfs_iput(root);
+}
+
+int tty_vt_activate(unsigned int vtnr) {
+    int ret = 0;
+
+    if (vtnr == 0 || vtnr > 63)
+        return -EINVAL;
+
+    spin_lock(&tty_vt_lock);
+    if (!(tty_vt_present & (1ULL << vtnr)))
+        ret = -ENXIO;
+    else {
+        tty_active_vt = vtnr;
+        tty_sysfs_update_active_locked();
+    }
+    spin_unlock(&tty_vt_lock);
+    return ret;
+}
+
+int tty_vt_get_state(struct vt_state *state) {
+    if (!state)
+        return -EINVAL;
+
+    spin_lock(&tty_vt_lock);
+    state->v_active = (unsigned short)tty_active_vt;
+    state->v_signal = 0;
+    state->v_state = (unsigned short)(tty_vt_present & 0xffff);
+    spin_unlock(&tty_vt_lock);
+    return 0;
+}
+
 int tty_ioctl(void *dev, int cmd, void *args) {
     tty_t *tty = dev;
     return tty->ops.ioctl(tty, cmd, (uint64_t)args);
@@ -820,10 +935,14 @@ void tty_init_session() {
     llist_init_head(&tty->node);
     create_session_terminal(tty);
     tty_register_session(tty);
-    device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, NULL, NULL, tty_ioctl,
-                   tty_poll, tty_read, tty_write, NULL);
-    device_install(DEV_CHAR, DEV_TTY, tty, "tty1", 0, NULL, NULL, tty_ioctl,
-                   tty_poll, tty_read, tty_write, NULL);
+    uint64_t tty0_dev =
+        device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, NULL, NULL,
+                       tty_ioctl, tty_poll, tty_read, tty_write, NULL);
+    uint64_t tty1_dev =
+        device_install(DEV_CHAR, DEV_TTY, tty, "tty1", 0, NULL, NULL, tty_ioctl,
+                       tty_poll, tty_read, tty_write, NULL);
+    tty_sysfs_register(tty1_dev, "tty1");
+    tty_sysfs_register(tty0_dev, tty_name);
 
     kernel_session = tty;
 }
@@ -843,8 +962,10 @@ void tty_init_session_serial() {
     llist_init_head(&tty->node);
     create_session_terminal_serial(tty);
     tty_register_session(tty);
-    device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, NULL, NULL, tty_ioctl,
-                   tty_poll, tty_read, tty_write, NULL);
+    uint64_t dev =
+        device_install(DEV_CHAR, DEV_TTY, tty, tty_name, 0, NULL, NULL,
+                       tty_ioctl, tty_poll, tty_read, tty_write, NULL);
+    tty_sysfs_register(dev, tty_name);
 
     kernel_session = tty;
 }

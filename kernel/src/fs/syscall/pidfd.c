@@ -4,7 +4,7 @@
 #include <libs/hashmap.h>
 #include <task/task.h>
 
-#define PIDFDFS_MAGIC 0x70696466ULL
+#define PIDFDFS_MAGIC 0x50494446ULL
 
 typedef struct pidfd_ctx {
     uint64_t pid;
@@ -17,6 +17,8 @@ typedef struct pidfd_ctx {
 typedef struct pidfd_watch_bucket {
     uint64_t key;
     size_t count;
+    ino64_t inode_id;
+    bool exited;
     struct llist_header watchers;
 } pidfd_watch_bucket_t;
 
@@ -77,11 +79,40 @@ static pidfd_watch_bucket_t *pidfd_watch_bucket_get_or_create(uint64_t pid) {
 static void pidfd_watch_bucket_destroy_if_empty(uint64_t pid) {
     pidfd_watch_bucket_t *bucket = pidfd_watch_bucket_lookup(pid);
 
-    if (!bucket || bucket->count || !llist_empty(&bucket->watchers))
+    /* Keep the identity cached for the whole process lifetime even when no
+     * pidfd is currently open. Linux pidfs reports the same inode number for
+     * every pidfd referring to one process, and systemd relies on that to
+     * authenticate PID references passed between processes. */
+    if (!bucket || !bucket->exited || bucket->count ||
+        !llist_empty(&bucket->watchers))
         return;
 
     hashmap_remove(&pidfd_watch_map, pid);
     free(bucket);
+}
+
+static int pidfd_inode_id(uint64_t pid, pidfdfs_info_t *fsi,
+                          ino64_t *inode_id) {
+    pidfd_watch_bucket_t *bucket;
+
+    if (!pid || !fsi || !inode_id)
+        return -EINVAL;
+
+    spin_lock(&pidfd_watch_lock);
+    bucket = pidfd_watch_bucket_get_or_create(pid);
+    if (!bucket) {
+        spin_unlock(&pidfd_watch_lock);
+        return -ENOMEM;
+    }
+
+    if (!bucket->inode_id) {
+        spin_lock(&fsi->lock);
+        bucket->inode_id = ++fsi->next_ino;
+        spin_unlock(&fsi->lock);
+    }
+    *inode_id = bucket->inode_id;
+    spin_unlock(&pidfd_watch_lock);
+    return 0;
 }
 
 static void pidfd_watch_attach_locked(pidfd_ctx_t *ctx) {
@@ -395,6 +426,8 @@ static int pidfd_create_handle_file(pidfd_ctx_t *ctx, unsigned int open_flags,
     struct vfs_dentry *dentry;
     struct vfs_qstr name = {0};
     struct vfs_file *file;
+    ino64_t inode_id;
+    int ret;
     char namebuf[32];
 
     if (!ctx || !out_file)
@@ -406,15 +439,18 @@ static int pidfd_create_handle_file(pidfd_ctx_t *ctx, unsigned int open_flags,
 
     sb = mnt->mnt_sb;
     fsi = pidfdfs_sb_info(sb);
+    ret = pidfd_inode_id(ctx->pid, fsi, &inode_id);
+    if (ret < 0) {
+        vfs_mntput(mnt);
+        return ret;
+    }
     inode = vfs_alloc_inode(sb);
     if (!inode) {
         vfs_mntput(mnt);
         return -ENOMEM;
     }
 
-    spin_lock(&fsi->lock);
-    inode->i_ino = ++fsi->next_ino;
-    spin_unlock(&fsi->lock);
+    inode->i_ino = inode_id;
     inode->inode = inode->i_ino;
     inode->i_mode = S_IFCHR | 0600;
     inode->i_nlink = 1;
@@ -525,8 +561,9 @@ uint64_t sys_pidfd_send_signal(uint64_t pidfd, int sig, siginfo_t *info,
         return 0;
 
     if (!info) {
-        task_send_signal(target, sig, SI_USER);
-        return 0;
+        return task_kill_thread_group(task_effective_tgid(target), sig) > 0
+                   ? 0
+                   : (uint64_t)-ESRCH;
     }
 
     siginfo_t kinfo;
@@ -579,6 +616,10 @@ void pidfd_on_task_exit(task_t *task) {
         ctx->exit_status = task->status;
         if (ctx->node)
             vfs_poll_notify_inode(ctx->node, EPOLLIN | EPOLLRDNORM);
+    }
+    if (bucket) {
+        bucket->exited = true;
+        pidfd_watch_bucket_destroy_if_empty(task->pid);
     }
     spin_unlock(&pidfd_watch_lock);
 }

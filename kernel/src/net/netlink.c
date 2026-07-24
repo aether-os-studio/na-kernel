@@ -2904,52 +2904,6 @@ static size_t netlink_buffer_available(struct netlink_buffer *buf) {
     return avail;
 }
 
-static void netlink_deliver_historical_messages(struct netlink_sock *sock) {
-    int start = 0;
-
-    if (sock == NULL || sock->buffer == NULL || sock->groups == 0) {
-        return;
-    }
-
-    spin_lock(&netlink_msg_pool_lock);
-    start = netlink_msg_pool_next;
-    spin_unlock(&netlink_msg_pool_lock);
-
-    for (int count = 0; count < MAX_NETLINK_MSG_POOL_SIZE; count++) {
-        char message[NETLINK_BUFFER_SIZE];
-        size_t length = 0;
-        uint32_t nl_pid = 0;
-        uint32_t nl_groups = 0;
-        int protocol = 0;
-        bool should_deliver = false;
-
-        spin_lock(&netlink_msg_pool_lock);
-        struct netlink_msg_pool_entry *entry =
-            &netlink_msg_pool[(start + count) % MAX_NETLINK_MSG_POOL_SIZE];
-
-        if (entry->valid) {
-            protocol = entry->protocol;
-            nl_groups = entry->nl_groups;
-            if (protocol == sock->protocol &&
-                netlink_group_mask_matches(sock->groups, nl_groups)) {
-                length = entry->length;
-                nl_pid = entry->nl_pid;
-                memcpy(message, entry->message, length);
-                should_deliver = true;
-            }
-        }
-        spin_unlock(&netlink_msg_pool_lock);
-
-        if (!should_deliver)
-            continue;
-
-        if (netlink_buffer_write_packet(sock, message, length, nl_pid,
-                                        nl_groups) == 0) {
-            break;
-        }
-    }
-}
-
 // 内部发送函数，用于向指定 socket 发送消息
 static size_t netlink_deliver_to_socket(struct netlink_sock *target,
                                         const char *data, size_t len,
@@ -3066,8 +3020,6 @@ int netlink_bind(uint64_t fd, const struct sockaddr_un *addr,
     netlink_fill_sockaddr(sock->bind_addr, sock->portid, sock->groups);
     spin_unlock(&sock->lock);
     spin_unlock(&netlink_sockets_lock);
-
-    netlink_deliver_historical_messages(sock);
 
     vfs_file_put(file);
     return 0;
@@ -3257,10 +3209,8 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
                 NETLINK_SETSOCKOPT_RETURN(-EINVAL);
 
             uint32_t bit = 1U << (group - 1);
-            bool replay_history = false;
             spin_lock(&nl_sk->lock);
             if (optname == NETLINK_ADD_MEMBERSHIP) {
-                replay_history = (nl_sk->groups & bit) == 0;
                 nl_sk->groups |= bit;
             } else {
                 nl_sk->groups &= ~bit;
@@ -3269,8 +3219,6 @@ size_t netlink_setsockopt(uint64_t fd, int level, int optname,
                 nl_sk->bind_addr->nl_groups = nl_sk->groups;
             spin_unlock(&nl_sk->lock);
 
-            if (replay_history)
-                netlink_deliver_historical_messages(nl_sk);
             NETLINK_SETSOCKOPT_RETURN(0);
         }
         case 3:

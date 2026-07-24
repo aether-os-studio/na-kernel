@@ -144,6 +144,17 @@ int64_t sys_sendmsg(int sockfd, const struct msghdr *msg, int flags);
  * Gaps: unsupported backends currently return 0 instead of an error.
  */
 int64_t sys_recvmsg(int sockfd, struct msghdr *msg, int flags);
+
+/*
+ * VFS vectored I/O entry points for sockets. The iovec array is already a
+ * kernel copy, while each iov_base still names userspace memory. Keeping this
+ * conversion in the socket layer lets readv()/writev() retain the single
+ * message boundary required by DGRAM and SEQPACKET sockets.
+ */
+int64_t socket_send_iov(int sockfd, const struct iovec *iov, size_t iovlen,
+                        int flags);
+int64_t socket_recv_iov(int sockfd, const struct iovec *iov, size_t iovlen,
+                        int flags);
 /**
  * Linux contract: send multiple datagrams/messages with one syscall.
  * Current kernel: loops over sys_sendmsg() one entry at a time.

@@ -87,12 +87,6 @@ int vfs_mkdirat(int dfd, const char *pathname, umode_t mode, bool kernel) {
         goto out;
     }
 
-    if (!kernel) {
-        ret = vfs_may_write_dir(dir);
-        if (ret < 0)
-            goto out;
-    }
-
     dentry = vfs_d_lookup(parent.dentry, &last);
     if (dentry) {
         if (dentry->d_inode) {
@@ -100,7 +94,18 @@ int vfs_mkdirat(int dfd, const char *pathname, umode_t mode, bool kernel) {
             ret = -EEXIST;
             goto out;
         }
-    } else {
+    }
+
+    if (!kernel) {
+        ret = vfs_may_write_dir(dir);
+        if (ret < 0) {
+            if (dentry)
+                vfs_dput(dentry);
+            goto out;
+        }
+    }
+
+    if (!dentry) {
         dentry = vfs_d_alloc(parent.dentry->d_sb, parent.dentry, &last);
         if (!dentry) {
             ret = -ENOMEM;

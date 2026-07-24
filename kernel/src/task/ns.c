@@ -206,7 +206,7 @@ task_uts_namespace_create(const task_uts_namespace_t *parent) {
         return uts_ns;
     }
 
-    strcpy(uts_ns->sysname, "aether-kernel");
+    strcpy(uts_ns->sysname, "na-kernel");
     strcpy(uts_ns->nodename, "aether");
     strcpy(uts_ns->release, BUILD_VERSION);
     strcpy(uts_ns->version, BUILD_VERSION);

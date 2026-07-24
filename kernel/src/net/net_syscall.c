@@ -1068,6 +1068,172 @@ int64_t sys_recvmsg(int sockfd, struct msghdr *msg, int flags) {
     return 0;
 }
 
+static int socket_prepare_iov_from_kernel(const struct iovec *iov,
+                                          size_t iovlen,
+                                          socket_msghdr_copy_t *copy,
+                                          bool copy_payloads) {
+    size_t iov_bytes;
+    size_t total_len = 0;
+    int ret;
+
+    if (!copy || (iovlen && !iov))
+        return -EINVAL;
+    if (iovlen > SOCKET_IOV_MAX || iovlen > SIZE_MAX / sizeof(struct iovec))
+        return -EMSGSIZE;
+
+    memset(copy, 0, sizeof(*copy));
+    copy->user_shadow.msg_iovlen = iovlen;
+    if (!iovlen)
+        return 0;
+
+    iov_bytes = iovlen * sizeof(struct iovec);
+    copy->user_iov = malloc(iov_bytes);
+    if (!copy->user_iov)
+        return -ENOMEM;
+    memcpy(copy->user_iov, iov, iov_bytes);
+
+    ret = socket_iov_total_len(copy->user_iov, iovlen, &total_len);
+    if (ret < 0)
+        goto fail;
+    if (total_len > SOCKET_MSG_PAYLOAD_MAX) {
+        ret = -EMSGSIZE;
+        goto fail;
+    }
+
+    copy->kernel_iov = calloc(iovlen, sizeof(*copy->kernel_iov));
+    copy->kernel_iov_allocs = calloc(iovlen, sizeof(*copy->kernel_iov_allocs));
+    if (!copy->kernel_iov || !copy->kernel_iov_allocs) {
+        ret = -ENOMEM;
+        goto fail;
+    }
+
+    for (size_t i = 0; i < iovlen; i++) {
+        size_t len = copy->user_iov[i].len;
+
+        if (!len)
+            continue;
+        ret =
+            socket_validate_user_mapped_buffer(copy->user_iov[i].iov_base, len);
+        if (ret < 0)
+            goto fail;
+
+        copy->kernel_iov[i].iov_base = malloc(len);
+        if (!copy->kernel_iov[i].iov_base) {
+            ret = -ENOMEM;
+            goto fail;
+        }
+        copy->kernel_iov[i].len = len;
+        copy->kernel_iov_allocs[i] = copy->kernel_iov[i].iov_base;
+
+        if (copy_payloads && copy_from_user(copy->kernel_iov[i].iov_base,
+                                            copy->user_iov[i].iov_base, len)) {
+            ret = -EFAULT;
+            goto fail;
+        }
+    }
+
+    copy->kernel_msg.msg_iov = copy->kernel_iov;
+    copy->kernel_msg.msg_iovlen = iovlen;
+    return 0;
+
+fail:
+    socket_release_msghdr_copy(copy);
+    return ret;
+}
+
+int64_t socket_send_iov(int sockfd, const struct iovec *iov, size_t iovlen,
+                        int flags) {
+    socket_msghdr_copy_t copy;
+    fd_t *node;
+    socket_handle_t *handle;
+    int ret;
+    int64_t out;
+
+    if (sockfd < 0)
+        return -EBADF;
+    ret = socket_prepare_iov_from_kernel(iov, iovlen, &copy, true);
+    if (ret < 0)
+        return ret;
+
+    node = task_get_file(current_task, sockfd);
+    if (!node) {
+        socket_release_msghdr_copy(&copy);
+        return -EBADF;
+    }
+    if (!is_socket(node)) {
+        vfs_file_put(node);
+        socket_release_msghdr_copy(&copy);
+        return -ENOTSOCK;
+    }
+
+    handle = sockfs_file_handle(node);
+    if (!handle || !handle->op || !handle->op->sendmsg)
+        out = -EOPNOTSUPP;
+    else
+        out = handle->op->sendmsg(sockfd, &copy.kernel_msg, flags);
+
+    vfs_file_put(node);
+    socket_release_msghdr_copy(&copy);
+    return out;
+}
+
+int64_t socket_recv_iov(int sockfd, const struct iovec *iov, size_t iovlen,
+                        int flags) {
+    socket_msghdr_copy_t copy;
+    fd_t *node;
+    socket_handle_t *handle;
+    size_t total_len = 0;
+    int ret;
+    int64_t out;
+
+    if (sockfd < 0)
+        return -EBADF;
+    ret = socket_prepare_iov_from_kernel(iov, iovlen, &copy, false);
+    if (ret < 0)
+        return ret;
+
+    node = task_get_file(current_task, sockfd);
+    if (!node) {
+        socket_release_msghdr_copy(&copy);
+        return -EBADF;
+    }
+    if (!is_socket(node)) {
+        vfs_file_put(node);
+        socket_release_msghdr_copy(&copy);
+        return -ENOTSOCK;
+    }
+
+    handle = sockfs_file_handle(node);
+    if (!handle || !handle->op || !handle->op->recvmsg)
+        out = -EOPNOTSUPP;
+    else
+        out = handle->op->recvmsg(sockfd, &copy.kernel_msg, flags);
+
+    if (out >= 0) {
+        ret = socket_iov_total_len(copy.user_iov, iovlen, &total_len);
+        if (ret < 0)
+            out = ret;
+        else {
+            size_t remaining = MIN((size_t)out, total_len);
+
+            for (size_t i = 0; i < iovlen && remaining > 0; i++) {
+                size_t len = MIN(copy.user_iov[i].len, remaining);
+
+                if (len && copy_to_user(copy.user_iov[i].iov_base,
+                                        copy.kernel_iov[i].iov_base, len)) {
+                    out = -EFAULT;
+                    break;
+                }
+                remaining -= len;
+            }
+        }
+    }
+
+    vfs_file_put(node);
+    socket_release_msghdr_copy(&copy);
+    return out;
+}
+
 int64_t sys_sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
                      int flags) {
     int ret = socket_validate_mmsg_array(msgvec, vlen);

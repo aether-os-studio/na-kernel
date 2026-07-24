@@ -116,6 +116,8 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
         return 0;
     }
     case KDSETMODE:
+        if (arg != KD_TEXT && arg != KD_GRAPHICS)
+            return -EINVAL;
         device->tty_mode = arg;
         return 0;
     case KDGKBMODE: {
@@ -138,14 +140,14 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
             return -EFAULT;
         return 0;
     case VT_ACTIVATE:
-        return 0;
+        return tty_vt_activate((unsigned int)arg);
     case VT_WAITACTIVE:
         return 0;
     case VT_GETSTATE: {
-        struct vt_state state = {
-            .v_active = 1,
-            .v_state = 0,
-        };
+        struct vt_state state = {0};
+        int ret = tty_vt_get_state(&state);
+        if (ret < 0)
+            return ret;
         if (!arg || copy_to_user((void *)arg, &state, sizeof(state)))
             return -EFAULT;
         return 0;
@@ -195,7 +197,10 @@ size_t terminal_write(tty_t *device, const char *buf, size_t count) {
 #if SERIAL_DEBUG
     serial_printk((char *)buf, count);
 #endif
-    if (device->current_vt_mode.mode != VT_PROCESS && device->terminal) {
+    /* KD_TEXT/KD_GRAPHICS controls whether the kernel console owns the
+     * framebuffer. VT_AUTO/VT_PROCESS instead controls who arbitrates VT
+     * switching and must not be used as a rendering-mode test. */
+    if (device->tty_mode == KD_TEXT && device->terminal) {
         flanterm_write(device->terminal, buf, count);
     }
     spin_unlock(&terminal_write_lock);

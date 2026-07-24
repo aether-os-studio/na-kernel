@@ -28,6 +28,7 @@ uint32_t cgroup_subtree_control(cgroup_t *cgroup);
 void cgroup_set_subtree_control(cgroup_t *cgroup, uint32_t mask);
 bool cgroup_frozen(cgroup_t *cgroup);
 void cgroup_set_frozen(cgroup_t *cgroup, bool frozen);
+uint64_t cgroup_runtime_ns(cgroup_t *cgroup);
 
 void cgroup_lock(void);
 void cgroup_unlock(void);
