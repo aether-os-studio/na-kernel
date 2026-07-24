@@ -13,10 +13,11 @@
 #define VIRTIO_GPU_DEFAULT_WIDTH 1024
 #define VIRTIO_GPU_DEFAULT_HEIGHT 768
 #define VIRTIO_GPU_DISPLAY_POLL_NS 100000000LL
+#define VIRTIO_GPU_RESPONSE_WATCHDOG_NS 10000000LL
 #define VIRTIO_GPU_SUPPORTED_FEATURES                                          \
     (VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_CONTEXT_INIT |      \
      VIRTIO_GPU_F_SUPPORTED_CAPSET_IDS | VIRTIO_F_RING_INDIRECT_DESC |         \
-     VIRTIO_F_RING_EVENT_IDX | VIRTIO_F_VERSION_1)
+     VIRTIO_F_VERSION_1)
 
 static bool virtio_gpu_handle_to_index(uint32_t handle, uint32_t *idx) {
     if (handle == 0 || handle > VIRTIO_GPU_MAX_DUMB_BUFFERS || !idx) {
@@ -63,6 +64,98 @@ static void virtio_gpu_hdr_init_ctx(virtio_gpu_ctrl_hdr_t *hdr, uint32_t type,
 
 static uint32_t virtio_gpu_resp_type(const virtio_gpu_ctrl_hdr_t *hdr) {
     return le32toh(hdr->type);
+}
+
+static void virtio_gpu_control_acquire(virtio_gpu_device_t *gpu) {
+    for (;;) {
+        bool expected = false;
+        if (__atomic_compare_exchange_n(&gpu->control_busy, &expected, true,
+                                        false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED))
+            return;
+
+        if (!current_task) {
+            arch_pause();
+            continue;
+        }
+
+        wait_queue_entry_t wait;
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&gpu->control_available_wait, &wait);
+
+        expected = false;
+        if (__atomic_compare_exchange_n(&gpu->control_busy, &expected, true,
+                                        false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            wait_queue_remove(&gpu->control_available_wait, &wait);
+            task_cancel_block_prepare(current_task);
+            return;
+        }
+
+        (void)task_block(current_task, TASK_BLOCKING, -1, "virtio_gpu_control");
+        wait_queue_remove(&gpu->control_available_wait, &wait);
+        task_cancel_block_prepare(current_task);
+    }
+}
+
+static void virtio_gpu_control_release(virtio_gpu_device_t *gpu) {
+    __atomic_store_n(&gpu->control_busy, false, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&gpu->control_available_wait, 0, EOK);
+}
+
+static uint16_t virtio_gpu_control_wait_used(virtio_gpu_device_t *gpu,
+                                             uint32_t *used_len) {
+    for (;;) {
+        uint16_t used_idx = virt_queue_get_used_buf(gpu->control_vq, used_len);
+        if (used_idx != 0xFFFF)
+            return used_idx;
+
+        bool can_sleep =
+            current_task &&
+            __atomic_load_n(&gpu->control_irq_enabled, __ATOMIC_ACQUIRE);
+        if (!can_sleep) {
+            if (current_task)
+                schedule(0);
+            else
+                arch_pause();
+            continue;
+        }
+
+        wait_queue_entry_t wait;
+        uint64_t observed_seq =
+            __atomic_load_n(&gpu->control_irq_seq, __ATOMIC_ACQUIRE);
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&gpu->control_irq_wait, &wait);
+
+        used_idx = virt_queue_get_used_buf(gpu->control_vq, used_len);
+        if (used_idx != 0xFFFF ||
+            __atomic_load_n(&gpu->control_irq_seq, __ATOMIC_ACQUIRE) !=
+                observed_seq) {
+            wait_queue_remove(&gpu->control_irq_wait, &wait);
+            task_cancel_block_prepare(current_task);
+            if (used_idx != 0xFFFF)
+                return used_idx;
+            continue;
+        }
+
+        (void)task_block(current_task, TASK_BLOCKING,
+                         VIRTIO_GPU_RESPONSE_WATCHDOG_NS,
+                         "virtio_gpu_response");
+        wait_queue_remove(&gpu->control_irq_wait, &wait);
+        task_cancel_block_prepare(current_task);
+    }
+}
+
+static void virtio_gpu_irq_handler(void *opaque, uint8_t isr_status) {
+    virtio_gpu_device_t *gpu = (virtio_gpu_device_t *)opaque;
+
+    if (!gpu || !(isr_status & 0x1))
+        return;
+
+    __atomic_fetch_add(&gpu->control_irq_seq, 1, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&gpu->control_irq_wait, 0, EOK);
 }
 
 static int virtio_gpu_ctl_send(virtio_gpu_device_t *gpu, const void *req,
@@ -120,10 +213,10 @@ static int virtio_gpu_ctl_send(virtio_gpu_device_t *gpu, const void *req,
     }
     dma_sync_cpu_to_device(resp_buf, resp_size);
 
-    spin_lock(&gpu->control_lock);
+    virtio_gpu_control_acquire(gpu);
     desc_idx = virt_queue_add_buf(gpu->control_vq, bufs, num_bufs, writable);
     if (desc_idx == 0xFFFF) {
-        spin_unlock(&gpu->control_lock);
+        virtio_gpu_control_release(gpu);
         ret = -EIO;
         goto out;
     }
@@ -131,12 +224,9 @@ static int virtio_gpu_ctl_send(virtio_gpu_device_t *gpu, const void *req,
     virt_queue_submit_buf(gpu->control_vq, desc_idx);
     virt_queue_notify(gpu->driver, gpu->control_vq);
 
-    while ((used_idx = virt_queue_get_used_buf(gpu->control_vq, &used_len)) ==
-           0xFFFF) {
-        arch_pause();
-    }
+    used_idx = virtio_gpu_control_wait_used(gpu, &used_len);
     virt_queue_free_desc(gpu->control_vq, used_idx);
-    spin_unlock(&gpu->control_lock);
+    virtio_gpu_control_release(gpu);
 
     dma_sync_device_to_cpu(resp_buf, resp_size);
     memcpy(resp, resp_buf, resp_size);
@@ -2215,7 +2305,8 @@ int virtio_gpu_init(virtio_driver_t *driver) {
     gpu->next_resource_id = 1;
     gpu->next_context_id = 1;
     gpu->next_fence_id = 1;
-    spin_init(&gpu->control_lock);
+    wait_queue_init(&gpu->control_available_wait);
+    wait_queue_init(&gpu->control_irq_wait);
     drm_resource_manager_init(&gpu->resource_mgr);
     if ((features & VIRTIO_GPU_F_VIRGL) == 0) {
         printk("virtio_gpu: host did not offer virgl; Mesa will use software "
@@ -2235,6 +2326,13 @@ int virtio_gpu_init(virtio_driver_t *driver) {
     }
 
     virtio_finish_init(driver);
+    if (driver->op->supports_interrupts &&
+        driver->op->supports_interrupts(driver->data) &&
+        driver->op->set_interrupt_handler) {
+        driver->op->set_interrupt_handler(driver->data, virtio_gpu_irq_handler,
+                                          gpu);
+        __atomic_store_n(&gpu->control_irq_enabled, true, __ATOMIC_RELEASE);
+    }
     virtio_gpu_read_config(gpu);
     virtio_gpu_probe_capsets(gpu);
     if ((features & VIRTIO_GPU_F_VIRGL) != 0 &&

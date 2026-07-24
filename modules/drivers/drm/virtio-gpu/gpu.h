@@ -5,6 +5,7 @@
 #include <drivers/virtio/pci.h>
 #include <drivers/virtio/queue.h>
 #include <drivers/virtio/virtio.h>
+#include <task/wait.h>
 
 #define VIRTIO_GPU_QUEUE_CONTROL 0
 #define VIRTIO_GPU_QUEUE_CURSOR 1
@@ -274,7 +275,11 @@ typedef struct virtio_gpu_device {
     virtio_driver_t *driver;
     virtqueue_t *control_vq;
     virtqueue_t *cursor_vq;
-    spinlock_t control_lock;
+    bool control_busy;
+    wait_queue_head_t control_available_wait;
+    wait_queue_head_t control_irq_wait;
+    uint64_t control_irq_seq;
+    bool control_irq_enabled;
     uint64_t negotiated_features;
     uint32_t num_capsets;
     uint32_t next_resource_id;

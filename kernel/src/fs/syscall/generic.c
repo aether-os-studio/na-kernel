@@ -4187,7 +4187,23 @@ uint64_t sys_readlinkat(int dfd, char *path_user, char *buf_user,
     if (copy_from_user_str(path, path_user, sizeof(path)))
         return (uint64_t)-EFAULT;
 
-    ret = vfs_filename_lookup(dfd, path, LOOKUP_NOFOLLOW, &vpath);
+    if (path[0] == '\0') {
+        fd_t *file;
+
+        if (dfd == AT_FDCWD)
+            return (uint64_t)-ENOENT;
+
+        file = task_get_file(current_task, dfd);
+        if (!file)
+            return (uint64_t)-EBADF;
+        if (!vfs_path_copy(&vpath, &file->f_path))
+            ret = -ENOENT;
+        else
+            ret = 0;
+        vfs_file_put(file);
+    } else {
+        ret = vfs_filename_lookup(dfd, path, LOOKUP_NOFOLLOW, &vpath);
+    }
     if (ret < 0)
         return (uint64_t)ret;
     if (!vpath.dentry->d_inode || !S_ISLNK(vpath.dentry->d_inode->i_mode) ||
