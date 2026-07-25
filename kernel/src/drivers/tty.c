@@ -802,6 +802,7 @@ void tty_init() {
         tty_init_session_serial();
     } else {
         tty_init_session();
+        tty_init_session_serial();
     }
 }
 
@@ -1222,5 +1223,6 @@ void tty_init_session_serial() {
                        tty_ioctl, tty_poll, tty_read, tty_write, NULL);
     tty_sysfs_register(dev, tty_name);
 
-    kernel_session = tty;
+    if (!kernel_session)
+        kernel_session = tty;
 }

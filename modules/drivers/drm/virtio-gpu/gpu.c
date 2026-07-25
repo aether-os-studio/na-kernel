@@ -12,7 +12,7 @@
 
 #define VIRTIO_GPU_DEFAULT_WIDTH 1024
 #define VIRTIO_GPU_DEFAULT_HEIGHT 768
-#define VIRTIO_GPU_DISPLAY_POLL_NS 100000000LL
+#define VIRTIO_GPU_DISPLAY_FALLBACK_POLL_NS 1000000000LL
 #define VIRTIO_GPU_RESPONSE_WATCHDOG_NS 10000000LL
 #define VIRTIO_GPU_SUPPORTED_FEATURES                                          \
     (VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_CONTEXT_INIT |      \
@@ -151,11 +151,29 @@ static uint16_t virtio_gpu_control_wait_used(virtio_gpu_device_t *gpu,
 static void virtio_gpu_irq_handler(void *opaque, uint8_t isr_status) {
     virtio_gpu_device_t *gpu = (virtio_gpu_device_t *)opaque;
 
-    if (!gpu || !(isr_status & 0x1))
+    if (!gpu)
         return;
 
-    __atomic_fetch_add(&gpu->control_irq_seq, 1, __ATOMIC_RELEASE);
-    wait_queue_wake_all(&gpu->control_irq_wait, 0, EOK);
+    if (isr_status & 0x1) {
+        __atomic_fetch_add(&gpu->control_irq_seq, 1, __ATOMIC_RELEASE);
+        wait_queue_wake_all(&gpu->control_irq_wait, 0, EOK);
+    }
+
+    if ((isr_status & 0x2) && gpu->driver && gpu->driver->op &&
+        gpu->driver->op->read_config_space &&
+        gpu->driver->op->write_config_space) {
+        uint32_t events = gpu->driver->op->read_config_space(
+            gpu->driver->data, VIRTIO_GPU_CONFIG_EVENTS_READ);
+        if (events) {
+            gpu->driver->op->write_config_space(
+                gpu->driver->data, VIRTIO_GPU_CONFIG_EVENTS_CLEAR, events);
+        }
+        if (events & VIRTIO_GPU_EVENT_DISPLAY) {
+            __atomic_store_n(&gpu->display_event_pending, true,
+                             __ATOMIC_RELEASE);
+            wait_queue_wake_all(&gpu->display_event_wait, 0, EOK);
+        }
+    }
 }
 
 static int virtio_gpu_ctl_send(virtio_gpu_device_t *gpu, const void *req,
@@ -275,7 +293,6 @@ static void virtio_gpu_build_mode(const virtio_gpu_device_t *gpu,
     }
 
     memset(mode, 0, sizeof(*mode));
-    mode->clock = gpu->width * HZ;
     mode->hdisplay = gpu->width;
     mode->hsync_start = gpu->width + 16;
     mode->hsync_end = gpu->width + 16 + 96;
@@ -285,6 +302,10 @@ static void virtio_gpu_build_mode(const virtio_gpu_device_t *gpu,
     mode->vsync_end = gpu->height + 10 + 2;
     mode->vtotal = gpu->height + 10 + 2 + 33;
     mode->vrefresh = HZ;
+    mode->clock =
+        (uint32_t)(((uint64_t)mode->htotal * mode->vtotal * mode->vrefresh +
+                    500) /
+                   1000);
     mode->type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED;
     snprintf(mode->name, sizeof(mode->name), "%dx%d", gpu->width, gpu->height);
 }
@@ -538,7 +559,14 @@ static int virtio_gpu_set_scanout(virtio_gpu_device_t *gpu,
     req.rect.height = htole32(height);
     req.scanout_id = htole32(gpu->scanout_id);
     req.resource_id = htole32(bo ? bo->resource_id : 0);
-    return virtio_gpu_simple_cmd(gpu, &req, sizeof(req));
+    int ret = virtio_gpu_simple_cmd(gpu, &req, sizeof(req));
+    if (ret == 0) {
+        gpu->bound_scanout_id = gpu->scanout_id;
+        gpu->scanout_resource_id = bo ? bo->resource_id : 0;
+        gpu->scanout_resource_width = bo ? width : 0;
+        gpu->scanout_resource_height = bo ? height : 0;
+    }
+    return ret;
 }
 
 static int virtio_gpu_transfer_to_host_2d(virtio_gpu_device_t *gpu,
@@ -599,7 +627,10 @@ static int virtio_gpu_present(virtio_gpu_device_t *gpu, virtio_gpu_buffer_t *bo,
         return 0;
     }
 
-    if (set_scanout) {
+    if (set_scanout && (gpu->bound_scanout_id != gpu->scanout_id ||
+                        gpu->scanout_resource_id != bo->resource_id ||
+                        gpu->scanout_resource_width != bo->width ||
+                        gpu->scanout_resource_height != bo->height)) {
         int ret = virtio_gpu_set_scanout(gpu, bo, 0, 0, bo->width, bo->height);
         if (ret != 0) {
             return ret;
@@ -1063,7 +1094,6 @@ static int virtio_gpu_drm_get_display_info(drm_device_t *drm_dev,
         return -ENODEV;
     }
 
-    (void)virtio_gpu_refresh_display_info(gpu, NULL);
     *width = gpu->width;
     *height = gpu->height;
     *bpp = gpu->bpp;
@@ -1074,15 +1104,31 @@ static void virtio_gpu_display_worker(uint64_t arg) {
     virtio_gpu_device_t *gpu = (virtio_gpu_device_t *)arg;
 
     while (true) {
+        wait_queue_entry_t wait;
+        int64_t timeout_ns =
+            gpu->control_irq_enabled ? -1 : VIRTIO_GPU_DISPLAY_FALLBACK_POLL_NS;
+
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&gpu->display_event_wait, &wait);
+
+        bool pending = __atomic_exchange_n(&gpu->display_event_pending, false,
+                                           __ATOMIC_ACQ_REL);
+        if (!pending) {
+            (void)task_block(current_task, TASK_BLOCKING, timeout_ns,
+                             "virtio_gpu_display");
+        } else {
+            task_cancel_block_prepare(current_task);
+        }
+        wait_queue_remove(&gpu->display_event_wait, &wait);
+        task_cancel_block_prepare(current_task);
+
         bool changed = false;
 
         if (virtio_gpu_refresh_display_info(gpu, &changed) == 0 && changed &&
             gpu->drm_dev) {
             drm_notify_hotplug(gpu->drm_dev);
         }
-
-        task_block(current_task, TASK_BLOCKING, VIRTIO_GPU_DISPLAY_POLL_NS,
-                   "virtio_gpu_display");
     }
 }
 
@@ -2307,6 +2353,7 @@ int virtio_gpu_init(virtio_driver_t *driver) {
     gpu->next_fence_id = 1;
     wait_queue_init(&gpu->control_available_wait);
     wait_queue_init(&gpu->control_irq_wait);
+    wait_queue_init(&gpu->display_event_wait);
     drm_resource_manager_init(&gpu->resource_mgr);
     if ((features & VIRTIO_GPU_F_VIRGL) == 0) {
         printk("virtio_gpu: host did not offer virgl; Mesa will use software "

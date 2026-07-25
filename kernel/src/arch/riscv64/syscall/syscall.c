@@ -625,11 +625,9 @@ void syscall_handler_init() {
     syscall_handlers[SYS_ADD_KEY] = (syscall_handle_t)sys_add_key;
     syscall_handlers[SYS_REQUEST_KEY] = (syscall_handle_t)sys_request_key;
     syscall_handlers[SYS_KEYCTL] = (syscall_handle_t)sys_keyctl;
-    syscall_handlers[SYS_IOPRIO_SET] =
-        // (syscall_handle_t)sys_ioprio_set; syscall_handlers[SYS_IOPRIO_GET] =
-        // (syscall_handle_t)sys_ioprio_get;
-        syscall_handlers[SYS_INOTIFY_INIT1] =
-            (syscall_handle_t)sys_inotify_init1;
+    syscall_handlers[SYS_IOPRIO_SET] = (syscall_handle_t)sys_ioprio_set;
+    syscall_handlers[SYS_IOPRIO_GET] = (syscall_handle_t)sys_ioprio_get;
+    syscall_handlers[SYS_INOTIFY_INIT1] = (syscall_handle_t)sys_inotify_init1;
     syscall_handlers[SYS_INOTIFY_ADD_WATCH] =
         (syscall_handle_t)sys_inotify_add_watch;
     syscall_handlers[SYS_INOTIFY_RM_WATCH] =

@@ -650,10 +650,9 @@ void syscall_handler_init() {
     // regist_syscall_handler(SYS_ADD_KEY, (syscall_handle_t)sys_add_key);
     // regist_syscall_handler(SYS_REQUEST_KEY,
     // (syscall_handle_t)sys_request_key); regist_syscall_handler(SYS_KEYCTL,
-    // (syscall_handle_t)sys_keyctl); regist_syscall_handler(SYS_IOPRIO_SET,
-    // (syscall_handle_t)sys_ioprio_set);
-    // regist_syscall_handler(SYS_IOPRIO_GET,
-    // (syscall_handle_t)sys_ioprio_get);
+    // (syscall_handle_t)sys_keyctl);
+    regist_syscall_handler(SYS_IOPRIO_SET, (syscall_handle_t)sys_ioprio_set);
+    regist_syscall_handler(SYS_IOPRIO_GET, (syscall_handle_t)sys_ioprio_get);
     regist_syscall_handler(SYS_INOTIFY_ADD_WATCH,
                            (syscall_handle_t)sys_inotify_add_watch);
     regist_syscall_handler(SYS_INOTIFY_RM_WATCH,

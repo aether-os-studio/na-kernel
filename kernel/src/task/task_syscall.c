@@ -3453,6 +3453,7 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
     task_keyring_inherit(child, self);
 
     child->nice = self->nice;
+    child->ioprio = self->ioprio;
 
     child->arg_start = self->arg_start;
     child->arg_end = self->arg_end;
@@ -4972,6 +4973,158 @@ uint64_t sys_setpriority(int which, int who, int niceval) {
     default:
         return (uint64_t)-EINVAL;
     }
+}
+
+#define LINUX_IOPRIO_CLASS_SHIFT 13
+#define LINUX_IOPRIO_CLASS_MASK 0x7
+#define LINUX_IOPRIO_DATA_MASK ((1U << LINUX_IOPRIO_CLASS_SHIFT) - 1)
+#define LINUX_IOPRIO_CLASS_NONE 0
+#define LINUX_IOPRIO_CLASS_RT 1
+#define LINUX_IOPRIO_CLASS_BE 2
+#define LINUX_IOPRIO_CLASS_IDLE 3
+#define LINUX_IOPRIO_WHO_PROCESS 1
+#define LINUX_IOPRIO_WHO_PGRP 2
+#define LINUX_IOPRIO_WHO_USER 3
+#define LINUX_CAP_SYS_ADMIN 21
+#define LINUX_CAP_SYS_NICE 23
+
+static bool task_ioprio_has_capability(unsigned int capability) {
+    return current_task &&
+           (current_task->euid == 0 ||
+            (current_task->cap_effective & (UINT64_C(1) << capability)));
+}
+
+static int task_ioprio_validate(int ioprio) {
+    if (ioprio < 0 || (ioprio & ~0xffff))
+        return -EINVAL;
+
+    unsigned int class = ((unsigned int)ioprio >> LINUX_IOPRIO_CLASS_SHIFT) &
+                         LINUX_IOPRIO_CLASS_MASK;
+    unsigned int data = (unsigned int)ioprio & LINUX_IOPRIO_DATA_MASK;
+
+    if (data > 7)
+        return -EINVAL;
+    if (class == LINUX_IOPRIO_CLASS_NONE)
+        return data == 0 ? 0 : -EINVAL;
+    if (class != LINUX_IOPRIO_CLASS_RT && class != LINUX_IOPRIO_CLASS_BE &&
+        class != LINUX_IOPRIO_CLASS_IDLE)
+        return -EINVAL;
+    if (class == LINUX_IOPRIO_CLASS_RT &&
+        !task_ioprio_has_capability(LINUX_CAP_SYS_ADMIN))
+        return -EPERM;
+    return 0;
+}
+
+static bool task_ioprio_may_change(const task_t *task) {
+    if (!current_task || !task)
+        return false;
+    if (task_ioprio_has_capability(LINUX_CAP_SYS_NICE))
+        return true;
+    return current_task->euid == task->euid || current_task->euid == task->uid;
+}
+
+static bool task_ioprio_matches(const task_t *task, int which, int who) {
+    if (!task || task->state == TASK_DIED)
+        return false;
+
+    switch (which) {
+    case LINUX_IOPRIO_WHO_PROCESS:
+        return task->pid == (uint64_t)who;
+    case LINUX_IOPRIO_WHO_PGRP:
+        return task->pgid == (int64_t)who;
+    case LINUX_IOPRIO_WHO_USER:
+        return task->uid == (int64_t)who;
+    default:
+        return false;
+    }
+}
+
+static int task_ioprio_resolve_who(int which, int who) {
+    if (who < 0)
+        return -EINVAL;
+    if (who != 0)
+        return who;
+
+    switch (which) {
+    case LINUX_IOPRIO_WHO_PROCESS:
+        return (int)current_task->pid;
+    case LINUX_IOPRIO_WHO_PGRP:
+        return (int)current_task->pgid;
+    case LINUX_IOPRIO_WHO_USER:
+        return (int)current_task->uid;
+    default:
+        return -EINVAL;
+    }
+}
+
+uint64_t sys_ioprio_set(int which, int who, int ioprio) {
+    int ret = task_ioprio_validate(ioprio);
+    if (ret < 0)
+        return (uint64_t)ret;
+    if (which < LINUX_IOPRIO_WHO_PROCESS || which > LINUX_IOPRIO_WHO_USER)
+        return (uint64_t)-EINVAL;
+
+    who = task_ioprio_resolve_who(which, who);
+    if (who < 0)
+        return (uint64_t)who;
+
+    bool found = false;
+    spin_lock(&task_queue_lock);
+    if (task_pid_map.buckets) {
+        for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
+            hashmap_entry_t *entry = &task_pid_map.buckets[i];
+            if (!hashmap_entry_is_occupied(entry))
+                continue;
+            task_t *task = (task_t *)entry->value;
+            if (!task_ioprio_matches(task, which, who))
+                continue;
+            found = true;
+            if (!task_ioprio_may_change(task)) {
+                spin_unlock(&task_queue_lock);
+                return (uint64_t)-EPERM;
+            }
+        }
+        if (found) {
+            for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
+                hashmap_entry_t *entry = &task_pid_map.buckets[i];
+                if (!hashmap_entry_is_occupied(entry))
+                    continue;
+                task_t *task = (task_t *)entry->value;
+                if (task_ioprio_matches(task, which, who))
+                    task->ioprio = ioprio;
+            }
+        }
+    }
+    spin_unlock(&task_queue_lock);
+    return found ? 0 : (uint64_t)-ESRCH;
+}
+
+uint64_t sys_ioprio_get(int which, int who) {
+    if (which < LINUX_IOPRIO_WHO_PROCESS || which > LINUX_IOPRIO_WHO_USER)
+        return (uint64_t)-EINVAL;
+
+    who = task_ioprio_resolve_who(which, who);
+    if (who < 0)
+        return (uint64_t)who;
+
+    int ioprio = 0;
+    bool found = false;
+    spin_lock(&task_queue_lock);
+    if (task_pid_map.buckets) {
+        for (size_t i = 0; i < task_pid_map.bucket_count; i++) {
+            hashmap_entry_t *entry = &task_pid_map.buckets[i];
+            if (!hashmap_entry_is_occupied(entry))
+                continue;
+            task_t *task = (task_t *)entry->value;
+            if (!task_ioprio_matches(task, which, who))
+                continue;
+            if (!found || task->ioprio < ioprio)
+                ioprio = task->ioprio;
+            found = true;
+        }
+    }
+    spin_unlock(&task_queue_lock);
+    return found ? (uint64_t)ioprio : (uint64_t)-ESRCH;
 }
 
 #define LINUX_KCMP_FILE 0

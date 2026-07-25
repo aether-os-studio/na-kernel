@@ -2125,7 +2125,6 @@ static void drm_fill_default_modeinfo(drm_device_t *dev,
     if (dev->op->get_display_info &&
         dev->op->get_display_info(dev, &width, &height, &bpp) == 0 &&
         width > 0 && height > 0) {
-        mode->clock = width * HZ;
         mode->hdisplay = width;
         mode->hsync_start = width + 16;
         mode->hsync_end = width + 16 + 96;
@@ -2135,6 +2134,10 @@ static void drm_fill_default_modeinfo(drm_device_t *dev,
         mode->vsync_end = height + 10 + 2;
         mode->vtotal = height + 10 + 2 + 33;
         mode->vrefresh = HZ;
+        mode->clock =
+            (uint32_t)(((uint64_t)mode->htotal * mode->vtotal * mode->vrefresh +
+                        500) /
+                       1000);
         sprintf(mode->name, "%dx%d", width, height);
         return;
     }

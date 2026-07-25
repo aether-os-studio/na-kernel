@@ -499,6 +499,8 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_GET_MEMPOLICY,
                            (syscall_handle_t)sys_get_mempolicy);
     regist_syscall_handler(SYS_WAITID, (syscall_handle_t)sys_waitid);
+    regist_syscall_handler(SYS_IOPRIO_SET, (syscall_handle_t)sys_ioprio_set);
+    regist_syscall_handler(SYS_IOPRIO_GET, (syscall_handle_t)sys_ioprio_get);
     regist_syscall_handler(SYS_INOTIFY_INIT1,
                            (syscall_handle_t)sys_inotify_init1);
     regist_syscall_handler(SYS_INOTIFY_ADD_WATCH,

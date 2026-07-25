@@ -877,7 +877,6 @@ drm_device_t *drm_register_device_with_info(void *data, drm_device_op_t *op,
                 dev->op->get_display_info(dev, &width, &height, &bpp);
 
                 struct drm_mode_modeinfo mode = {
-                    .clock = width * HZ,
                     .hdisplay = width,
                     .hsync_start = width + 16,
                     .hsync_end = width + 16 + 96,
@@ -888,6 +887,10 @@ drm_device_t *drm_register_device_with_info(void *data, drm_device_op_t *op,
                     .vtotal = height + 10 + 2 + 33,
                     .vrefresh = HZ,
                 };
+                mode.clock = (uint32_t)(((uint64_t)mode.htotal * mode.vtotal *
+                                             mode.vrefresh +
+                                         500) /
+                                        1000);
                 sprintf(mode.name, "%dx%d", width, height);
                 memcpy(connector->modes, &mode,
                        sizeof(struct drm_mode_modeinfo));

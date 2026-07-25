@@ -26,6 +26,10 @@
 #define VIRTIO_GPU_F_CONTEXT_INIT (1ULL << 4)
 #define VIRTIO_GPU_F_SUPPORTED_CAPSET_IDS (1ULL << 5)
 
+#define VIRTIO_GPU_EVENT_DISPLAY (1U << 0)
+#define VIRTIO_GPU_CONFIG_EVENTS_READ 0
+#define VIRTIO_GPU_CONFIG_EVENTS_CLEAR 4
+
 #define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM 1
 #define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM 2
 #define VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM 3
@@ -278,8 +282,10 @@ typedef struct virtio_gpu_device {
     bool control_busy;
     wait_queue_head_t control_available_wait;
     wait_queue_head_t control_irq_wait;
+    wait_queue_head_t display_event_wait;
     uint64_t control_irq_seq;
     bool control_irq_enabled;
+    bool display_event_pending;
     uint64_t negotiated_features;
     uint32_t num_capsets;
     uint32_t next_resource_id;
@@ -287,6 +293,10 @@ typedef struct virtio_gpu_device {
     uint64_t next_fence_id;
     uint64_t supported_capset_ids;
     uint32_t scanout_id;
+    uint32_t bound_scanout_id;
+    uint32_t scanout_resource_id;
+    uint32_t scanout_resource_width;
+    uint32_t scanout_resource_height;
     uint32_t width;
     uint32_t height;
     uint32_t bpp;

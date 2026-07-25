@@ -892,6 +892,8 @@ static inline uint64_t sys_set_tid_address(int *ptr) {
  */
 uint64_t sys_getpriority(int which, int who);
 uint64_t sys_setpriority(int which, int who, int niceval);
+uint64_t sys_ioprio_set(int which, int who, int ioprio);
+uint64_t sys_ioprio_get(int which, int who);
 
 /**
  * Linux contract: compare shared kernel objects between two tasks via kcmp(2).

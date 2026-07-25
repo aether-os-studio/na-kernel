@@ -385,6 +385,7 @@ typedef struct task {
     char name[TASK_NAME_MAX];
     struct vfs_file *exec_file;
     int nice;
+    int ioprio;
     int sched_policy;
     int sched_priority;
     void *sched_info;
@@ -447,6 +448,7 @@ typedef struct task {
     bool exit_reaped;
     bool on_cpu;
     bool need_resched;
+    sigset_t sigwait_mask;
     bool wake_pending;
     bool block_preparing;
     spinlock_t block_lock;

@@ -161,7 +161,6 @@ int rtc_alarm_enable_irq(bool enabled) {
 
 int rtc_read_realtime(rtc_realtime_t *time) {
     rtc_device_t *rtc;
-    rtc_time_t tm;
     uint64_t mono_ns;
     int ret;
 
@@ -175,15 +174,15 @@ int rtc_read_realtime(rtc_realtime_t *time) {
             return 0;
     }
 
+    /*
+     * A calendar-only RTC has one-second resolution.  Combining a freshly
+     * sampled RTC second with an unrelated monotonic fractional second can
+     * move CLOCK_REALTIME backwards whenever the two counters roll over at
+     * slightly different instants.  The boot protocol timestamp and the
+     * monotonic clock form one stable epoch instead.  RTCs which expose an
+     * atomic high-resolution read remain handled by read_realtime above.
+     */
     mono_ns = nano_time();
-
-    ret = rtc_read_time(&tm);
-    if (ret == 0) {
-        time->sec = rtc_time_to_seconds(&tm);
-        time->nsec = (uint32_t)(mono_ns % 1000000000ULL);
-        return 0;
-    }
-
     time->sec = boot_get_boottime() + mono_ns / 1000000000ULL;
     time->nsec = (uint32_t)(mono_ns % 1000000000ULL);
     return 0;

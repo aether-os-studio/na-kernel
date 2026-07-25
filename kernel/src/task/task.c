@@ -1951,6 +1951,7 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
     task->tgid = task->pid;
     task->sid = 0;
     task->nice = priority;
+    task->ioprio = 0;
     task->sched_policy = 0;
     task->sched_priority = 0;
 

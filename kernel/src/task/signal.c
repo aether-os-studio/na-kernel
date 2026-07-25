@@ -189,7 +189,8 @@ static bool signal_should_wake_task_locked(task_t *task, int sig) {
         return false;
     }
 
-    if (signal_is_blocked(task->signal->blocked, sig)) {
+    if (signal_is_blocked(task->signal->blocked, sig) &&
+        !signal_sigset_has(task->sigwait_mask, sig)) {
         return false;
     }
 
@@ -275,7 +276,7 @@ static inline void signal_wake_interruptible_task(task_t *task, int sig) {
     if (!signal_should_wake_task(task, sig) && !signalfd_waiter)
         return;
 
-    if (task->state == TASK_BLOCKING) {
+    if (task->state == TASK_BLOCKING || task->block_preparing) {
         task_unblock(task, 128 + sig);
     } else if (signalfd_waiter && task->cpu_id < cpu_count &&
                task->cpu_id != current_cpu_id) {
@@ -850,6 +851,8 @@ uint64_t sys_rt_sigpending(sigset_t *set, size_t sigsetsize) {
 
 uint64_t sys_rt_sigtimedwait(const sigset_t *uthese, siginfo_t *uinfo,
                              const struct timespec *uts, size_t sigsetsize) {
+    uint64_t result;
+
     if (!signal_sigset_size_valid(sigsetsize)) {
         return (uint64_t)-EINVAL;
     }
@@ -877,13 +880,16 @@ uint64_t sys_rt_sigtimedwait(const sigset_t *uthese, siginfo_t *uinfo,
         deadline = nano_time() + wait_ns;
     }
 
-    bool irq_state = arch_interrupt_enabled();
-    arch_enable_interrupt();
+    spin_lock(&current_task->signal->sighand->siglock);
+    current_task->sigwait_mask = wait_set;
+    spin_unlock(&current_task->signal->sighand->siglock);
 
     while (true) {
         siginfo_t info;
         int sig = 0;
         bool interrupted = false;
+
+        task_prepare_block(current_task);
 
         spin_lock(&current_task->signal->sighand->siglock);
         sig = signal_pick_from_set_locked(current_task, wait_set);
@@ -897,24 +903,39 @@ uint64_t sys_rt_sigtimedwait(const sigset_t *uthese, siginfo_t *uinfo,
 
         if (sig) {
             if (uinfo && copy_to_user(uinfo, &info, sizeof(info))) {
-                return (uint64_t)-EFAULT;
+                result = (uint64_t)-EFAULT;
+                task_cancel_block_prepare(current_task);
+                break;
             }
-            return (uint64_t)sig;
+            result = (uint64_t)sig;
+            task_cancel_block_prepare(current_task);
+            break;
         }
 
         if (interrupted) {
-            return (uint64_t)-EINTR;
+            result = (uint64_t)-EINTR;
+            task_cancel_block_prepare(current_task);
+            break;
         }
 
-        if (deadline != UINT64_MAX && nano_time() >= deadline) {
-            return (uint64_t)-EAGAIN;
+        uint64_t now = nano_time();
+        if (deadline != UINT64_MAX && now >= deadline) {
+            result = (uint64_t)-EAGAIN;
+            task_cancel_block_prepare(current_task);
+            break;
         }
 
-        arch_wait_for_interrupt();
+        int64_t timeout_ns = -1;
+        if (deadline != UINT64_MAX)
+            timeout_ns = (int64_t)(deadline - now);
+        (void)task_block(current_task, TASK_BLOCKING, timeout_ns,
+                         "sigtimedwait");
     }
 
-    if (!irq_state)
-        arch_disable_interrupt();
+    spin_lock(&current_task->signal->sighand->siglock);
+    current_task->sigwait_mask = 0;
+    spin_unlock(&current_task->signal->sighand->siglock);
+    return result;
 }
 
 uint64_t sys_rt_sigqueueinfo(uint64_t tgid, uint64_t sig, siginfo_t *info) {

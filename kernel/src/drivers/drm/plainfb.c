@@ -1270,7 +1270,6 @@ void drm_plainfb_init() {
             malloc(sizeof(struct drm_mode_modeinfo));
         if (gpu_device->connectors[i]->modes) {
             struct drm_mode_modeinfo mode = {
-                .clock = fb->width * HZ,
                 .hdisplay = fb->width,
                 .hsync_start = fb->width + 16,
                 .hsync_end = fb->width + 16 + 96,
@@ -1281,6 +1280,10 @@ void drm_plainfb_init() {
                 .vtotal = fb->height + 10 + 2 + 33,
                 .vrefresh = HZ,
             };
+            mode.clock = (uint32_t)(((uint64_t)mode.htotal * mode.vtotal *
+                                         mode.vrefresh +
+                                     500) /
+                                    1000);
             sprintf(mode.name, "%dx%d", fb->width, fb->height);
             memcpy(gpu_device->connectors[i]->modes, &mode,
                    sizeof(struct drm_mode_modeinfo));

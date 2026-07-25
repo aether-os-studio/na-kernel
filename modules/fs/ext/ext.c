@@ -132,6 +132,10 @@ static int ext_dev_write(ext_mount_ctx_t *fs, uint64_t offset, const void *buf,
 static int ext_read_block(ext_mount_ctx_t *fs, uint64_t block, void *buf);
 static int ext_write_block(ext_mount_ctx_t *fs, uint64_t block,
                            const void *buf);
+static int ext_map_cache_read_locked(ext_mount_ctx_t *fs, uint64_t block,
+                                     void *buf);
+static int ext_write_block_cached_locked(ext_mount_ctx_t *fs, uint64_t block,
+                                         const void *buf);
 static int ext_read_inode(ext_mount_ctx_t *fs, uint32_t ino,
                           ext_inode_disk_t *inode);
 static int ext_write_inode(ext_mount_ctx_t *fs, uint32_t ino,
@@ -533,7 +537,7 @@ static int ext_dir_block_prepare(ext_mount_ctx_t *fs, uint32_t dir_ino,
     if (!pblock)
         return 0;
 
-    ret = ext_read_block(fs, pblock, buf);
+    ret = ext_map_cache_read_locked(fs, pblock, buf);
     if (ret)
         return ret;
 
@@ -576,7 +580,7 @@ static int ext_dir_block_write_locked(ext_mount_ctx_t *fs, uint32_t dir_ino,
 
     if (ctx->has_tail)
         ext_dir_block_checksum_set(fs, dir_ino, dir_inode, ctx, buf);
-    return ext_write_block(fs, ctx->pblock, buf);
+    return ext_write_block_cached_locked(fs, ctx->pblock, buf);
 }
 
 /*
