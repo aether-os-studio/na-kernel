@@ -2021,7 +2021,8 @@ task_t *task_create(const char *name, void (*entry)(uint64_t), uint64_t arg,
         if (stderr_file)
             vfs_file_put(stderr_file);
     }
-    strncpy(task->name, name, TASK_NAME_MAX);
+    memset(task->name, 0, sizeof(task->name));
+    strncpy(task->name, name, sizeof(task->name) - 1);
     task->shm_ids = NULL;
 
     task->arg_start = 0;

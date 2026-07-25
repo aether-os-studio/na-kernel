@@ -295,6 +295,11 @@ static bool signal_x64_setup_frame(task_t *task, struct pt_regs *regs, int sig,
                                    const sigaction_t *action,
                                    const siginfo_t *info,
                                    sigset_t restore_mask) {
+    if (!task || !regs || !action || action->sa_handler == SIG_DFL ||
+        action->sa_handler == SIG_IGN) {
+        return false;
+    }
+
     struct pt_regs saved = *regs;
     signal_x64_prepare_syscall_result(&saved, action);
 
@@ -306,8 +311,9 @@ static bool signal_x64_setup_frame(task_t *task, struct pt_regs *regs, int sig,
     uint64_t trampoline_bytes = 0;
     bool use_kernel_restorer =
         !(action->sa_flags & SA_RESTORER) || !action->sa_restorer;
-    if (use_kernel_restorer && !signal_ensure_user_trampoline(task))
+    if (use_kernel_restorer && !signal_ensure_user_trampoline(task)) {
         return false;
+    }
 
     signal_x64_frame_layout_t layout;
     signal_x64_build_frame_layout(saved.rsp, fpstate_bytes, trampoline_bytes,
@@ -324,8 +330,9 @@ static bool signal_x64_setup_frame(task_t *task, struct pt_regs *regs, int sig,
         if (task->signal->altstack.ss_flags & SS_AUTODISARM)
             signal_altstack_disable(&task->signal->altstack);
     }
-    if (!layout.frame_rsp)
+    if (!layout.frame_rsp) {
         return false;
+    }
 
     uint64_t ucontext_addr = layout.ucontext_addr;
     uint64_t siginfo_addr = layout.siginfo_addr;
@@ -358,18 +365,23 @@ static bool signal_x64_setup_frame(task_t *task, struct pt_regs *regs, int sig,
         return false;
     }
 
-    memset(regs, 0, sizeof(*regs));
-    regs->rip = (uint64_t)action->sa_handler;
-    regs->rdi = sig;
+    struct pt_regs delivery;
+    memset(&delivery, 0, sizeof(delivery));
+    delivery.rip = (uint64_t)action->sa_handler;
+    delivery.rdi = sig;
     if (action->sa_flags & SA_SIGINFO) {
-        regs->rsi = siginfo_addr;
-        regs->rdx = ucontext_addr;
+        delivery.rsi = siginfo_addr;
+        delivery.rdx = ucontext_addr;
     }
-    regs->cs = SELECTOR_USER_CS;
-    regs->ss = SELECTOR_USER_DS;
-    regs->rflags = saved.rflags | (1ULL << 9);
-    regs->rsp = layout.frame_rsp;
-    regs->rbp = layout.frame_rsp;
+    delivery.cs = SELECTOR_USER_CS;
+    delivery.ss = SELECTOR_USER_DS;
+    delivery.rflags = saved.rflags | (1ULL << 9);
+    delivery.rsp = layout.frame_rsp;
+    delivery.rbp = layout.frame_rsp;
+
+    /* Never expose a partially constructed return frame to the low-level
+     * syscall/interrupt exit path. */
+    *regs = delivery;
 
     return true;
 }

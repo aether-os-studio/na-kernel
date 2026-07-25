@@ -108,11 +108,11 @@ char *proc_gen_status_file(task_t *task, size_t *content_len) {
         "SigBlk:\t%016llx\n"
         "SigIgn:\t%016llx\n"
         "SigCgt:\t%016llx\n"
-        "CapInh:\t0000000000000000\n"
-        "CapPrm:\t0000000000000000\n"
-        "CapEff:\t0000000000000000\n"
-        "CapBnd:\t0000000000000000\n"
-        "CapAmb:\t0000000000000000\n",
+        "CapInh:\t%016llx\n"
+        "CapPrm:\t%016llx\n"
+        "CapEff:\t%016llx\n"
+        "CapBnd:\t%016llx\n"
+        "CapAmb:\t%016llx\n",
         task ? task->name : "unknown", task_state_to_proc_state(task),
         (unsigned long long)tgid, (unsigned long long)(task ? task->pid : 0),
         (unsigned long long)task_parent_pid(task), task ? task->uid : 0,
@@ -134,7 +134,11 @@ char *proc_gen_status_file(task_t *task, size_t *content_len) {
         (unsigned long long)(task && task->signal
                                  ? sigset_kernel_to_user(task->signal->blocked)
                                  : 0),
-        ignored, caught);
+        ignored, caught, (unsigned long long)(task ? task->cap_inheritable : 0),
+        (unsigned long long)(task ? task->cap_permitted : 0),
+        (unsigned long long)(task ? task->cap_effective : 0),
+        (unsigned long long)(task ? task->cap_bounding : 0),
+        (unsigned long long)(task ? task->cap_ambient : 0));
 
     int group_count = task_groups_copy(task, NULL, 0);
     uint32_t *groups = NULL;

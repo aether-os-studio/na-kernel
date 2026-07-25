@@ -1167,8 +1167,10 @@ uint64_t sys_unlinkat(uint64_t dirfd, const char *name, uint64_t flags);
 
 /**
  * Linux contract: create a timerfd.
- * Current kernel: supports only CLOCK_REALTIME and CLOCK_MONOTONIC plus
- * TFD_NONBLOCK/TFD_CLOEXEC.
+ * Current kernel: supports CLOCK_REALTIME, CLOCK_MONOTONIC, and
+ * CLOCK_BOOTTIME plus TFD_NONBLOCK/TFD_CLOEXEC. CLOCK_BOOTTIME shares the
+ * monotonic deadline queue; na-kernel currently has no suspend interval to
+ * distinguish the two clocks.
  * Notes: timerfd is usually consumed through poll/epoll loops, so its readable
  * state and counter semantics matter at least as much as the timer source.
  */

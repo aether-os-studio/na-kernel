@@ -471,8 +471,11 @@ static inline int64_t cred_keep_or_set(int value, int64_t current) {
     return value == -1 ? current : value;
 }
 
-static inline void
-task_cred_update_capabilities_after_uid_change(task_t *task, int64_t old_euid) {
+static inline void task_cred_update_capabilities_after_uid_change(
+    task_t *task, int64_t old_uid, int64_t old_euid, int64_t old_suid) {
+    bool old_had_root;
+    bool new_has_root;
+
     if (!task)
         return;
 
@@ -482,11 +485,21 @@ task_cred_update_capabilities_after_uid_change(task_t *task, int64_t old_euid) {
         return;
     }
 
-    if (old_euid == 0 && task->euid != 0) {
+    old_had_root = old_uid == 0 || old_euid == 0 || old_suid == 0;
+    new_has_root = task->uid == 0 || task->euid == 0 || task->suid == 0;
+
+    if (old_had_root && !new_has_root) {
         task->cap_effective = 0;
         if (!task_keep_caps_enabled(task))
             task->cap_permitted = 0;
         task->cap_ambient = 0;
+    } else if (old_euid == 0 && task->euid != 0) {
+        /* A temporary seteuid() drop keeps the permitted set while a real or
+         * saved root UID remains, so returning to euid 0 can regain it. */
+        task->cap_effective = 0;
+        task->cap_ambient = 0;
+    } else if (old_euid != 0 && task->euid == 0) {
+        task->cap_effective = task->cap_permitted;
     }
 }
 
@@ -508,17 +521,22 @@ static inline uint64_t sys_vhangup(void) { return 0; }
  * Gaps: Linux capability and permission checks are not implemented.
  */
 static inline uint64_t sys_setuid(uint64_t uid) {
+    int64_t old_uid;
     int64_t old_euid;
+    int64_t old_suid;
 
     if (uid == (uint64_t)-1)
         return (uint64_t)-EINVAL;
 
+    old_uid = current_task->uid;
     old_euid = current_task->euid;
+    old_suid = current_task->suid;
     current_task->uid = uid;
     current_task->euid = uid;
     current_task->suid = uid;
     current_task->fsuid = uid;
-    task_cred_update_capabilities_after_uid_change(current_task, old_euid);
+    task_cred_update_capabilities_after_uid_change(current_task, old_uid,
+                                                   old_euid, old_suid);
     return 0;
 }
 
@@ -568,14 +586,17 @@ static inline uint64_t sys_getresuid(int *ruid, int *euid, int *suid) {
  * Gaps: Linux privilege checks are not enforced.
  */
 static inline uint64_t sys_setresuid(int ruid, int euid, int suid) {
+    int64_t old_uid = current_task->uid;
     int64_t old_euid = current_task->euid;
+    int64_t old_suid = current_task->suid;
 
     current_task->uid = cred_keep_or_set(ruid, current_task->uid);
     current_task->euid = cred_keep_or_set(euid, current_task->euid);
     current_task->suid = cred_keep_or_set(suid, current_task->suid);
     if (euid != -1)
         current_task->fsuid = current_task->euid;
-    task_cred_update_capabilities_after_uid_change(current_task, old_euid);
+    task_cred_update_capabilities_after_uid_change(current_task, old_uid,
+                                                   old_euid, old_suid);
 
     return 0;
 }
@@ -588,6 +609,7 @@ static inline uint64_t sys_setresuid(int ruid, int euid, int suid) {
 static inline uint64_t sys_setreuid(int ruid, int euid) {
     int64_t old_ruid = current_task->uid;
     int64_t old_euid = current_task->euid;
+    int64_t old_suid = current_task->suid;
 
     current_task->uid = cred_keep_or_set(ruid, current_task->uid);
     current_task->euid = cred_keep_or_set(euid, current_task->euid);
@@ -595,7 +617,8 @@ static inline uint64_t sys_setreuid(int ruid, int euid) {
         current_task->fsuid = current_task->euid;
     if (ruid != -1 || (euid != -1 && current_task->euid != old_ruid))
         current_task->suid = current_task->euid;
-    task_cred_update_capabilities_after_uid_change(current_task, old_euid);
+    task_cred_update_capabilities_after_uid_change(current_task, old_ruid,
+                                                   old_euid, old_suid);
 
     return 0;
 }

@@ -1200,6 +1200,17 @@ static void task_execve_commit_creds(task_t *task,
         task->cap_permitted = 0;
         task->cap_ambient = 0;
     }
+
+    /* Linux promotes ambient capabilities into both the permitted and
+     * effective sets across an ordinary exec.  Service managers rely on this
+     * to grant selected capabilities after switching to an unprivileged UID.
+     * A privilege-changing executable must not inherit the ambient set. */
+    if (creds->secure_exec) {
+        task->cap_ambient = 0;
+    } else {
+        task->cap_permitted |= task->cap_ambient;
+        task->cap_effective |= task->cap_ambient;
+    }
 }
 
 static int task_capability_u32_count(uint32_t version) {
@@ -2661,8 +2672,10 @@ shell_fallback_done:
     if (interpreter_path)
         free(interpreter_path);
 
-    strncpy(self->name, path, TASK_NAME_MAX);
-    self->name[TASK_NAME_MAX - 1] = '\0';
+    const char *comm = strrchr(path, '/');
+    comm = comm ? comm + 1 : path;
+    memset(self->name, 0, sizeof(self->name));
+    strncpy(self->name, comm, sizeof(self->name) - 1);
 
     task_complete_vfork(self);
     self->clone_flags = 0;

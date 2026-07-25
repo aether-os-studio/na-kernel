@@ -41,6 +41,15 @@ typedef struct timerfdfs_inode_info {
 
 static uint64_t get_current_time_ns(int clock_type);
 
+static inline bool timerfd_clock_supported(int clock_type) {
+    return clock_type == CLOCK_REALTIME || clock_type == CLOCK_MONOTONIC ||
+           clock_type == CLOCK_BOOTTIME;
+}
+
+static inline bool timerfd_clock_is_realtime(int clock_type) {
+    return clock_type == CLOCK_REALTIME;
+}
+
 static inline timerfdfs_info_t *timerfdfs_sb_info(struct vfs_super_block *sb) {
     return sb ? (timerfdfs_info_t *)sb->s_fs_info : NULL;
 }
@@ -56,18 +65,18 @@ static inline timerfd_t *timerfd_file_handle(struct vfs_file *file) {
 }
 
 static inline spinlock_t *timerfd_tree_lock_for_clock(int clock_type) {
-    return clock_type == CLOCK_REALTIME ? &timerfd_real_lock
-                                        : &timerfd_mono_lock;
+    return timerfd_clock_is_realtime(clock_type) ? &timerfd_real_lock
+                                                 : &timerfd_mono_lock;
 }
 
 static inline rb_root_t *timerfd_root_for_clock(int clock_type) {
-    return clock_type == CLOCK_REALTIME ? &timerfd_real_root
-                                        : &timerfd_mono_root;
+    return timerfd_clock_is_realtime(clock_type) ? &timerfd_real_root
+                                                 : &timerfd_mono_root;
 }
 
 static inline uint64_t *timerfd_next_deadline_for_clock(int clock_type) {
-    return clock_type == CLOCK_REALTIME ? &timerfd_real_next_ns
-                                        : &timerfd_mono_next_ns;
+    return timerfd_clock_is_realtime(clock_type) ? &timerfd_real_next_ns
+                                                 : &timerfd_mono_next_ns;
 }
 
 static inline int timerfd_cmp(timerfd_t *left, timerfd_t *right) {
@@ -93,7 +102,7 @@ static inline void timerfd_refresh_next_locked(int clock_type) {
 
     __atomic_store_n(timerfd_next_deadline_for_clock(clock_type), next,
                      __ATOMIC_RELEASE);
-    deadline_source_update(clock_type == CLOCK_REALTIME
+    deadline_source_update(timerfd_clock_is_realtime(clock_type)
                                ? &timerfd_real_deadline_source
                                : &timerfd_mono_deadline_source,
                            next);
@@ -467,9 +476,11 @@ static int timerfdfs_release(struct vfs_inode *inode, struct vfs_file *file) {
 }
 
 static uint64_t get_current_time_ns(int clock_type) {
-    if (clock_type == CLOCK_MONOTONIC)
+    if (clock_type == CLOCK_MONOTONIC || clock_type == CLOCK_BOOTTIME)
         return nano_time();
-    return boot_get_boottime() * 1000000000ULL + nano_time();
+    if (clock_type == CLOCK_REALTIME)
+        return boot_get_boottime() * 1000000000ULL + nano_time();
+    return 0;
 }
 
 static int timerfdfs_create_file(struct vfs_file **out_file, int clockid,
@@ -555,7 +566,7 @@ uint64_t sys_timerfd_create(int clockid, int flags) {
 
     if (flags & ~(TFD_NONBLOCK | TFD_CLOEXEC))
         return -EINVAL;
-    if (clockid != CLOCK_REALTIME && clockid != CLOCK_MONOTONIC)
+    if (!timerfd_clock_supported(clockid))
         return -EINVAL;
 
     ret = timerfdfs_create_file(&file, clockid, (unsigned int)flags, NULL);

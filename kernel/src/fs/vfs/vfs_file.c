@@ -173,7 +173,10 @@ struct vfs_file *vfs_alloc_file(const struct vfs_path *path,
     }
     file->node = file->f_inode;
     file->f_op = file->f_inode->i_fop;
-    file->f_flags = open_flags;
+    /* O_CLOEXEC is a descriptor-creation flag. It is stored in the fd table
+     * as FD_CLOEXEC and must never leak through F_GETFL or SCM_RIGHTS into the
+     * shared open-file-description status flags. */
+    file->f_flags = open_flags & ~O_CLOEXEC;
     spin_init(&file->f_pos_lock);
     spin_init(&file->f_lock);
     file->f_fd_refs = 0;

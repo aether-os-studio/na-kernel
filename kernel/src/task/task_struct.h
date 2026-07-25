@@ -169,7 +169,7 @@ static inline int task_fd_info_ref_read(fd_info_t *fd_info) {
     return __atomic_load_n(&fd_info->ref_count, __ATOMIC_ACQUIRE);
 }
 
-#define TASK_NAME_MAX 128
+#define TASK_NAME_MAX 16
 
 typedef uint64_t sigset_t;
 typedef void (*sighandler_t)(int);
