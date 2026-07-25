@@ -845,10 +845,12 @@ void free_page_table(task_mm_info_t *directory) {
         }
     }
 
-    spin_lock(&mgr->lock);
+    /* ref_count reaching zero gives this path exclusive ownership of the mm.
+     * Do not hold the VMA spinlock while dropping inode and mapping references:
+     * filesystem eviction and page-cache teardown are potentially lengthy and
+     * must remain preemptible. */
     page_table_account_shared_file_mappings(directory, false);
     vma_manager_exit_cleanup(mgr);
-    spin_unlock(&mgr->lock);
 
     uint64_t levels = arch_page_table_levels();
     if (page_table_levels_valid(levels)) {

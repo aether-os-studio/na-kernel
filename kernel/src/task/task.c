@@ -2084,6 +2084,9 @@ void softirqd_thread(uint64_t arg) {
         if (softirq_has_pending()) {
             task_cancel_block_prepare(current_task);
             softirq_handle_pending();
+            /* A handler may queue another bounded batch.  Yield between
+             * batches so deferred teardown cannot monopolize this CPU. */
+            schedule(SCHED_FLAG_YIELD);
             continue;
         }
 
@@ -2462,20 +2465,19 @@ void task_exit_inner(task_t *task, int64_t code) {
     if (task->pid == 1)
         arch_shutdown();
 
-    uint64_t before_user_ns = task ? task->user_time_ns : 0;
-    task_account_runtime_ns(task, nano_time());
-    if (task && task->user_time_ns > before_user_ns)
-        task->system_time_ns += task->user_time_ns - before_user_ns;
-    task->last_sched_in_ns = 0;
-
-    struct sched_entity *entity = (struct sched_entity *)task->sched_info;
-    remove_sched_entity(task, &schedulers[task->cpu_id]);
-    if (entity) {
-        entity->task = NULL;
-    }
-
     task_timeout_cancel(task);
     task_signal_timer_cancel(task);
+
+    /*
+     * Keep the exiting task schedulable while releasing resources.  Closing
+     * files can tear down DRM objects, mappings and filesystem state, and the
+     * robust-futex walk may inspect a large process.  Doing all of that with
+     * interrupts disabled stalls the whole CPU and also prevents cleanup code
+     * from sleeping for device completions.
+     */
+    arch_enable_interrupt();
+
+    futex_on_exit_task(task);
 
     if (task->exec_file) {
         vfs_close_file(task->exec_file);
@@ -2488,12 +2490,31 @@ void task_exit_inner(task_t *task, int64_t code) {
     task_ns_proxy_put(task->nsproxy);
     task->nsproxy = NULL;
 
+    /* Publish TASK_DIED only after cleanup can no longer block. */
+    arch_disable_interrupt();
+
+    uint64_t before_user_ns = task ? task->user_time_ns : 0;
+    task_account_runtime_ns(task, nano_time());
+    if (task && task->user_time_ns > before_user_ns)
+        task->system_time_ns += task->user_time_ns - before_user_ns;
+    task->last_sched_in_ns = 0;
+
+    struct sched_entity *entity = (struct sched_entity *)task->sched_info;
+    remove_sched_entity(task, &schedulers[task->cpu_id]);
+    if (entity) {
+        entity->task = NULL;
+    }
+
     task->current_state = TASK_DIED;
     task->state = TASK_DIED;
     task->status = (uint64_t)code;
     task->exited_by_signal = code >= 128 && code <= 128 + 64;
 
-    futex_on_exit_task(task);
+    /* Interrupts may run, but this detached task must not be scheduled again.
+     */
+    preempt_enable(task);
+    arch_enable_interrupt();
+
     pidfd_on_task_exit(task);
     on_exit_task_call(task);
 
@@ -2567,6 +2588,9 @@ void task_exit_inner(task_t *task, int64_t code) {
         if (task_try_mark_reaped(task))
             task_enqueue_should_free(task);
     }
+
+    arch_disable_interrupt();
+    preempt_disable(task);
 }
 
 uint64_t task_exit_thread(int64_t code) {

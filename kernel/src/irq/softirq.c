@@ -32,23 +32,18 @@ bool softirq_has_pending(void) {
 }
 
 void softirq_handle_pending(void) {
-    while (true) {
-        uint64_t pending =
-            __atomic_exchange_n(&softirq_pending, 0, __ATOMIC_ACQ_REL);
-        if (!pending) {
-            break;
+    uint64_t pending =
+        __atomic_exchange_n(&softirq_pending, 0, __ATOMIC_ACQ_REL);
+
+    for (uint32_t id = 0; id < SOFTIRQ_MAX; id++) {
+        if (!(pending & (1ULL << id))) {
+            continue;
         }
 
-        for (uint32_t id = 0; id < SOFTIRQ_MAX; id++) {
-            if (!(pending & (1ULL << id))) {
-                continue;
-            }
-
-            softirq_handler_t handler =
-                __atomic_load_n(&softirq_handlers[id], __ATOMIC_ACQUIRE);
-            if (handler) {
-                handler();
-            }
+        softirq_handler_t handler =
+            __atomic_load_n(&softirq_handlers[id], __ATOMIC_ACQUIRE);
+        if (handler) {
+            handler();
         }
     }
 }
