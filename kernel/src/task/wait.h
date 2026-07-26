@@ -17,6 +17,11 @@ typedef struct wait_queue_head {
     uint64_t wake_seq;
 } wait_queue_head_t;
 
+typedef struct wait_mutex {
+    wait_queue_head_t wait;
+    bool locked;
+} wait_mutex_t;
+
 struct wait_queue_entry {
     struct llist_header node;
     task_t *task;
@@ -37,3 +42,8 @@ int wait_queue_wake_entry(wait_queue_entry_t *entry, uint32_t events,
 int wait_queue_wake(wait_queue_head_t *queue, uint32_t events, int nr,
                     int reason);
 int wait_queue_wake_all(wait_queue_head_t *queue, uint32_t events, int reason);
+
+void wait_mutex_init(wait_mutex_t *mutex);
+bool wait_mutex_trylock(wait_mutex_t *mutex);
+void wait_mutex_lock(wait_mutex_t *mutex);
+void wait_mutex_unlock(wait_mutex_t *mutex);

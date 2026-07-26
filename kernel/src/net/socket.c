@@ -1520,6 +1520,7 @@ int sockfs_create_handle_file(socket_handle_t *handle, unsigned int open_flags,
     }
 
     file->private_data = handle;
+    file->f_mode |= VFS_FMODE_NO_POS_LOCK;
     *out_file = file;
 
     vfs_dput(dentry);

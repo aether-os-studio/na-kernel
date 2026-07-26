@@ -377,6 +377,7 @@ typedef struct task {
     uint64_t start_time_ns;
     uint64_t user_time_ns;
     uint64_t system_time_ns;
+    uint64_t cgroup_accounted_runtime_ns;
     uint64_t child_user_time_ns;
     uint64_t child_system_time_ns;
     uint64_t preempt_count;

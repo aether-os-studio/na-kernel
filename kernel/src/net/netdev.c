@@ -8,7 +8,7 @@
 netdev_t *netdevs[MAX_NETDEV_NUM] = {NULL};
 static spinlock_t netdevs_lock = SPIN_INIT;
 
-#define NETDEV_RX_POLL_FALLBACK_NS (20ULL * 1000ULL * 1000ULL)
+#define NETDEV_RX_POLL_FALLBACK_NS (2ULL * 1000ULL * 1000ULL)
 
 static void netdev_default_name(char *name, uint32_t type, uint32_t id) {
     if (!name) {
@@ -911,7 +911,6 @@ int netdev_wait_rx(netdev_t *dev, uint64_t observed_seq) {
     spin_unlock(&dev->lock);
 
     if (!ready && !gone && poll_rx && poll_rx(desc)) {
-        netdev_notify_rx(dev);
         ready = true;
     }
 

@@ -14,7 +14,8 @@ typedef struct virtio_net_device {
     void *rx_buffers[64];
     void *tx_buffers[64];
     uint32_t tx_buffer_sizes[64];
-    spinlock_t send_recv_lock;
+    spinlock_t tx_lock;
+    spinlock_t rx_lock;
     netdev_t *netdev;
 } virtio_net_device_t;
 

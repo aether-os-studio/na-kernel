@@ -1091,6 +1091,7 @@ int notifyfs_create_handle_file(struct vfs_file **out_file,
     }
 
     file->private_data = handle;
+    file->f_mode |= VFS_FMODE_NO_POS_LOCK;
     vfs_dput(dentry);
     vfs_iput(inode);
     vfs_mntput(mnt);

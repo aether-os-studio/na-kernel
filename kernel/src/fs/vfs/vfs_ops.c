@@ -1,10 +1,10 @@
 #include "fs/vfs/vfs_internal.h"
 #include "fs/vfs/notify.h"
 
-static spinlock_t vfs_rename_lock;
+static wait_mutex_t vfs_rename_lock;
 static volatile uint64_t vfs_rename_seq = 1;
 
-void vfs_ops_init(void) { spin_init(&vfs_rename_lock); }
+void vfs_ops_init(void) { wait_mutex_init(&vfs_rename_lock); }
 
 ssize_t vfs_getxattr(struct vfs_inode *inode, const char *name, void *value,
                      size_t size) {
@@ -410,7 +410,7 @@ int vfs_renameat2(int olddfd, const char *oldname, int newdfd,
     struct vfs_inode *moved_inode = NULL;
     int ret;
 
-    spin_lock(&vfs_rename_lock);
+    wait_mutex_lock(&vfs_rename_lock);
 
     ret = vfs_path_parent_lookup(olddfd, oldname, LOOKUP_PARENT, &old_parent,
                                  &old_last, NULL);
@@ -492,7 +492,7 @@ out:
     vfs_qstr_destroy(&old_last);
     vfs_qstr_destroy(&new_last);
 out_unlock:
-    spin_unlock(&vfs_rename_lock);
+    wait_mutex_unlock(&vfs_rename_lock);
     return ret;
 }
 

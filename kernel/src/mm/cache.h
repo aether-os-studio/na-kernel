@@ -2,10 +2,12 @@
 
 #include <fs/vfs/vfs.h>
 #include <mm/mm.h>
+#include <task/wait.h>
 
 typedef struct page_cache_page {
     rb_node_t node;
     struct llist_header lru;
+    wait_queue_head_t wait;
     struct vfs_address_space *mapping;
     uint64_t index;
     uint64_t paddr;
@@ -34,7 +36,7 @@ typedef struct page_cache_stats {
 void page_cache_mapping_init(struct vfs_address_space *mapping,
                              struct vfs_inode *host);
 void page_cache_stats_snapshot(page_cache_stats_t *stats);
-uint64_t page_cache_reclaim_half(void);
+uint64_t page_cache_reclaim(uint64_t target_pages);
 int page_cache_read(struct vfs_file *file, void *buf, size_t count,
                     loff_t *ppos);
 int page_cache_write(struct vfs_file *file, const void *buf, size_t count,

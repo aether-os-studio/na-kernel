@@ -1478,10 +1478,7 @@ static int task_kill_thread_group_locked(uint64_t tgid, int sig, int code,
 
         sent++;
         task_send_signal(task, sig, code);
-        if (task->state == TASK_BLOCKING ||
-            task->state == TASK_UNINTERRUPTABLE || task->block_preparing) {
-            task_unblock(task, EOK);
-        }
+        task_unblock(task, EOK);
     }
 
     return sent;
@@ -1557,9 +1554,7 @@ void task_complete_vfork(task_t *task) {
 
     parent->child_vfork_done = true;
     task->vfork_parent_pid = 0;
-    if (parent->state == TASK_BLOCKING || parent->block_preparing) {
-        task_unblock(parent, EOK);
-    }
+    task_unblock(parent, EOK);
     spin_unlock(&task_queue_lock);
 }
 
@@ -1757,9 +1752,7 @@ static void task_notify_parent_death_locked(task_t *task) {
 
     task_send_signal(task, task->parent_death_sig,
                      task->parent_death_sig + 128);
-    if (task->state == TASK_BLOCKING) {
-        task_unblock(task, EOK);
-    }
+    task_unblock(task, EOK);
 }
 
 static void task_reparent_children_locked(task_t *owner, task_t *new_parent,
@@ -2644,10 +2637,7 @@ uint64_t task_exit(int64_t code) {
             }
 
             task->procfs_thread_path = NULL;
-            if (task->state == TASK_BLOCKING ||
-                task->state == TASK_UNINTERRUPTABLE || task->block_preparing) {
-                task_unblock(task, EOK);
-            }
+            task_unblock(task, EOK);
         }
     }
 

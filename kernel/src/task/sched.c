@@ -375,10 +375,10 @@ static void sched_add_entity(task_t *task, sched_rq_t *scheduler, bool wakeup) {
 
     spin_unlock(&scheduler->lock);
 
-    bool newly_requested = false;
     if (resched_task)
-        newly_requested = task_set_need_resched_once(resched_task);
-    if (should_ping_cpu && (!resched_task || newly_requested))
+        task_set_need_resched_once(resched_task);
+
+    if (should_ping_cpu)
         irq_trigger_sched_ipi(target_cpu);
 }
 

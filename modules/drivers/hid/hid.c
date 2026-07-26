@@ -977,7 +977,7 @@ static void hid_cb(int status, int actual_length, void *user_data) {
     (void)actual_length;
     hid_device_t *hid = user_data;
     hid->xfer_status = status;
-    if (hid->polling_task && hid->polling_task->state == TASK_BLOCKING)
+    if (hid->polling_task)
         task_unblock(hid->polling_task, EOK);
 }
 

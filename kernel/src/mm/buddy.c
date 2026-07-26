@@ -588,7 +588,7 @@ uintptr_t alloc_frames(size_t count) {
         if (attempt == 0)
             task_reap_deferred(512);
         else if (attempt == 1)
-            (void)page_cache_reclaim_half();
+            (void)page_cache_reclaim(MAX((uint64_t)pages, 64ULL));
     }
 
     if (!addr)

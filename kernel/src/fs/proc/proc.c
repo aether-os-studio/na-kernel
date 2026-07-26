@@ -932,7 +932,7 @@ static loff_t procfs_llseek(struct vfs_file *file, loff_t offset, int whence) {
     if (!file || !file->f_inode)
         return -EBADF;
 
-    spin_lock(&file->f_pos_lock);
+    vfs_file_pos_lock(file);
     switch (whence) {
     case SEEK_SET:
         pos = offset;
@@ -944,15 +944,15 @@ static loff_t procfs_llseek(struct vfs_file *file, loff_t offset, int whence) {
         pos = (loff_t)file->f_inode->i_size + offset;
         break;
     default:
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
         return -EINVAL;
     }
     if (pos < 0) {
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
         return -EINVAL;
     }
     file->f_pos = pos;
-    spin_unlock(&file->f_pos_lock);
+    vfs_file_pos_unlock(file);
     return pos;
 }
 

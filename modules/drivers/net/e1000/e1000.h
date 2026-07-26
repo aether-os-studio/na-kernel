@@ -1,6 +1,8 @@
 #pragma once
 
 #include <mm/mm.h>
+#include <drivers/bus/pci.h>
+#include <drivers/bus/pci_msi.h>
 #include <libs/klibc.h>
 #include <net/netdev.h>
 
@@ -81,9 +83,18 @@
 // TX Descriptor Status Bits
 #define E1000_TXD_STAT_DD (1 << 0) // Descriptor Done
 
+// Interrupt cause/mask bits
+#define E1000_INT_TXDW (1 << 0)
+#define E1000_INT_LSC (1 << 2)
+#define E1000_INT_RXDMT0 (1 << 4)
+#define E1000_INT_RXO (1 << 6)
+#define E1000_INT_RXT0 (1 << 7)
+#define E1000_RX_INTERRUPTS                                                    \
+    (E1000_INT_LSC | E1000_INT_RXDMT0 | E1000_INT_RXO | E1000_INT_RXT0)
+
 // Constants
-#define E1000_NUM_RX_DESC 32
-#define E1000_NUM_TX_DESC 32
+#define E1000_NUM_RX_DESC 256
+#define E1000_NUM_TX_DESC 256
 #define E1000_RX_BUFFER_SIZE 2048
 #define E1000_TX_BUFFER_SIZE 2048
 #define E1000_MTU 1500
@@ -111,6 +122,8 @@ struct e1000_tx_desc {
 
 // E1000 Device Structure
 typedef struct e1000_device {
+    pci_device_t *pci_dev;
+    struct msi_desc_t msi;
     void *mmio_base;
     uint8_t mac[6];
     uint32_t mtu;
@@ -128,11 +141,14 @@ typedef struct e1000_device {
     uint16_t tx_lengths[E1000_NUM_TX_DESC];
     uint16_t tx_head;
     uint16_t tx_tail;
+    spinlock_t tx_lock;
+    spinlock_t rx_lock;
+    bool irq_enabled;
     netdev_t *netdev;
 } e1000_device_t;
 
 // Function prototypes
-int e1000_init(void *mmio_base);
+int e1000_init(pci_device_t *pci_dev, void *mmio_base);
 int e1000_send(void *dev_desc, void *data, uint32_t len);
 int e1000_receive(void *dev_desc, void *buffer, uint32_t buffer_size);
 bool e1000_has_packets(void *dev_desc);

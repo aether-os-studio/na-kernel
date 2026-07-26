@@ -481,6 +481,7 @@ static int pidfd_create_handle_file(pidfd_ctx_t *ctx, unsigned int open_flags,
     }
 
     file->private_data = ctx;
+    file->f_mode |= VFS_FMODE_NO_POS_LOCK;
     *out_file = file;
 
     vfs_dput(dentry);

@@ -67,6 +67,10 @@ static void naos_lwip_set_fallback_dns(void) {
 }
 
 static void naos_lwip_status_callback(struct netif *netif) {
+    char ipaddr_buf[IP4ADDR_STRLEN_MAX];
+    char netmask_buf[IP4ADDR_STRLEN_MAX];
+    char gw_buf[IP4ADDR_STRLEN_MAX];
+
     if (!netif) {
         return;
     }
@@ -74,9 +78,11 @@ static void naos_lwip_status_callback(struct netif *netif) {
 #if LWIP_IPV4 && LWIP_DHCP
     if (dhcp_supplied_address(netif)) {
         printk("netserver: ipv4=%s netmask=%s gw=%s\n",
-               ip4addr_ntoa(netif_ip4_addr(netif)),
-               ip4addr_ntoa(netif_ip4_netmask(netif)),
-               ip4addr_ntoa(netif_ip4_gw(netif)));
+               ip4addr_ntoa_r(netif_ip4_addr(netif), ipaddr_buf,
+                              sizeof(ipaddr_buf)),
+               ip4addr_ntoa_r(netif_ip4_netmask(netif), netmask_buf,
+                              sizeof(netmask_buf)),
+               ip4addr_ntoa_r(netif_ip4_gw(netif), gw_buf, sizeof(gw_buf)));
     }
 #endif
 
@@ -278,6 +284,7 @@ static uint32_t naos_prefixlen_to_mask_u32(uint8_t prefixlen) {
 static void naos_lwip_rx_thread(uint64_t arg) {
     naos_lwip_link_t *link = (naos_lwip_link_t *)arg;
     uint32_t max_len = 0;
+    uint32_t rx_budget = 0;
     struct pbuf *rx_pbuf = NULL;
 
     if (!link || !link->netdev) {
@@ -297,8 +304,9 @@ static void naos_lwip_rx_thread(uint64_t arg) {
         if (!rx_pbuf) {
             rx_pbuf = pbuf_alloc(PBUF_RAW, (u16_t)max_len, PBUF_POOL);
             if (!rx_pbuf) {
-                int wait_ret = netdev_wait_rx(link->netdev, rx_seq);
-                if (wait_ret == -ENODEV || link->stopping)
+                (void)task_block(current_task, TASK_BLOCKING, 1000000,
+                                 "lwip_rx_nomem");
+                if (link->stopping)
                     break;
                 continue;
             }
@@ -317,10 +325,28 @@ static void naos_lwip_rx_thread(uint64_t arg) {
 
         pbuf_realloc(rx_pbuf, (u16_t)len);
 
-        if (naos_lwip_netif.input(rx_pbuf, &naos_lwip_netif) != ERR_OK) {
+        err_t input_err;
+        while ((input_err = naos_lwip_netif.input(rx_pbuf, &naos_lwip_netif)) ==
+               ERR_MEM) {
+            if (link->stopping)
+                break;
+            (void)task_block(current_task, TASK_BLOCKING, 1000000,
+                             "lwip_rx_backpressure");
+        }
+
+        if (input_err != ERR_OK) {
             pbuf_free(rx_pbuf);
+            rx_pbuf = NULL;
+            if (link->stopping)
+                break;
+            continue;
         }
         rx_pbuf = NULL;
+
+        if (++rx_budget >= 64) {
+            rx_budget = 0;
+            schedule(SCHED_FLAG_YIELD);
+        }
     }
 
     if (rx_pbuf) {
@@ -347,6 +373,8 @@ int lwip_module_init() {
     if (initialized) {
         return 0;
     }
+
+    naos_lwip_thread_sem_registry_init();
 
     netdev = get_default_netdev();
     if (!netdev) {
@@ -397,7 +425,7 @@ int lwip_module_init() {
     naos_lwip_queue_link_state_update(&naos_link);
 
     task_create("lwip-rx", naos_lwip_rx_thread, (uint64_t)&naos_link,
-                KTHREAD_PRIORITY);
+                NORMAL_PRIORITY);
 
     initialized = true;
     return 0;

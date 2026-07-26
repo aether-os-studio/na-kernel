@@ -1,22 +1,156 @@
 #include "netserver_internal.h"
+#include <init/callbacks.h>
 
 typedef struct lwip_thread_bootstrap {
     lwip_thread_fn fn;
     void *arg;
 } lwip_thread_bootstrap_t;
 
+typedef struct lwip_thread_sem_entry {
+    task_t *task;
+    sys_sem_t sem;
+    struct lwip_thread_sem_entry *next;
+} lwip_thread_sem_entry_t;
+
+typedef struct lwip_thread_sem_bucket {
+    spinlock_t lock;
+    lwip_thread_sem_entry_t *head;
+} lwip_thread_sem_bucket_t;
+
+#define LWIP_THREAD_SEM_BUCKET_COUNT 64U
+
 static spinlock_t naos_lwip_protect_lock = SPIN_INIT;
 static uintptr_t naos_lwip_protect_owner = 0;
 static uint32_t naos_lwip_protect_depth = 0;
+static lwip_thread_sem_bucket_t
+    naos_lwip_thread_sem_buckets[LWIP_THREAD_SEM_BUCKET_COUNT];
+static spinlock_t naos_lwip_thread_sem_callback_lock = SPIN_INIT;
+static bool naos_lwip_thread_sem_callback_registered = false;
+static spinlock_t naos_lwip_mbox_lifecycle_lock = SPIN_INIT;
+
+static uintptr_t naos_lwip_task_owner_id(task_t *task) {
+    return task ? (((uintptr_t)task << 1) | 1UL) : 0;
+}
 
 static uintptr_t naos_lwip_protect_owner_id(void) {
     task_t *task = current_task;
 
     if (task) {
-        return ((uintptr_t)task << 1) | 1UL;
+        return naos_lwip_task_owner_id(task);
     }
 
     return ((uintptr_t)(current_cpu_id + 1) << 1);
+}
+
+static lwip_thread_sem_bucket_t *naos_lwip_thread_sem_bucket(task_t *task) {
+    uintptr_t key = (uintptr_t)task >> 6;
+
+    return &naos_lwip_thread_sem_buckets[key % LWIP_THREAD_SEM_BUCKET_COUNT];
+}
+
+static lwip_thread_sem_entry_t *
+naos_lwip_thread_sem_find_locked(lwip_thread_sem_bucket_t *bucket,
+                                 task_t *task) {
+    lwip_thread_sem_entry_t *entry = bucket ? bucket->head : NULL;
+
+    while (entry) {
+        if (entry->task == task)
+            return entry;
+        entry = entry->next;
+    }
+    return NULL;
+}
+
+static void naos_lwip_thread_sem_free_task(task_t *task) {
+    lwip_thread_sem_bucket_t *bucket = NULL;
+    lwip_thread_sem_entry_t *entry = NULL;
+    lwip_thread_sem_entry_t *prev = NULL;
+
+    if (!task)
+        return;
+
+    bucket = naos_lwip_thread_sem_bucket(task);
+    spin_lock(&bucket->lock);
+    entry = bucket->head;
+    while (entry && entry->task != task) {
+        prev = entry;
+        entry = entry->next;
+    }
+    if (entry) {
+        if (prev)
+            prev->next = entry->next;
+        else
+            bucket->head = entry->next;
+    }
+    spin_unlock(&bucket->lock);
+
+    if (entry) {
+        sys_sem_free(&entry->sem);
+        free(entry);
+    }
+}
+
+static int naos_lwip_thread_sem_on_exit(task_t *task) {
+    naos_lwip_thread_sem_free_task(task);
+    return 0;
+}
+
+void naos_lwip_thread_sem_registry_init(void) {
+    spin_lock(&naos_lwip_thread_sem_callback_lock);
+    if (naos_lwip_thread_sem_callback_registered) {
+        spin_unlock(&naos_lwip_thread_sem_callback_lock);
+        return;
+    }
+    naos_lwip_thread_sem_callback_registered = true;
+    spin_unlock(&naos_lwip_thread_sem_callback_lock);
+
+    regist_on_exit_task_callback(naos_lwip_thread_sem_on_exit);
+}
+
+sys_sem_t *naos_lwip_thread_sem_get(void) {
+    task_t *task = current_task;
+    lwip_thread_sem_bucket_t *bucket = NULL;
+    lwip_thread_sem_entry_t *entry = NULL;
+    lwip_thread_sem_entry_t *created = NULL;
+
+    if (!task)
+        return NULL;
+
+    bucket = naos_lwip_thread_sem_bucket(task);
+    spin_lock(&bucket->lock);
+    entry = naos_lwip_thread_sem_find_locked(bucket, task);
+    spin_unlock(&bucket->lock);
+    if (entry)
+        return &entry->sem;
+
+    created = calloc(1, sizeof(*created));
+    if (!created || sys_sem_new(&created->sem, 0) != ERR_OK) {
+        free(created);
+        return NULL;
+    }
+    created->task = task;
+
+    spin_lock(&bucket->lock);
+    entry = naos_lwip_thread_sem_find_locked(bucket, task);
+    if (!entry) {
+        created->next = bucket->head;
+        bucket->head = created;
+        entry = created;
+        created = NULL;
+    }
+    spin_unlock(&bucket->lock);
+
+    if (created) {
+        sys_sem_free(&created->sem);
+        free(created);
+    }
+    return &entry->sem;
+}
+
+void naos_lwip_thread_sem_alloc(void) { (void)naos_lwip_thread_sem_get(); }
+
+void naos_lwip_thread_sem_free(void) {
+    naos_lwip_thread_sem_free_task(current_task);
 }
 
 static bool naos_lwip_sem_trywait(sys_sem_t sem) {
@@ -34,20 +168,6 @@ static bool naos_lwip_sem_trywait(sys_sem_t sem) {
     spin_unlock(&sem->sem.lock);
 
     return acquired;
-}
-
-static bool naos_lwip_sem_has_waiters(sys_sem_t sem) {
-    bool has_waiters = false;
-
-    if (!sem) {
-        return false;
-    }
-
-    spin_lock(&sem->sem.lock);
-    has_waiters = sem->wait_head != NULL;
-    spin_unlock(&sem->sem.lock);
-
-    return has_waiters;
 }
 
 static void naos_lwip_sem_wait_enqueue_locked(sys_sem_t sem,
@@ -307,11 +427,28 @@ u32_t sys_arch_sem_wait(sys_sem_t *sem, u32_t timeout) {
         reason =
             task_block(current_task, TASK_BLOCKING, block_ns, "lwip_sem_wait");
         if (reason == ETIMEDOUT && timeout_ns) {
+            bool timed_out = false;
+
             spin_lock(&s->sem.lock);
-            naos_lwip_sem_wait_remove_locked(s, &wait_node);
+            if (!s->valid) {
+                naos_lwip_sem_wait_remove_locked(s, &wait_node);
+                timed_out = true;
+            } else if (wait_node.queued) {
+                naos_lwip_sem_wait_remove_locked(s, &wait_node);
+                timed_out = true;
+            } else if (s->sem.cnt > 0) {
+                /* A signal selected this waiter concurrently with the timeout.
+                 * Consume that signal here instead of leaking it into the
+                 * caller's next netconn operation. */
+                s->sem.cnt--;
+            } else {
+                timed_out = true;
+            }
             spin_unlock(&s->sem.lock);
             task_cancel_block_prepare(current_task);
-            return SYS_ARCH_TIMEOUT;
+            if (timed_out)
+                return SYS_ARCH_TIMEOUT;
+            break;
         }
     }
 
@@ -491,9 +628,8 @@ void sys_spin_unlock(sys_mutex_t *mutex) {
     while ((node = naos_lwip_mutex_wait_dequeue_locked(m))) {
         waiter = node->task;
         node->task = NULL;
-        if (waiter && waiter->state != TASK_DIED) {
+        if (waiter && waiter->state != TASK_DIED)
             break;
-        }
         waiter = NULL;
     }
 
@@ -504,6 +640,8 @@ void sys_spin_unlock(sys_mutex_t *mutex) {
 
     if (waiter) {
         task_unblock(waiter, EOK);
+        if (current_task && !current_task->preempt_count)
+            sched_resched_if_needed();
     }
 }
 
@@ -555,6 +693,76 @@ void sys_mutex_set_invalid(sys_mutex_t *mutex) {
     }
 }
 
+static bool naos_lwip_mbox_op_get(sys_mbox_t *handle, sys_mbox_t *out) {
+    bool acquired = false;
+    sys_mbox_t mbox = NULL;
+
+    if (!handle || !out)
+        return false;
+
+    spin_lock(&naos_lwip_mbox_lifecycle_lock);
+    mbox = *handle;
+    if (mbox && mbox->valid && !mbox->destroying) {
+        mbox->active_ops++;
+        *out = mbox;
+        acquired = true;
+    }
+    spin_unlock(&naos_lwip_mbox_lifecycle_lock);
+    return acquired;
+}
+
+static bool naos_lwip_mbox_op_put(sys_mbox_t mbox) {
+    bool destroy = false;
+
+    if (!mbox)
+        return false;
+
+    spin_lock(&naos_lwip_mbox_lifecycle_lock);
+    if (mbox->active_ops)
+        mbox->active_ops--;
+    if (mbox->destroying && mbox->destroy_ready && !mbox->active_ops &&
+        !mbox->destroy_claimed) {
+        mbox->destroy_claimed = true;
+        destroy = true;
+    }
+    spin_unlock(&naos_lwip_mbox_lifecycle_lock);
+    return destroy;
+}
+
+static void naos_lwip_mbox_destroy(sys_mbox_t mbox) {
+    if (!mbox)
+        return;
+
+    sys_mutex_free(&mbox->lock);
+    free(mbox->not_empty);
+    free(mbox->not_full);
+    free(mbox->entries);
+    free(mbox);
+}
+
+static void naos_lwip_mbox_sem_close(sys_sem_t sem) {
+    wait_node_t *node = NULL;
+
+    if (!sem)
+        return;
+
+    spin_lock(&sem->sem.lock);
+    sem->valid = false;
+    node = naos_lwip_sem_wait_dequeue_locked(sem);
+    spin_unlock(&sem->sem.lock);
+
+    while (node) {
+        task_t *waiter = node->task;
+        node->task = NULL;
+        if (waiter && waiter->state != TASK_DIED)
+            task_unblock(waiter, EOK);
+
+        spin_lock(&sem->sem.lock);
+        node = naos_lwip_sem_wait_dequeue_locked(sem);
+        spin_unlock(&sem->sem.lock);
+    }
+}
+
 err_t sys_mbox_new(sys_mbox_t *mbox, int size) {
     sys_mbox_t created = calloc(1, sizeof(*created));
     if (!created) {
@@ -595,12 +803,12 @@ err_t sys_mbox_new(sys_mbox_t *mbox, int size) {
 void sys_mbox_post(sys_mbox_t *mbox, void *msg) {
     sys_mbox_t m = NULL;
 
-    if (!mbox || !*mbox || !(*mbox)->valid) {
+    if (!naos_lwip_mbox_op_get(mbox, &m))
         return;
-    }
-    m = *mbox;
 
     while (sys_arch_sem_wait(&m->not_full, 0) == SYS_ARCH_TIMEOUT) {
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return;
     }
 
@@ -608,6 +816,8 @@ void sys_mbox_post(sys_mbox_t *mbox, void *msg) {
     if (!m->valid || m->count >= m->size) {
         sys_spin_unlock(&m->lock);
         sys_sem_signal(&m->not_full);
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return;
     }
     m->entries[m->tail] = msg;
@@ -615,16 +825,18 @@ void sys_mbox_post(sys_mbox_t *mbox, void *msg) {
     m->count++;
     sys_spin_unlock(&m->lock);
     sys_sem_signal(&m->not_empty);
+    if (naos_lwip_mbox_op_put(m))
+        naos_lwip_mbox_destroy(m);
 }
 
 err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg) {
     sys_mbox_t m = NULL;
 
-    if (!mbox || !*mbox || !(*mbox)->valid) {
+    if (!naos_lwip_mbox_op_get(mbox, &m))
         return ERR_VAL;
-    }
-    m = *mbox;
     if (!naos_lwip_sem_trywait(m->not_full)) {
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return ERR_MEM;
     }
 
@@ -632,6 +844,8 @@ err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg) {
     if (!m->valid || m->count >= m->size) {
         sys_spin_unlock(&m->lock);
         sys_sem_signal(&m->not_full);
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return ERR_VAL;
     }
     m->entries[m->tail] = msg;
@@ -639,6 +853,8 @@ err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg) {
     m->count++;
     sys_spin_unlock(&m->lock);
     sys_sem_signal(&m->not_empty);
+    if (naos_lwip_mbox_op_put(m))
+        naos_lwip_mbox_destroy(m);
     return ERR_OK;
 }
 
@@ -650,19 +866,19 @@ u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout) {
     u32_t waited = 0;
     sys_mbox_t m = NULL;
 
-    if (!mbox || !*mbox || !(*mbox)->valid) {
-        if (msg) {
+    if (!naos_lwip_mbox_op_get(mbox, &m)) {
+        if (msg)
             *msg = NULL;
-        }
         return SYS_ARCH_TIMEOUT;
     }
-    m = *mbox;
 
     waited = sys_arch_sem_wait(&m->not_empty, timeout);
     if (waited == SYS_ARCH_TIMEOUT) {
         if (msg) {
             *msg = NULL;
         }
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return SYS_ARCH_TIMEOUT;
     }
 
@@ -675,6 +891,8 @@ u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout) {
         if (m->valid) {
             sys_sem_signal(&m->not_empty);
         }
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return SYS_ARCH_TIMEOUT;
     }
     if (msg) {
@@ -685,6 +903,8 @@ u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout) {
     m->count--;
     sys_spin_unlock(&m->lock);
     sys_sem_signal(&m->not_full);
+    if (naos_lwip_mbox_op_put(m))
+        naos_lwip_mbox_destroy(m);
 
     return waited;
 }
@@ -692,17 +912,17 @@ u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout) {
 u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg) {
     sys_mbox_t m = NULL;
 
-    if (!mbox || !*mbox || !(*mbox)->valid) {
-        if (msg) {
+    if (!naos_lwip_mbox_op_get(mbox, &m)) {
+        if (msg)
             *msg = NULL;
-        }
         return SYS_MBOX_EMPTY;
     }
-    m = *mbox;
     if (!naos_lwip_sem_trywait(m->not_empty)) {
         if (msg) {
             *msg = NULL;
         }
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return SYS_MBOX_EMPTY;
     }
 
@@ -715,6 +935,8 @@ u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg) {
         if (m->valid) {
             sys_sem_signal(&m->not_empty);
         }
+        if (naos_lwip_mbox_op_put(m))
+            naos_lwip_mbox_destroy(m);
         return SYS_MBOX_EMPTY;
     }
     if (msg) {
@@ -725,42 +947,65 @@ u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg) {
     m->count--;
     sys_spin_unlock(&m->lock);
     sys_sem_signal(&m->not_full);
+    if (naos_lwip_mbox_op_put(m))
+        naos_lwip_mbox_destroy(m);
     return 0;
 }
 
 void sys_mbox_free(sys_mbox_t *mbox) {
     sys_mbox_t m = NULL;
-    bool has_waiters = false;
+    bool destroy = false;
 
-    if (!mbox || !*mbox) {
+    if (!mbox) {
         return;
     }
+
+    spin_lock(&naos_lwip_mbox_lifecycle_lock);
     m = *mbox;
+    if (!m) {
+        spin_unlock(&naos_lwip_mbox_lifecycle_lock);
+        return;
+    }
     *mbox = NULL;
-    has_waiters = naos_lwip_sem_has_waiters(m->not_empty) ||
-                  naos_lwip_sem_has_waiters(m->not_full);
+    m->destroying = true;
+    spin_unlock(&naos_lwip_mbox_lifecycle_lock);
 
     sys_spin_lock(&m->lock);
     m->valid = false;
     m->count = 0;
     sys_spin_unlock(&m->lock);
 
-    sys_sem_free(&m->not_empty);
-    sys_sem_free(&m->not_full);
-    if (has_waiters) {
-        return;
-    }
+    naos_lwip_mbox_sem_close(m->not_empty);
+    naos_lwip_mbox_sem_close(m->not_full);
 
-    sys_mutex_free(&m->lock);
-    free(m->entries);
-    free(m);
+    spin_lock(&naos_lwip_mbox_lifecycle_lock);
+    m->destroy_ready = true;
+    if (!m->active_ops && !m->destroy_claimed) {
+        m->destroy_claimed = true;
+        destroy = true;
+    }
+    spin_unlock(&naos_lwip_mbox_lifecycle_lock);
+    if (destroy)
+        naos_lwip_mbox_destroy(m);
 }
 
-int sys_mbox_valid(sys_mbox_t *mbox) { return mbox && *mbox && (*mbox)->valid; }
+int sys_mbox_valid(sys_mbox_t *mbox) {
+    bool valid = false;
+
+    if (!mbox)
+        return false;
+
+    spin_lock(&naos_lwip_mbox_lifecycle_lock);
+    valid = *mbox && (*mbox)->valid && !(*mbox)->destroying;
+    spin_unlock(&naos_lwip_mbox_lifecycle_lock);
+    return valid;
+}
 
 void sys_mbox_set_invalid(sys_mbox_t *mbox) {
     if (mbox) {
+        spin_lock(&naos_lwip_mbox_lifecycle_lock);
         *mbox = NULL;
+        spin_unlock(&naos_lwip_mbox_lifecycle_lock);
     }
 }
 
@@ -789,7 +1034,7 @@ sys_thread_t sys_thread_new(const char *name, lwip_thread_fn thread, void *arg,
     bootstrap->arg = arg;
 
     task_t *task = task_create(name ? name : "lwip", lwip_sys_thread_entry,
-                               (uint64_t)bootstrap, KTHREAD_PRIORITY);
+                               (uint64_t)bootstrap, NORMAL_PRIORITY);
     if (!task) {
         free(bootstrap);
         return NULL;

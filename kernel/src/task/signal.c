@@ -276,10 +276,15 @@ static inline void signal_wake_interruptible_task(task_t *task, int sig) {
     if (!signal_should_wake_task(task, sig) && !signalfd_waiter)
         return;
 
-    if (task->state == TASK_BLOCKING || task->block_preparing) {
-        task_unblock(task, 128 + sig);
-    } else if (signalfd_waiter && task->cpu_id < cpu_count &&
-               task->cpu_id != current_cpu_id) {
+    /* Check state and block_preparing through task_unblock_prepare(), under
+     * block_lock.  A lockless pre-check can miss the prepare-to-block
+     * transition and lose the signal wakeup permanently. */
+    task_unblock_token_t token;
+    task_unblock_prepare(task, 128 + sig, &token);
+    if (token.prepared)
+        task_unblock_finish(&token);
+    if (!token.accepted && signalfd_waiter && task->cpu_id < cpu_count &&
+        task->cpu_id != current_cpu_id) {
         irq_trigger_sched_ipi(task->cpu_id);
     }
 }

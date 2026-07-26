@@ -332,6 +332,8 @@ int cgroupfs_set_task_cgroup_by_fd(task_t *task, int fd) {
     if (ret < 0)
         return ret;
 
+    if (task == current_task)
+        task_account_runtime_ns(task, nano_time());
     old_cgroup = cgroup_task_cgroup(task);
     cgroup_lock();
     ret = cgroup_attach_task_pid_locked(task->pid, cgroup);
@@ -636,12 +638,12 @@ static int cgroupfs_write_procs(cgroup_t *cgroup, uint64_t pid, bool threads) {
     }
     spin_unlock(&task_queue_lock);
 
-    /* Settle a currently running task against its old cgroup before moving it.
-     */
+    /* Bring the calling thread's local runtime up to the migration point. */
     for (size_t i = 0; i < count; ++i) {
         task_t *member = task_find_by_pid(pids[i]);
         if (member) {
-            task_account_runtime_ns(member, nano_time());
+            if (member == current_task)
+                task_account_runtime_ns(member, nano_time());
             old_cgroups[i] = cgroup_task_cgroup(member);
         }
     }

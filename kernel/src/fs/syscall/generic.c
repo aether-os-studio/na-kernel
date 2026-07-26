@@ -2401,7 +2401,7 @@ uint64_t sys_read(uint64_t fd, void *buf, uint64_t len) {
         return (uint64_t)-EISDIR;
     }
 
-    ssize_t ret = (ssize_t)vfs_read_file(file, buf, len, &file->f_pos);
+    ssize_t ret = (ssize_t)vfs_read_file(file, buf, len, NULL);
 
     vfs_file_put(file);
 
@@ -2423,7 +2423,7 @@ uint64_t sys_write(uint64_t fd, const void *buf, uint64_t len) {
         return (uint64_t)-EISDIR;
     }
 
-    ssize_t ret = (ssize_t)vfs_write_file(file, buf, len, &file->f_pos);
+    ssize_t ret = (ssize_t)vfs_write_file(file, buf, len, NULL);
 
     vfs_file_put(file);
     return ret;
@@ -2941,6 +2941,7 @@ static uint64_t generic_do_preadv(uint64_t fd, struct iovec *iovec,
     size_t total_len;
     ssize_t total_read = 0;
     uint64_t ret;
+    bool update_f_pos = false;
 
     if (flags & ~RWF_SUPPORTED)
         return (uint64_t)-EOPNOTSUPP;
@@ -2979,9 +2980,16 @@ static uint64_t generic_do_preadv(uint64_t fd, struct iovec *iovec,
         return (uint64_t)io_ret;
     }
 
+    if (use_f_pos && !(file->f_mode & VFS_FMODE_NO_POS_LOCK)) {
+        vfs_file_pos_lock(file);
+        pos = file->f_pos;
+        update_f_pos = true;
+    }
+
     for (uint64_t i = 0; i < count; i++) {
         size_t len = kiov[i].len;
         size_t iov_done = 0;
+        loff_t *ppos = use_f_pos ? (update_f_pos ? &pos : NULL) : &pos;
 
         if (len > MAX_RW_COUNT - (size_t)total_read)
             len = MAX_RW_COUNT - (size_t)total_read;
@@ -2991,18 +2999,15 @@ static uint64_t generic_do_preadv(uint64_t fd, struct iovec *iovec,
         while (iov_done < len) {
             ssize_t io_ret = (ssize_t)vfs_read_file(
                 file, (uint8_t *)kiov[i].iov_base + iov_done, len - iov_done,
-                use_f_pos ? NULL : &pos);
+                ppos);
             if (io_ret < 0) {
                 if (total_read > 0 &&
                     (io_ret == -EAGAIN || io_ret == -EWOULDBLOCK ||
                      io_ret == -EINTR)) {
-                    vfs_file_put(file);
-                    free(kiov);
-                    return total_read;
+                    goto out_readv;
                 }
-                vfs_file_put(file);
-                free(kiov);
-                return total_read ? (uint64_t)total_read : (uint64_t)io_ret;
+                total_read = total_read ? total_read : io_ret;
+                goto out_readv;
             }
             if (io_ret == 0)
                 break;
@@ -3013,6 +3018,12 @@ static uint64_t generic_do_preadv(uint64_t fd, struct iovec *iovec,
         }
         if (iov_done < len || (size_t)total_read >= MAX_RW_COUNT)
             break;
+    }
+out_readv:
+    if (update_f_pos) {
+        if (total_read > 0)
+            file->f_pos = pos;
+        vfs_file_pos_unlock(file);
     }
     vfs_file_put(file);
     free(kiov);
@@ -3028,6 +3039,7 @@ static uint64_t generic_do_pwritev(uint64_t fd, struct iovec *iovec,
     ssize_t total_written = 0;
     uint64_t ret;
     bool append;
+    bool pos_locked = false;
     bool update_f_pos = false;
 
     if (flags & ~RWF_SUPPORTED)
@@ -3068,23 +3080,27 @@ static uint64_t generic_do_pwritev(uint64_t fd, struct iovec *iovec,
     }
 
     append = (flags & RWF_APPEND) || (file->f_flags & O_APPEND);
-    update_f_pos = use_f_pos && append;
+    if ((use_f_pos || append) && !(file->f_mode & VFS_FMODE_NO_POS_LOCK)) {
+        vfs_file_pos_lock(file);
+        pos_locked = true;
+    }
+    if (use_f_pos && pos_locked) {
+        pos = file->f_pos;
+        update_f_pos = true;
+    }
     if (append)
-        spin_lock(&file->f_pos_lock);
+        pos = (loff_t)file->f_inode->i_size;
+
     for (uint64_t i = 0; i < count; i++) {
         size_t len = kiov[i].len;
-        loff_t *ppos = use_f_pos ? NULL : &pos;
+        loff_t *ppos =
+            (use_f_pos || append) ? (pos_locked ? &pos : NULL) : &pos;
         size_t iov_done = 0;
 
         if (len > MAX_RW_COUNT - (size_t)total_written)
             len = MAX_RW_COUNT - (size_t)total_written;
         if (kiov[i].iov_base == NULL)
             continue;
-        if (append) {
-            pos = (loff_t)file->f_inode->i_size;
-            ppos = &pos;
-        }
-
         while (iov_done < len) {
             ssize_t io_ret = (ssize_t)vfs_write_file(
                 file, (uint8_t *)kiov[i].iov_base + iov_done, len - iov_done,
@@ -3109,8 +3125,8 @@ static uint64_t generic_do_pwritev(uint64_t fd, struct iovec *iovec,
 out_writev:
     if (update_f_pos && total_written > 0)
         file->f_pos = pos;
-    if (append)
-        spin_unlock(&file->f_pos_lock);
+    if (pos_locked)
+        vfs_file_pos_unlock(file);
     vfs_file_put(file);
     free(kiov);
     return total_written;

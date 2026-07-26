@@ -550,7 +550,7 @@ struct vfs_file {
     unsigned int f_mode;
     unsigned int f_flags;
     loff_t f_pos;
-    spinlock_t f_pos_lock;
+    wait_mutex_t f_pos_lock;
     spinlock_t f_lock;
     vfs_ref_t f_ref;
     volatile int f_fd_refs;
@@ -931,6 +931,8 @@ ssize_t vfs_read_kernel_file(struct vfs_file *file, void *buf, size_t count,
                              loff_t *ppos);
 ssize_t vfs_write_kernel_file(struct vfs_file *file, const void *buf,
                               size_t count, loff_t *ppos);
+void vfs_file_pos_lock(struct vfs_file *file);
+void vfs_file_pos_unlock(struct vfs_file *file);
 loff_t vfs_llseek_file(struct vfs_file *file, loff_t offset, int whence);
 int vfs_iterate_dir(struct vfs_file *file, struct vfs_dir_context *ctx);
 long vfs_ioctl_file(struct vfs_file *file, unsigned long cmd,

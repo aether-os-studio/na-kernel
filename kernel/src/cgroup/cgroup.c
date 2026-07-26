@@ -38,27 +38,79 @@ static cgroup_t *
 cgroup_task_cgroup_for_hierarchy_locked(uint64_t pid,
                                         cgroup_hierarchy_t *hierarchy);
 
+static uint64_t cgroup_task_pending_runtime_ns_locked(task_t *task) {
+    uint64_t runtime_ns;
+
+    if (!task)
+        return 0;
+
+    runtime_ns = __atomic_load_n(&task->user_time_ns, __ATOMIC_RELAXED);
+    if (runtime_ns <= task->cgroup_accounted_runtime_ns)
+        return 0;
+    return runtime_ns - task->cgroup_accounted_runtime_ns;
+}
+
+static void cgroup_charge_runtime_locked(cgroup_t *cgroup, uint64_t delta_ns) {
+    for (; cgroup && delta_ns; cgroup = cgroup_parent(cgroup))
+        __atomic_add_fetch(&cgroup->runtime_ns, delta_ns, __ATOMIC_RELAXED);
+}
+
+static void cgroup_settle_task_runtime_locked(task_t *task,
+                                              cgroup_hierarchy_t *hierarchy) {
+    uint64_t delta_ns;
+    cgroup_t *cgroup;
+
+    if (!task || hierarchy != cgroup_unified_hierarchy)
+        return;
+
+    delta_ns = cgroup_task_pending_runtime_ns_locked(task);
+    if (!delta_ns)
+        return;
+
+    task->cgroup_accounted_runtime_ns += delta_ns;
+    cgroup = cgroup_task_cgroup_for_hierarchy_locked(task->pid, hierarchy);
+    cgroup_charge_runtime_locked(cgroup, delta_ns);
+}
+
 void cgroup_lock(void) { spin_lock(&cgroup_global_lock); }
 
 void cgroup_unlock(void) { spin_unlock(&cgroup_global_lock); }
 
-void cgroup_account_runtime_ns(task_t *task, uint64_t delta_ns) {
-    cgroup_hierarchy_t *hierarchy;
-    cgroup_t *cgroup;
+uint64_t cgroup_runtime_ns(cgroup_t *cgroup) {
+    uint64_t runtime_ns = 0;
 
-    if (!task || !delta_ns)
-        return;
+    if (!cgroup)
+        return 0;
 
     cgroup_lock();
-    hierarchy = cgroup_unified_hierarchy;
-    cgroup = cgroup_task_cgroup_for_hierarchy_locked(task->pid, hierarchy);
-    for (; cgroup; cgroup = cgroup_parent(cgroup))
-        __atomic_add_fetch(&cgroup->runtime_ns, delta_ns, __ATOMIC_RELAXED);
-    cgroup_unlock();
-}
+    runtime_ns = __atomic_load_n(&cgroup->runtime_ns, __ATOMIC_RELAXED);
 
-uint64_t cgroup_runtime_ns(cgroup_t *cgroup) {
-    return cgroup ? __atomic_load_n(&cgroup->runtime_ns, __ATOMIC_RELAXED) : 0;
+    if (cgroup_unified_hierarchy &&
+        cgroup_is_descendant_of(cgroup, cgroup_unified_hierarchy->root)) {
+        spin_lock(&task_queue_lock);
+        if (task_pid_map.buckets) {
+            for (size_t i = 0; i < task_pid_map.bucket_count; ++i) {
+                hashmap_entry_t *entry = &task_pid_map.buckets[i];
+                task_t *task;
+                cgroup_t *task_cgroup;
+
+                if (!hashmap_entry_is_occupied(entry))
+                    continue;
+                task = (task_t *)entry->value;
+                if (!task || task->state == TASK_DIED)
+                    continue;
+
+                task_cgroup = cgroup_task_cgroup_for_hierarchy_locked(
+                    task->pid, cgroup_unified_hierarchy);
+                if (cgroup_is_descendant_of(task_cgroup, cgroup))
+                    runtime_ns += cgroup_task_pending_runtime_ns_locked(task);
+            }
+        }
+        spin_unlock(&task_queue_lock);
+    }
+
+    cgroup_unlock();
+    return runtime_ns;
 }
 
 cgroup_t *cgroup_get(cgroup_t *cgroup) {
@@ -280,12 +332,20 @@ int cgroup_attach_task_pid_locked(uint64_t pid, cgroup_t *cgroup) {
     cgroup_hierarchy_t *hierarchy = cgroup_unified_hierarchy;
     cgroup_hierarchy_t *pos, *tmp;
     cgroup_assignment_t *entry;
+    task_t *task;
 
     llist_for_each(pos, tmp, &cgroup_hierarchies, node) {
         if (cgroup_is_descendant_of(cgroup, pos->root)) {
             hierarchy = pos;
             break;
         }
+    }
+
+    if (hierarchy == cgroup_unified_hierarchy) {
+        spin_lock(&task_queue_lock);
+        task = task_lookup_by_pid_nolock(pid);
+        cgroup_settle_task_runtime_locked(task, hierarchy);
+        spin_unlock(&task_queue_lock);
     }
 
     entry = cgroup_find_assignment_locked(pid, hierarchy);
@@ -342,6 +402,7 @@ void cgroup_on_exit_task(task_t *task) {
         return;
 
     cgroup_lock();
+    cgroup_settle_task_runtime_locked(task, cgroup_unified_hierarchy);
     cgroup_hierarchy_t *hierarchy, *tmp;
     llist_for_each(hierarchy, tmp, &cgroup_hierarchies, node) {
         cgroup_assignment_t *entry =

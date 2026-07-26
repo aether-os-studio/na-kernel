@@ -77,7 +77,7 @@ int wait_queue_wake_entry(wait_queue_entry_t *entry, uint32_t events,
     if (entry->wake)
         return entry->wake(entry, events, reason);
 
-    if (!entry->task || entry->task->state == TASK_DIED)
+    if (!entry->task)
         return 0;
 
     task_unblock(entry->task, reason);
@@ -132,10 +132,7 @@ int wait_queue_wake(wait_queue_head_t *queue, uint32_t events, int nr,
             }
 
             task = entry->task;
-            if (!task || task->state == TASK_DIED)
-                continue;
-            if (task->state != TASK_BLOCKING &&
-                task->state != TASK_UNINTERRUPTABLE && !task->block_preparing)
+            if (!task)
                 continue;
 
             task_unblock_token_t token;
@@ -167,4 +164,65 @@ int wait_queue_wake(wait_queue_head_t *queue, uint32_t events, int nr,
 
 int wait_queue_wake_all(wait_queue_head_t *queue, uint32_t events, int reason) {
     return wait_queue_wake(queue, events, 0, reason);
+}
+
+void wait_mutex_init(wait_mutex_t *mutex) {
+    if (!mutex)
+        return;
+
+    wait_queue_init(&mutex->wait);
+    __atomic_store_n(&mutex->locked, false, __ATOMIC_RELEASE);
+}
+
+bool wait_mutex_trylock(wait_mutex_t *mutex) {
+    bool expected = false;
+
+    return mutex &&
+           __atomic_compare_exchange_n(&mutex->locked, &expected, true, false,
+                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+void wait_mutex_lock(wait_mutex_t *mutex) {
+    if (!mutex)
+        return;
+
+    for (;;) {
+        wait_queue_entry_t wait;
+
+        if (!current_task || current_task->preempt_count) {
+            if (wait_mutex_trylock(mutex))
+                return;
+            arch_pause();
+            continue;
+        }
+
+        if (wait_mutex_trylock(mutex))
+            return;
+
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&mutex->wait, &wait);
+
+        if (wait_mutex_trylock(mutex)) {
+            wait_queue_remove(&mutex->wait, &wait);
+            task_cancel_block_prepare(current_task);
+            return;
+        }
+
+        (void)task_block(current_task, TASK_UNINTERRUPTABLE, -1, "wait_mutex");
+
+        wait_queue_remove(&mutex->wait, &wait);
+        task_cancel_block_prepare(current_task);
+    }
+}
+
+void wait_mutex_unlock(wait_mutex_t *mutex) {
+    if (!mutex)
+        return;
+
+    __atomic_store_n(&mutex->locked, false, __ATOMIC_RELEASE);
+
+    int woke = wait_queue_wake(&mutex->wait, 0, 1, EOK);
+    if (woke > 0 && current_task && !current_task->preempt_count)
+        sched_resched_if_needed();
 }

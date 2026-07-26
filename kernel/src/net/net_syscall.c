@@ -406,25 +406,61 @@ static int socket_wait_fd_event(fd_t *fd, uint32_t events, int64_t timeout_ns,
     if (!fd || !fd->node)
         return -EBADF;
 
+    bool infinite_timeout = timeout_ns < 0;
     uint64_t deadline_ns =
-        (timeout_ns > 0) ? (nano_time() + timeout_ns) : UINT64_MAX;
-
+        infinite_timeout ? UINT64_MAX : nano_time() + (uint64_t)timeout_ns;
     uint32_t want = events | EPOLLERR | EPOLLHUP | EPOLLNVAL | EPOLLRDHUP;
 
-    while (nano_time() < deadline_ns) {
-        int polled = vfs_poll(fd, want);
-        if (polled < 0)
+    while (true) {
+        vfs_poll_wait_table_t table;
+        vfs_poll_wait_table_init(&table, current_task);
+
+        int polled = vfs_poll_with_table(fd, want, &table.pt);
+        int table_error = vfs_poll_wait_table_error(&table);
+        if (table_error) {
+            vfs_poll_wait_table_cleanup(&table);
+            return table_error;
+        }
+        if (polled < 0) {
+            vfs_poll_wait_table_cleanup(&table);
             return polled;
+        }
 
-        if (polled & want)
+        if ((uint32_t)polled & want) {
+            vfs_poll_wait_table_cleanup(&table);
             return 0;
+        }
 
-        int reason = vfs_poll_wait_interruptible(fd, want);
-        if (reason < 0)
-            return reason;
+        if (task_signal_has_deliverable(current_task)) {
+            vfs_poll_wait_table_cleanup(&table);
+            return -EINTR;
+        }
+        if (vfs_poll_wait_table_seq_changed(&table)) {
+            vfs_poll_wait_table_cleanup(&table);
+            continue;
+        }
+
+        int64_t sleep_ns = -1;
+        if (!infinite_timeout) {
+            uint64_t now = nano_time();
+            if (now >= deadline_ns) {
+                vfs_poll_wait_table_cleanup(&table);
+                return -ETIMEDOUT;
+            }
+            sleep_ns = (int64_t)(deadline_ns - now);
+        }
+
+        int block_reason =
+            task_block(current_task, TASK_BLOCKING, sleep_ns, reason);
+        vfs_poll_wait_table_cleanup(&table);
+
+        if (block_reason == ETIMEDOUT)
+            return -ETIMEDOUT;
+        if (block_reason < 0)
+            return block_reason;
+        if (block_reason != EOK && task_signal_has_deliverable(current_task))
+            return -EINTR;
     }
-
-    return -ETIMEDOUT;
 }
 
 static int socket_store_mmsg_len(struct mmsghdr *msgvec, unsigned int idx,

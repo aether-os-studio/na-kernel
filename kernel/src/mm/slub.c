@@ -305,7 +305,7 @@ retry:
             if (!reclaimed) {
                 reclaimed = true;
                 (void)malloc_trim(0);
-                (void)page_cache_reclaim_half();
+                (void)page_cache_reclaim(32);
                 goto retry;
             }
             return NULL;
@@ -461,7 +461,7 @@ static void *large_alloc_aligned(size_t size, size_t alignment) {
         buddy_alloc_zone_pages(zone, order_pages(order), &allocated_pages);
     if (!phys || allocated_pages != order_pages(order)) {
         (void)malloc_trim(0);
-        (void)page_cache_reclaim_half();
+        (void)page_cache_reclaim(MAX((uint64_t)order_pages(order), 64ULL));
         phys =
             buddy_alloc_zone_pages(zone, order_pages(order), &allocated_pages);
     }

@@ -121,6 +121,8 @@ typedef struct lwip_socket_state {
     bool shut_rd;
     bool shut_wr;
     spinlock_t event_lock;
+    wait_mutex_t rx_lock;
+    wait_mutex_t tx_lock;
     struct pbuf *rx_pbuf;
     size_t rx_pbuf_offset;
     size_t rx_pbuf_announced;

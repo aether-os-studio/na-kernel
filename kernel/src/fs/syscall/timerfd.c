@@ -418,7 +418,7 @@ static loff_t timerfdfs_llseek(struct vfs_file *file, loff_t offset,
 
     if (!file || !file->f_inode)
         return -EBADF;
-    spin_lock(&file->f_pos_lock);
+    vfs_file_pos_lock(file);
     switch (whence) {
     case SEEK_SET:
         pos = offset;
@@ -430,15 +430,15 @@ static loff_t timerfdfs_llseek(struct vfs_file *file, loff_t offset,
         pos = (loff_t)file->f_inode->i_size + offset;
         break;
     default:
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
         return -EINVAL;
     }
     if (pos < 0) {
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
         return -EINVAL;
     }
     file->f_pos = pos;
-    spin_unlock(&file->f_pos_lock);
+    vfs_file_pos_unlock(file);
     return pos;
 }
 
@@ -549,6 +549,7 @@ static int timerfdfs_create_file(struct vfs_file **out_file, int clockid,
     }
 
     file->private_data = tfd;
+    file->f_mode |= VFS_FMODE_NO_POS_LOCK;
     tfd->node = vfs_igrab(inode);
     *out_file = file;
     if (out_tfd)

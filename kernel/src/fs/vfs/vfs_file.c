@@ -177,7 +177,14 @@ struct vfs_file *vfs_alloc_file(const struct vfs_path *path,
      * as FD_CLOEXEC and must never leak through F_GETFL or SCM_RIGHTS into the
      * shared open-file-description status flags. */
     file->f_flags = open_flags & ~O_CLOEXEC;
-    spin_init(&file->f_pos_lock);
+    /* Only regular files and directories use the VFS-managed shared file
+     * position. Stream-like files can block indefinitely in read while a
+     * peer must write through the same open file description; serializing
+     * both directions on f_pos_lock would deadlock them even though their
+     * backends ignore ppos. */
+    if (!S_ISREG(file->f_inode->i_mode) && !S_ISDIR(file->f_inode->i_mode))
+        file->f_mode |= VFS_FMODE_NO_POS_LOCK;
+    wait_mutex_init(&file->f_pos_lock);
     spin_init(&file->f_lock);
     file->f_fd_refs = 0;
     spin_init(&file->epoll_watches_lock);
@@ -603,7 +610,7 @@ ssize_t vfs_read_file(struct vfs_file *file, void *buf, size_t count,
     bool lock_pos = !ppos && !(file->f_mode & VFS_FMODE_NO_POS_LOCK);
 
     if (lock_pos)
-        spin_lock(&file->f_pos_lock);
+        vfs_file_pos_lock(file);
     pos = ppos ? *ppos : file->f_pos;
 
     new_pos = pos;
@@ -617,7 +624,7 @@ ssize_t vfs_read_file(struct vfs_file *file, void *buf, size_t count,
     }
 
     if (lock_pos)
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
     return ret;
 }
 
@@ -637,7 +644,7 @@ ssize_t vfs_write_file(struct vfs_file *file, const void *buf, size_t count,
     bool lock_pos = !ppos && !(file->f_mode & VFS_FMODE_NO_POS_LOCK);
 
     if (lock_pos)
-        spin_lock(&file->f_pos_lock);
+        vfs_file_pos_lock(file);
     pos = ppos ? *ppos : file->f_pos;
     if (!ppos && (file->f_flags & O_APPEND))
         pos = (loff_t)file->f_inode->i_size;
@@ -656,7 +663,7 @@ ssize_t vfs_write_file(struct vfs_file *file, const void *buf, size_t count,
     }
 
     if (lock_pos)
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
     return ret;
 }
 
@@ -676,7 +683,7 @@ ssize_t vfs_read_kernel_file(struct vfs_file *file, void *buf, size_t count,
 
     bool lock_pos = !ppos && !(file->f_mode & VFS_FMODE_NO_POS_LOCK);
     if (lock_pos)
-        spin_lock(&file->f_pos_lock);
+        vfs_file_pos_lock(file);
     pos = ppos ? *ppos : file->f_pos;
 
     new_pos = pos;
@@ -689,7 +696,7 @@ ssize_t vfs_read_kernel_file(struct vfs_file *file, void *buf, size_t count,
     }
 
     if (lock_pos)
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
     return ret;
 }
 
@@ -709,7 +716,7 @@ ssize_t vfs_write_kernel_file(struct vfs_file *file, const void *buf,
 
     bool lock_pos = !ppos && !(file->f_mode & VFS_FMODE_NO_POS_LOCK);
     if (lock_pos)
-        spin_lock(&file->f_pos_lock);
+        vfs_file_pos_lock(file);
     pos = ppos ? *ppos : file->f_pos;
     if (!ppos && (file->f_flags & O_APPEND))
         pos = (loff_t)file->f_inode->i_size;
@@ -727,8 +734,18 @@ ssize_t vfs_write_kernel_file(struct vfs_file *file, const void *buf,
     }
 
     if (lock_pos)
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
     return ret;
+}
+
+void vfs_file_pos_lock(struct vfs_file *file) {
+    if (file)
+        wait_mutex_lock(&file->f_pos_lock);
+}
+
+void vfs_file_pos_unlock(struct vfs_file *file) {
+    if (file)
+        wait_mutex_unlock(&file->f_pos_lock);
 }
 
 loff_t vfs_llseek_file(struct vfs_file *file, loff_t offset, int whence) {
@@ -739,7 +756,7 @@ loff_t vfs_llseek_file(struct vfs_file *file, loff_t offset, int whence) {
     if (file->f_op && file->f_op->llseek)
         return file->f_op->llseek(file, offset, whence);
 
-    spin_lock(&file->f_pos_lock);
+    vfs_file_pos_lock(file);
     switch (whence) {
     case SEEK_SET:
         new_pos = offset;
@@ -751,17 +768,17 @@ loff_t vfs_llseek_file(struct vfs_file *file, loff_t offset, int whence) {
         new_pos = (loff_t)file->f_inode->i_size + offset;
         break;
     default:
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
         return -EINVAL;
     }
 
     if (new_pos < 0) {
-        spin_unlock(&file->f_pos_lock);
+        vfs_file_pos_unlock(file);
         return -EINVAL;
     }
 
     file->f_pos = new_pos;
-    spin_unlock(&file->f_pos_lock);
+    vfs_file_pos_unlock(file);
     return new_pos;
 }
 

@@ -1,4 +1,5 @@
 #include <mm/cache.h>
+#include <mm/buddy.h>
 #include <mm/page.h>
 #include <task/task.h>
 #include <arch/arch.h>
@@ -6,6 +7,10 @@
 #define PAGE_CACHE_MIN_READAHEAD 2ULL
 #define PAGE_CACHE_MAX_READAHEAD 32ULL
 #define PAGE_CACHE_UNMAP_LOCK_BATCH_MAX 64ULL
+#define PAGE_CACHE_DIRTY_MAPPING_LIMIT 256ULL
+#define PAGE_CACHE_DIRTY_GLOBAL_MIN 512ULL
+#define PAGE_CACHE_WRITEBACK_BATCH 8ULL
+#define PAGE_CACHE_RECLAIM_SCAN_BATCH 64ULL
 
 static DEFINE_LLIST(pcache_lru);
 static spinlock_t pcache_lru_lock = SPIN_INIT;
@@ -18,6 +23,8 @@ static uint64_t pcache_mapped_pages;
 static uint64_t pcache_lru_pages;
 static uint64_t pcache_reclaimed_pages;
 static uint64_t pcache_reclaim_scanned_pages;
+static uint64_t pcache_dirty_global_limit;
+static uint8_t pcache_writeback_active;
 
 static void pcache_stat_add(uint64_t *counter, uint64_t delta) {
     if (delta)
@@ -66,6 +73,11 @@ static bool pcache_user_buffer(struct vfs_file *file, const void *buf,
 }
 
 static void pcache_remove_locked_lru(page_cache_page_t *page, bool remove_lru);
+
+static void pcache_wake_waiters(page_cache_page_t *page) {
+    if (page)
+        wait_queue_wake_all(&page->wait, 0, EOK);
+}
 
 static void pcache_lru_add_tail_locked(page_cache_page_t *page) {
     if (!page || page->on_lru || page->reclaiming)
@@ -199,6 +211,7 @@ static void pcache_remove_locked_lru(page_cache_page_t *page, bool remove_lru) {
     page->node.rb_right = NULL;
     page->mapping = NULL;
     page->truncated = true;
+    page->loading = false;
     if (mapping->cached_pages)
         mapping->cached_pages--;
     pcache_stat_sub(&pcache_cached_pages, 1);
@@ -221,6 +234,7 @@ static void pcache_remove_locked_lru(page_cache_page_t *page, bool remove_lru) {
         pcache_stat_sub(&pcache_mapped_pages, 1);
         page->mmap_count = 0;
     }
+    pcache_wake_waiters(page);
 }
 
 static void pcache_free(page_cache_page_t *page) {
@@ -265,12 +279,37 @@ static void pcache_wait_unlocked(page_cache_page_t *page) {
 
     struct vfs_address_space *mapping = page->mapping;
     while (true) {
+        if (!current_task || current_task->preempt_count) {
+            spin_lock(&mapping->lock);
+            bool busy =
+                page->mapping == mapping && (page->loading || page->writeback);
+            spin_unlock(&mapping->lock);
+            if (!busy)
+                return;
+            arch_pause();
+            continue;
+        }
+
+        wait_queue_entry_t wait;
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&page->wait, &wait);
+
         spin_lock(&mapping->lock);
-        bool busy = page->mapping == mapping && page->loading;
+        bool busy =
+            page->mapping == mapping && (page->loading || page->writeback);
         spin_unlock(&mapping->lock);
-        if (!busy)
-            break;
-        arch_pause();
+
+        if (!busy) {
+            wait_queue_remove(&page->wait, &wait);
+            task_cancel_block_prepare(current_task);
+            return;
+        }
+
+        (void)task_block(current_task, TASK_UNINTERRUPTABLE, -1,
+                         "page_cache_busy");
+        wait_queue_remove(&page->wait, &wait);
+        task_cancel_block_prepare(current_task);
     }
 }
 
@@ -285,13 +324,13 @@ static int pcache_begin_update(page_cache_page_t *page) {
             spin_unlock(&mapping->lock);
             return -EIO;
         }
-        if (!page->loading) {
+        if (!page->loading && !page->writeback) {
             page->loading = true;
             spin_unlock(&mapping->lock);
             return 0;
         }
         spin_unlock(&mapping->lock);
-        arch_pause();
+        pcache_wait_unlocked(page);
     }
 }
 
@@ -301,6 +340,7 @@ static void pcache_finish_update(page_cache_page_t *page, bool uptodate,
         return;
 
     struct vfs_address_space *mapping = page->mapping;
+    bool finished = false;
     spin_lock(&mapping->lock);
     if (page->mapping == mapping) {
         if (uptodate)
@@ -311,8 +351,11 @@ static void pcache_finish_update(page_cache_page_t *page, bool uptodate,
             pcache_stat_add(&pcache_dirty_pages, 1);
         }
         page->loading = false;
+        finished = true;
     }
     spin_unlock(&mapping->lock);
+    if (finished)
+        pcache_wake_waiters(page);
 }
 
 void page_cache_zap_inode_shared_mappings(vfs_node_t *node,
@@ -358,6 +401,8 @@ static int pcache_load_page(struct vfs_file *file,
         valid = true;
     }
     spin_unlock(&mapping->lock);
+    if (valid)
+        pcache_wake_waiters(page);
     if (ret < 0)
         return ret;
     return valid ? 0 : -EIO;
@@ -379,7 +424,7 @@ static int pcache_write_page(struct vfs_address_space *mapping,
             spin_unlock(&mapping->lock);
             return 0;
         }
-        if (!page->loading)
+        if (!page->loading && !page->writeback)
             break;
         spin_unlock(&mapping->lock);
         pcache_wait_unlocked(page);
@@ -394,9 +439,11 @@ static int pcache_write_page(struct vfs_address_space *mapping,
     ret = mapping->a_ops->writepage(NULL, mapping, page->index,
                                     (const void *)phys_to_virt(page->paddr));
 
+    bool finished_writeback = false;
     spin_lock(&mapping->lock);
     if (accounted_writeback && page->writeback) {
         page->writeback = false;
+        finished_writeback = true;
         pcache_stat_sub(&pcache_writeback_pages, 1);
     }
     if (ret == 0 && page->mapping == mapping && page->dirty) {
@@ -406,6 +453,8 @@ static int pcache_write_page(struct vfs_address_space *mapping,
         pcache_stat_sub(&pcache_dirty_pages, 1);
     }
     spin_unlock(&mapping->lock);
+    if (finished_writeback)
+        pcache_wake_waiters(page);
     return ret < 0 ? ret : 0;
 }
 
@@ -483,13 +532,14 @@ retry:
     if (!new_page) {
         new_page = calloc(1, sizeof(*new_page));
         if (!new_page) {
-            (void)page_cache_reclaim_half();
+            (void)page_cache_reclaim(32);
             new_page = calloc(1, sizeof(*new_page));
             if (!new_page)
                 return -ENOMEM;
         }
 
         llist_init_head(&new_page->lru);
+        wait_queue_init(&new_page->wait);
         new_page->paddr = alloc_frames(1);
         if (!new_page->paddr) {
             pcache_free(new_page);
@@ -549,7 +599,8 @@ retry:
 
 void page_cache_page_put(page_cache_page_t *page) { pcache_drop_ref(page); }
 
-static bool pcache_lru_reclaim_oldest(uint64_t *scanned_out) {
+static bool pcache_lru_reclaim_oldest(uint64_t *scanned_out,
+                                      uint64_t scan_limit) {
     page_cache_page_t *reclaimed_page = NULL;
     bool reclaimed = false;
 
@@ -558,7 +609,7 @@ static bool pcache_lru_reclaim_oldest(uint64_t *scanned_out) {
 
     spin_lock(&pcache_lru_lock);
     struct llist_header *pos = pcache_lru.next;
-    while (pos != &pcache_lru) {
+    while (pos != &pcache_lru && (!scanned_out || *scanned_out < scan_limit)) {
         page_cache_page_t *candidate = list_entry(pos, page_cache_page_t, lru);
         struct vfs_address_space *mapping = candidate->mapping;
         pos = pos->next;
@@ -606,21 +657,27 @@ static bool pcache_lru_reclaim_oldest(uint64_t *scanned_out) {
     return reclaimed;
 }
 
-uint64_t page_cache_reclaim_half(void) {
+uint64_t page_cache_reclaim(uint64_t target_pages) {
     uint64_t lru_pages;
-    uint64_t target;
+    uint64_t scan_limit;
     uint64_t scanned = 0;
     uint64_t reclaimed = 0;
 
+    if (!target_pages)
+        return 0;
     if (__atomic_exchange_n(&pcache_reclaim_active, 1, __ATOMIC_ACQ_REL))
         return 0;
 
     lru_pages = __atomic_load_n(&pcache_lru_pages, __ATOMIC_ACQUIRE);
-    target = lru_pages ? MAX(1ULL, (lru_pages + 1) / 2) : 0;
+    target_pages = MIN(target_pages, lru_pages);
+    scan_limit = target_pages > UINT64_MAX / 8 ? UINT64_MAX : target_pages * 8;
+    scan_limit = MIN(lru_pages, scan_limit);
 
-    while (scanned < lru_pages && reclaimed < target) {
+    while (scanned < scan_limit && reclaimed < target_pages) {
         uint64_t pass_scanned = 0;
-        bool did_reclaim = pcache_lru_reclaim_oldest(&pass_scanned);
+        uint64_t pass_limit =
+            MIN(scan_limit - scanned, PAGE_CACHE_RECLAIM_SCAN_BATCH);
+        bool did_reclaim = pcache_lru_reclaim_oldest(&pass_scanned, pass_limit);
         if (!pass_scanned)
             break;
         scanned += pass_scanned;
@@ -764,6 +821,36 @@ int page_cache_read(struct vfs_file *file, void *buf, size_t count,
     return (int)done;
 }
 
+static int pcache_writeback_range_limit(struct vfs_address_space *mapping,
+                                        uint64_t start, uint64_t end,
+                                        uint64_t max_pages);
+
+static bool pcache_dirty_limit_exceeded(struct vfs_address_space *mapping) {
+    uint64_t mapping_dirty = 0;
+    uint64_t global_dirty =
+        __atomic_load_n(&pcache_dirty_pages, __ATOMIC_ACQUIRE);
+    uint64_t global_limit =
+        __atomic_load_n(&pcache_dirty_global_limit, __ATOMIC_ACQUIRE);
+
+    if (!global_limit) {
+        uint64_t total_pages = 0;
+        for (int i = 0; i < __MAX_NR_ZONES; i++) {
+            if (zones[i])
+                total_pages += zones[i]->managed_pages;
+        }
+        global_limit = MAX(PAGE_CACHE_DIRTY_GLOBAL_MIN, total_pages / 8);
+        __atomic_store_n(&pcache_dirty_global_limit, global_limit,
+                         __ATOMIC_RELEASE);
+    }
+
+    spin_lock(&mapping->lock);
+    mapping_dirty = mapping->dirty_pages;
+    spin_unlock(&mapping->lock);
+
+    return mapping_dirty > PAGE_CACHE_DIRTY_MAPPING_LIMIT ||
+           global_dirty > global_limit;
+}
+
 int page_cache_write(struct vfs_file *file, const void *buf, size_t count,
                      loff_t *ppos) {
     struct vfs_inode *inode;
@@ -811,20 +898,33 @@ int page_cache_write(struct vfs_file *file, const void *buf, size_t count,
         pcache_finish_update(page, true, true);
         page_cache_page_put(page);
         done += chunk;
+
+        uint64_t written_end = pos + done;
+        spin_lock(&inode->i_lock);
+        if (written_end > inode->i_size)
+            inode->i_size = written_end;
+        spin_unlock(&inode->i_lock);
+
+        if (pcache_dirty_limit_exceeded(mapping) &&
+            !__atomic_exchange_n(&pcache_writeback_active, 1,
+                                 __ATOMIC_ACQ_REL)) {
+            (void)pcache_writeback_range_limit(mapping, 0, UINT64_MAX,
+                                               PAGE_CACHE_WRITEBACK_BATCH);
+            __atomic_store_n(&pcache_writeback_active, 0, __ATOMIC_RELEASE);
+        }
     }
 
     *ppos += (loff_t)done;
-    if ((uint64_t)*ppos > inode->i_size)
-        inode->i_size = (uint64_t)*ppos;
     return (int)done;
 }
 
-int page_cache_writeback_range(struct vfs_address_space *mapping,
-                               uint64_t start, uint64_t end, bool datasync) {
+static int pcache_writeback_range_limit(struct vfs_address_space *mapping,
+                                        uint64_t start, uint64_t end,
+                                        uint64_t max_pages) {
     rb_node_t *node;
+    uint64_t written = 0;
     int ret = 0;
 
-    (void)datasync;
     if (!mapping || start >= end)
         return 0;
 
@@ -848,11 +948,20 @@ int page_cache_writeback_range(struct vfs_address_space *mapping,
         page_cache_page_put(page);
         if (ret < 0)
             return ret;
+        written++;
+        if (written >= max_pages)
+            return 0;
         spin_lock(&mapping->lock);
         node = pcache_lower_bound_locked(mapping, next_index);
     }
     spin_unlock(&mapping->lock);
     return 0;
+}
+
+int page_cache_writeback_range(struct vfs_address_space *mapping,
+                               uint64_t start, uint64_t end, bool datasync) {
+    (void)datasync;
+    return pcache_writeback_range_limit(mapping, start, end, UINT64_MAX);
 }
 
 int page_cache_invalidate_range(struct vfs_address_space *mapping,
