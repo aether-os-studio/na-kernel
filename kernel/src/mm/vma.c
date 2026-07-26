@@ -5,6 +5,13 @@ static inline unsigned long vma_len(const vma_t *vma) {
     return vma->vm_end - vma->vm_start;
 }
 
+/* 栈 VMA 是大范围预留地址，不按完整长度计入 RLIMIT_AS。 */
+static inline unsigned long vma_accounted_len(const vma_t *vma) {
+    if (vma->vm_flags & VMA_STACK)
+        return 0;
+    return vma_len(vma);
+}
+
 static vma_t *vma_prev(vma_manager_t *mgr, const vma_t *target) {
     if (!mgr || !target)
         return NULL;
@@ -166,7 +173,7 @@ int vma_insert(vma_manager_t *mgr, vma_t *new_vma) {
     *link = node;
     rb_insert_color(node, &mgr->vma_tree);
 
-    mgr->vm_used += vma_len(new_vma);
+    mgr->vm_used += vma_accounted_len(new_vma);
     return 0;
 }
 
@@ -180,7 +187,7 @@ int vma_remove(vma_manager_t *mgr, vma_t *vma) {
     vma->vm_rb.rb_parent_color = 0;
     vma->vm_rb.rb_left = NULL;
     vma->vm_rb.rb_right = NULL;
-    mgr->vm_used -= vma_len(vma);
+    mgr->vm_used -= vma_accounted_len(vma);
     return 0;
 }
 
@@ -221,7 +228,7 @@ int vma_split(vma_manager_t *mgr, vma_t *vma, uint64_t addr) {
         new_vma->vm_name = strdup(vma->vm_name);
 
     rb_erase(&vma->vm_rb, &mgr->vma_tree);
-    mgr->vm_used -= (old_end - old_start);
+    mgr->vm_used -= vma_accounted_len(vma);
     vma->vm_rb.rb_parent_color = 0;
     vma->vm_rb.rb_left = NULL;
     vma->vm_rb.rb_right = NULL;
@@ -238,7 +245,7 @@ int vma_split(vma_manager_t *mgr, vma_t *vma, uint64_t addr) {
 
     if (vma_insert(mgr, new_vma) != 0) {
         rb_erase(&vma->vm_rb, &mgr->vma_tree);
-        mgr->vm_used -= (addr - old_start);
+        mgr->vm_used -= vma_accounted_len(vma);
         vma->vm_rb.rb_parent_color = 0;
         vma->vm_rb.rb_left = NULL;
         vma->vm_rb.rb_right = NULL;
@@ -286,11 +293,11 @@ int vma_merge(vma_manager_t *mgr, vma_t *vma1, vma_t *vma2) {
 
     uint64_t new_end = vma2->vm_end;
 
-    mgr->vm_used -= vma_len(vma2);
+    mgr->vm_used -= vma_accounted_len(vma2);
     rb_erase(&vma2->vm_rb, &mgr->vma_tree);
 
     uint64_t old_end = vma1->vm_end;
-    mgr->vm_used -= vma_len(vma1);
+    mgr->vm_used -= vma_accounted_len(vma1);
     rb_erase(&vma1->vm_rb, &mgr->vma_tree);
     vma1->vm_rb.rb_parent_color = 0;
     vma1->vm_rb.rb_left = NULL;

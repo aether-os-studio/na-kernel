@@ -1583,7 +1583,8 @@ static uint64_t mremap_expand_inplace_locked(task_mm_info_t *mm,
     vma->vm_end = new_end;
     if (vma->vm_type == VMA_TYPE_FILE && vma->vm_file_len == old_size)
         vma->vm_file_len = new_size;
-    mgr->vm_used += grow;
+    if (!(vma->vm_flags & VMA_STACK))
+        mgr->vm_used += grow;
     return old_addr;
 }
 
