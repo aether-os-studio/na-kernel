@@ -221,6 +221,19 @@ void arch_context_free(arch_context_t *context) {
     }
 }
 
+void arch_context_save_interrupt_state(arch_context_t *context, bool enabled) {
+    if (!context)
+        return;
+
+    uint64_t sstatus;
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    if (enabled)
+        sstatus |= RISCV_SSTATUS_SIE;
+    else
+        sstatus &= ~RISCV_SSTATUS_SIE;
+    context->kernel_sstatus = sstatus;
+}
+
 void __switch_to(task_t *prev, task_t *next) {
     riscv64_cpu_local_t *local = riscv64_get_cpu_local();
     if (local) {

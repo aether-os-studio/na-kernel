@@ -119,6 +119,7 @@ void arch_context_init(arch_context_t *context, uint64_t page_table_addr,
 void arch_context_copy(arch_context_t *dst, arch_context_t *src, uint64_t stack,
                        uint64_t clone_flags);
 void arch_context_free(arch_context_t *context);
+void arch_context_save_interrupt_state(arch_context_t *context, bool enabled);
 void __switch_to(task_t *prev, task_t *next);
 task_t *arch_get_current();
 void arch_set_current(task_t *current);
