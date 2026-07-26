@@ -122,8 +122,9 @@ uint64_t get_arch_page_table_flags(uint64_t flags) {
 
     if (flags & PT_FLAG_R)
         attr |= ARCH_PT_FLAG_READ;
+    /* RISC-V 不允许 R=0、W=1 的叶子页表项，写映射必须同时可读。 */
     if (flags & PT_FLAG_W)
-        attr |= ARCH_PT_FLAG_WRITE;
+        attr |= ARCH_PT_FLAG_READ | ARCH_PT_FLAG_WRITE;
     if (flags & PT_FLAG_X)
         attr |= ARCH_PT_FLAG_EXEC;
     if (flags & PT_FLAG_U)
