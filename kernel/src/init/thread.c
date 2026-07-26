@@ -10,6 +10,7 @@
 #include <drivers/fb.h>
 #include <drivers/drm/drm.h>
 #include <drivers/virtio/virtio.h>
+#include <irq/softirq.h>
 
 extern void acpi_init_after_pci();
 
@@ -80,6 +81,13 @@ void init_thread(uint64_t arg) {
     printk("System initialized, ready to go to userland.\n");
 
     current_task->nice = NORMAL_PRIORITY;
+
+    /* 进入用户态前处理初始化阶段积压的定时器和延迟任务。 */
+    schedule(SCHED_FLAG_YIELD);
+    if (softirq_has_pending()) {
+        softirq_handle_pending();
+    }
+    schedule(SCHED_FLAG_YIELD);
 
     const char *argvs[2];
     memset(argvs, 0, sizeof(argvs));
