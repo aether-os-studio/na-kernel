@@ -2426,8 +2426,13 @@ int virtio_gpu_init(virtio_driver_t *driver) {
 
     printk("virtio_gpu: initialized %ux%u scanout %u\n", gpu->width,
            gpu->height, gpu->scanout_id);
+#if defined(__riscv)
+    /* RISC-V 在 PCI 探测期间创建轮询线程会引发调度竞态。 */
+    printk("virtio_gpu: display hotplug polling disabled on RISC-V\n");
+#else
     task_create("virtio_gpu", virtio_gpu_display_worker, (uint64_t)gpu,
                 KTHREAD_PRIORITY);
+#endif
     return 0;
 }
 
