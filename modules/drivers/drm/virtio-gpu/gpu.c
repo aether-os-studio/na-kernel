@@ -1184,7 +1184,6 @@ static void virtio_gpu_drm_close(drm_device_t *drm_dev, drm_file_t *file) {
 static int virtio_gpu_drm_create_dumb(drm_device_t *drm_dev,
                                       struct drm_mode_create_dumb *args,
                                       fd_t *fd) {
-    (void)fd;
     virtio_gpu_device_t *gpu = drm_dev->data;
     if (!gpu || !args || args->width == 0 || args->height == 0) {
         return -EINVAL;
@@ -1226,13 +1225,17 @@ static int virtio_gpu_drm_create_dumb(drm_device_t *drm_dev,
         return ret;
     }
 
+    virtio_gpu_file_t *vf = virtio_gpu_file_from_fd(fd);
+    if (vf) {
+        virtio_gpu_file_track_handle(vf, bo->handle);
+    }
+
     args->handle = bo->handle;
     return 0;
 }
 
 static int virtio_gpu_drm_destroy_dumb(drm_device_t *drm_dev, uint32_t handle,
                                        fd_t *fd) {
-    (void)fd;
     virtio_gpu_device_t *gpu = drm_dev->data;
     uint32_t idx = 0;
 
@@ -1244,6 +1247,11 @@ static int virtio_gpu_drm_destroy_dumb(drm_device_t *drm_dev, uint32_t handle,
     virtio_gpu_buffer_t *bo = &gpu->buffers[idx];
     if (bo->kind != VIRTIO_GPU_OBJECT_DUMB_2D) {
         return -EINVAL;
+    }
+
+    virtio_gpu_file_t *vf = virtio_gpu_file_from_fd(fd);
+    if (vf) {
+        virtio_gpu_file_untrack_handle(vf, handle);
     }
 
     if (--bo->refcount > 0) {
@@ -2418,8 +2426,13 @@ int virtio_gpu_init(virtio_driver_t *driver) {
 
     printk("virtio_gpu: initialized %ux%u scanout %u\n", gpu->width,
            gpu->height, gpu->scanout_id);
+#if defined(__riscv)
+    /* RISC-V 在 PCI 探测期间创建轮询线程会引发调度竞态。 */
+    printk("virtio_gpu: display hotplug polling disabled on RISC-V\n");
+#else
     task_create("virtio_gpu", virtio_gpu_display_worker, (uint64_t)gpu,
                 KTHREAD_PRIORITY);
+#endif
     return 0;
 }
 

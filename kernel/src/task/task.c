@@ -2819,6 +2819,11 @@ void schedule(uint64_t sched_flags) {
     bool state = arch_interrupt_enabled();
     task_t *prev = current_task;
 
+#if defined(__riscv)
+    if (prev && prev->arch_context)
+        arch_context_save_interrupt_state(prev->arch_context, state);
+#endif
+
     arch_disable_interrupt();
 
     if (prev->preempt_count) {

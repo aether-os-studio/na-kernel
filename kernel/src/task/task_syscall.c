@@ -3377,7 +3377,11 @@ static uint64_t sys_clone_internal(struct pt_regs *regs, uint64_t flags,
         }
     }
 
+#if defined(__riscv)
+    child->cpu_id = self->cpu_id;
+#else
     child->cpu_id = alloc_cpu_id();
+#endif
 
     void *kernel_stack_base = alloc_frames_bytes(STACK_SIZE);
     if (!kernel_stack_base)

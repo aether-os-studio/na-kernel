@@ -592,21 +592,39 @@ static ssize_t pipefs_read(struct vfs_file *file, void *buf, size_t count,
                            loff_t *ppos) {
     char *out = (char *)buf;
     size_t readn = 0;
+    bool kernel_io = (file->f_mode & VFS_FMODE_KERNEL_IO) != 0;
+    char *bounce = NULL;
 
     (void)ppos;
     if (!count)
         return 0;
 
+    if (!kernel_io) {
+        bounce = malloc(MIN(count, (size_t)PAGE_SIZE));
+        if (!bounce)
+            return -ENOMEM;
+    }
+
     while (readn < count) {
-        ssize_t ret =
-            pipe_read_inner(file, out + readn, count - readn, readn == 0);
-        if (ret < 0)
+        size_t chunk = MIN(count - readn, (size_t)PAGE_SIZE);
+        ssize_t ret = pipe_read_inner(file, kernel_io ? out + readn : bounce,
+                                      chunk, readn == 0);
+        if (ret < 0) {
+            free(bounce);
             return readn ? (ssize_t)readn : ret;
+        }
         if (ret == 0)
             break;
+
+        if (!kernel_io &&
+            copy_to_user(out + readn, bounce, (size_t)ret)) {
+            free(bounce);
+            return readn ? (ssize_t)readn : -EFAULT;
+        }
         readn += (size_t)ret;
     }
 
+    free(bounce);
     return (ssize_t)readn;
 }
 
@@ -671,18 +689,39 @@ static ssize_t pipefs_write(struct vfs_file *file, const void *buf,
     const char *data = (const char *)buf;
     size_t written = 0;
     bool atomic = count <= PIPE_ATOMIC_MAX;
+    bool kernel_io = (file->f_mode & VFS_FMODE_KERNEL_IO) != 0;
+    char *bounce = NULL;
 
     (void)ppos;
+    if (!kernel_io && count) {
+        bounce = malloc(MIN(count, (size_t)PAGE_SIZE));
+        if (!bounce)
+            return -ENOMEM;
+    }
+
     while (written < count) {
-        ssize_t ret = pipe_write_inner(file, data + written, count - written,
-                                       atomic, true);
-        if (ret < 0)
+        size_t chunk = MIN(count - written, (size_t)PAGE_SIZE);
+        const void *src = data + written;
+
+        if (!kernel_io) {
+            if (copy_from_user(bounce, src, chunk)) {
+                free(bounce);
+                return written ? (ssize_t)written : -EFAULT;
+            }
+            src = bounce;
+        }
+
+        ssize_t ret = pipe_write_inner(file, src, chunk, atomic, true);
+        if (ret < 0) {
+            free(bounce);
             return written ? (ssize_t)written : ret;
+        }
         if (ret == 0)
             break;
         written += (size_t)ret;
     }
 
+    free(bounce);
     return (ssize_t)written;
 }
 
