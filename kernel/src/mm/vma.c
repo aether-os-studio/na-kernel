@@ -2,6 +2,8 @@
 #include <mm/vma.h>
 
 static inline unsigned long vma_len(const vma_t *vma) {
+    if (!vma || vma->vm_flags & VMA_STACK)
+        return 0;
     return vma->vm_end - vma->vm_start;
 }
 

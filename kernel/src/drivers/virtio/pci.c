@@ -1,6 +1,8 @@
 // Copyright (C) 2025-2026  lihanrui2913
 #include "pci.h"
 
+#include <task/task.h>
+
 extern virtio_driver_op_t virtio_pci_driver_op;
 
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
@@ -439,6 +441,35 @@ void virtio_pci_set_interrupt_handler(void *data,
     spin_unlock(&pci->irq_lock);
 }
 
+static uint64_t virtio_pci_interrupt_seq(void *data) {
+    virtio_pci_device_t *pci = data;
+    return pci ? __atomic_load_n(&pci->irq_seq, __ATOMIC_ACQUIRE) : 0;
+}
+
+static int virtio_pci_wait_interrupt(void *data, uint64_t observed_seq,
+                                     int64_t timeout_ns) {
+    virtio_pci_device_t *pci = data;
+    if (!pci || !pci->irq_enabled || !current_task)
+        return -ENOTSUP;
+
+    wait_queue_entry_t wait;
+    task_prepare_block(current_task);
+    wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+    wait_queue_add(&pci->irq_wait, &wait);
+
+    int result = EOK;
+    if (virtio_pci_interrupt_seq(pci) == observed_seq) {
+        result = task_block(current_task, TASK_BLOCKING, timeout_ns,
+                            "virtio_interrupt");
+    } else {
+        task_cancel_block_prepare(current_task);
+    }
+
+    wait_queue_remove(&pci->irq_wait, &wait);
+    task_cancel_block_prepare(current_task);
+    return result;
+}
+
 virtio_driver_op_t virtio_pci_driver_op = {
     .init = virtio_pci_init,
     .get_device_type = virtio_pci_get_device_type,
@@ -455,4 +486,6 @@ virtio_driver_op_t virtio_pci_driver_op = {
     .write_config_space = virtio_pci_write_config_space,
     .supports_interrupts = virtio_pci_supports_interrupts,
     .set_interrupt_handler = virtio_pci_set_interrupt_handler,
+    .interrupt_seq = virtio_pci_interrupt_seq,
+    .wait_interrupt = virtio_pci_wait_interrupt,
 };

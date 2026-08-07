@@ -3,8 +3,6 @@
 #include <libs/klibc.h>
 #include <libs/fdt/libfdt.h>
 
-#if !defined(__x86_64__)
-
 #define MAX_FDT_DRIVERS 256
 #define MAX_FDT_DEVICES 256
 
@@ -35,5 +33,3 @@ extern int fdt_device_count;
 
 void fdt_init();
 int regist_fdt_driver(fdt_driver_t *driver);
-
-#endif

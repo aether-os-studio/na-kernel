@@ -2,9 +2,6 @@
 #include <drivers/logger.h>
 #include <drivers/fdt/fdt.h>
 #include <mm/mm.h>
-#include <drivers/fdt/fdt.h>
-
-#if !defined(__x86_64__)
 
 fdt_driver_t *fdt_drivers[MAX_FDT_DRIVERS];
 int fdt_driver_count = 0;
@@ -106,5 +103,3 @@ void fdt_init() {
         }
     }
 }
-
-#endif

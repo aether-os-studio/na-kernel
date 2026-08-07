@@ -16,8 +16,11 @@ static size_t loaded_module_symbol_capacity = 0;
 
 static void *find_symbol_address(const char *symbol_name, Elf64_Ehdr *ehdr,
                                  uint64_t offset);
+static dlfunc_t *find_kernel_func(const char *name);
 static bool get_elf_symbol_table(Elf64_Ehdr *ehdr, Elf64_Sym **symtab,
                                  char **strtab, size_t *num_symbols);
+static bool get_elf_section(module_t *module, const char *section_name,
+                            const char **data, size_t *size);
 static bool elf_symbol_is_exported(const Elf64_Sym *sym);
 static bool elf_symbol_can_describe_ip(const Elf64_Sym *sym);
 static bool module_symbol_can_describe_ip(const module_symbol_t *sym);
@@ -30,18 +33,12 @@ static bool update_symbol_lookup_result(symbol_lookup_result_t *result,
                                         bool exact_match);
 
 typedef struct {
-    const char **exports;
-    size_t export_count;
-    size_t export_capacity;
-    const char **imports;
-    size_t import_count;
-    size_t import_capacity;
     size_t *deps;
     size_t dep_count;
     size_t dep_capacity;
     bool scan_ok;
-    bool has_missing_provider;
-    bool has_ambiguous_provider;
+    bool has_missing_dependency;
+    bool has_ambiguous_dependency;
 } module_plan_t;
 
 typedef struct {
@@ -191,13 +188,19 @@ static void *lookup_kernel_symbol_by_name(const char *name) {
     return NULL;
 }
 
-static module_symbol_t *find_module_symbol(const char *name) {
+static module_symbol_t *find_module_symbol(const char *module_name,
+                                           const char *name) {
+    if (module_name == NULL || name == NULL) {
+        return NULL;
+    }
+
     for (size_t i = 0; i < loaded_module_symbol_count; i++) {
         if (!loaded_module_symbols[i].exported) {
             continue;
         }
 
-        if (strcmp(loaded_module_symbols[i].name, name) == 0) {
+        if (strcmp(loaded_module_symbols[i].module_name, module_name) == 0 &&
+            strcmp(loaded_module_symbols[i].name, name) == 0) {
             return &loaded_module_symbols[i];
         }
     }
@@ -238,16 +241,9 @@ static bool register_module_symbol(const char *module_name, const char *name,
         return true;
     }
 
-    if (exported && find_module_symbol(name) != NULL) {
+    if (exported && find_module_symbol(module_name, name) != NULL) {
         serial_fprintk("Skipping duplicate module symbol %s from %s\n", name,
                        module_name);
-        return true;
-    }
-
-    if (exported && lookup_kernel_symbol_by_name(name) != NULL) {
-        serial_fprintk(
-            "Skipping module symbol %s from %s due to kernel conflict\n", name,
-            module_name);
         return true;
     }
 
@@ -317,26 +313,57 @@ static bool get_elf_symbol_table(Elf64_Ehdr *ehdr, Elf64_Sym **symtab,
     return true;
 }
 
-static bool ensure_string_list_capacity(const char ***items, size_t *capacity,
-                                        size_t wanted) {
-    if (wanted <= *capacity) {
-        return true;
-    }
-
-    size_t new_capacity = *capacity ? *capacity * 2 : 16;
-    while (new_capacity < wanted) {
-        new_capacity *= 2;
-    }
-
-    const char **new_items =
-        realloc((void *)*items, new_capacity * sizeof(**items));
-    if (new_items == NULL) {
+static bool get_elf_section(module_t *module, const char *section_name,
+                            const char **data, size_t *size) {
+    if (module == NULL || section_name == NULL || data == NULL ||
+        size == NULL || module->data == NULL ||
+        module->size < sizeof(Elf64_Ehdr)) {
         return false;
     }
 
-    *items = new_items;
-    *capacity = new_capacity;
-    return true;
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)module->data;
+    if (ehdr->e_shentsize != sizeof(Elf64_Shdr) || ehdr->e_shnum == 0 ||
+        ehdr->e_shstrndx >= ehdr->e_shnum || ehdr->e_shoff > module->size ||
+        (size_t)ehdr->e_shnum >
+            (module->size - ehdr->e_shoff) / sizeof(Elf64_Shdr)) {
+        return false;
+    }
+
+    Elf64_Shdr *shdrs = (Elf64_Shdr *)(module->data + ehdr->e_shoff);
+    Elf64_Shdr *shstr = &shdrs[ehdr->e_shstrndx];
+    if (shstr->sh_offset > module->size ||
+        shstr->sh_size > module->size - shstr->sh_offset) {
+        return false;
+    }
+
+    const char *section_names = (const char *)module->data + shstr->sh_offset;
+    for (size_t i = 0; i < ehdr->e_shnum; i++) {
+        Elf64_Shdr *section = &shdrs[i];
+        if (section->sh_name >= shstr->sh_size) {
+            return false;
+        }
+
+        const char *name = section_names + section->sh_name;
+        size_t remaining = shstr->sh_size - section->sh_name;
+        if (strnlen(name, remaining) == remaining) {
+            return false;
+        }
+
+        if (strcmp(name, section_name) != 0) {
+            continue;
+        }
+
+        if (section->sh_offset > module->size ||
+            section->sh_size > module->size - section->sh_offset) {
+            return false;
+        }
+
+        *data = (const char *)module->data + section->sh_offset;
+        *size = section->sh_size;
+        return true;
+    }
+
+    return false;
 }
 
 static bool ensure_index_list_capacity(size_t **items, size_t *capacity,
@@ -361,30 +388,31 @@ static bool ensure_index_list_capacity(size_t **items, size_t *capacity,
     return true;
 }
 
-static bool string_list_contains(const char *const *items, size_t count,
-                                 const char *value) {
-    for (size_t i = 0; i < count; i++) {
-        if (strcmp(items[i], value) == 0) {
+static bool append_module_dependency(module_t *module, const char *name) {
+    if (module == NULL || name == NULL || *name == '\0') {
+        return false;
+    }
+
+    for (size_t i = 0; i < module->dependency_count; i++) {
+        if (strcmp(module->dependencies[i], name) == 0) {
             return true;
         }
     }
 
-    return false;
-}
-
-static bool append_unique_string(const char ***items, size_t *count,
-                                 size_t *capacity, const char *value) {
-    if (value == NULL || *value == '\0' ||
-        string_list_contains(*items, *count, value)) {
-        return true;
-    }
-
-    if (!ensure_string_list_capacity(items, capacity, *count + 1)) {
+    char **dependencies =
+        realloc(module->dependencies,
+                (module->dependency_count + 1) * sizeof(*dependencies));
+    if (dependencies == NULL) {
         return false;
     }
 
-    (*items)[*count] = value;
-    (*count)++;
+    module->dependencies = dependencies;
+    module->dependencies[module->dependency_count] = strdup(name);
+    if (module->dependencies[module->dependency_count] == NULL) {
+        return false;
+    }
+
+    module->dependency_count++;
     return true;
 }
 
@@ -414,10 +442,6 @@ static bool append_unique_index(size_t **items, size_t *count, size_t *capacity,
     return true;
 }
 
-static bool kernel_can_resolve_symbol(const char *name) {
-    return lookup_kernel_symbol_by_name(name) != NULL;
-}
-
 static bool elf_symbol_is_exported(const Elf64_Sym *sym) {
     if (sym == NULL || sym->st_name == 0 || sym->st_shndx == SHN_UNDEF) {
         return false;
@@ -442,15 +466,6 @@ static bool elf_symbol_is_exported(const Elf64_Sym *sym) {
     default:
         return false;
     }
-}
-
-static bool elf_symbol_is_imported(const Elf64_Sym *sym) {
-    if (sym == NULL || sym->st_name == 0 || sym->st_shndx != SHN_UNDEF) {
-        return false;
-    }
-
-    uint8_t bind = ELF64_ST_BIND(sym->st_info);
-    return bind == STB_GLOBAL || bind == STB_WEAK;
 }
 
 static bool elf_symbol_can_describe_ip(const Elf64_Sym *sym) {
@@ -542,13 +557,11 @@ static void free_module_plan(module_plan_t *plan) {
         return;
     }
 
-    free((void *)plan->exports);
-    free((void *)plan->imports);
     free(plan->deps);
     memset(plan, 0, sizeof(*plan));
 }
 
-static bool scan_module_symbols(module_t *module, module_plan_t *plan) {
+static bool scan_module_metadata(module_t *module, module_plan_t *plan) {
     if (module == NULL || plan == NULL) {
         return false;
     }
@@ -566,36 +579,45 @@ static bool scan_module_symbols(module_t *module, module_plan_t *plan) {
         return false;
     }
 
-    Elf64_Sym *symtab = NULL;
-    char *strtab = NULL;
-    size_t num_symbols = 0;
-
-    if (!get_elf_symbol_table(ehdr, &symtab, &strtab, &num_symbols)) {
-        serial_fprintk("Cannot find symbol table in module %s\n",
-                       module->module_name);
+    const char *module_name = NULL;
+    size_t module_name_size = 0;
+    if (!get_elf_section(module, MODULE_NAME_SECTION, &module_name,
+                         &module_name_size) ||
+        module_name_size < 2) {
+        serial_fprintk("Module %s has no build-generated name metadata\n",
+                       module->path);
         return false;
     }
 
-    for (size_t i = 0; i < num_symbols; i++) {
-        Elf64_Sym *sym = &symtab[i];
-        const char *sym_name = &strtab[sym->st_name];
+    size_t name_length = strnlen(module_name, module_name_size);
+    if (name_length == 0 || name_length + 1 != module_name_size ||
+        name_length >= sizeof(module->module_name)) {
+        serial_fprintk("Module %s has invalid name metadata\n", module->path);
+        return false;
+    }
+    memcpy(module->module_name, module_name, name_length + 1);
 
-        if (elf_symbol_is_exported(sym)) {
-            if (!strcmp(sym_name, "dlmain")) {
-                continue;
-            }
-
-            if (!append_unique_string(&plan->exports, &plan->export_count,
-                                      &plan->export_capacity, sym_name)) {
+    const char *dependencies = NULL;
+    size_t dependencies_size = 0;
+    if (get_elf_section(module, MODULE_DEPS_SECTION, &dependencies,
+                        &dependencies_size)) {
+        size_t cursor = 0;
+        while (cursor < dependencies_size) {
+            const char *dependency = dependencies + cursor;
+            size_t remaining = dependencies_size - cursor;
+            size_t dependency_length = strnlen(dependency, remaining);
+            if (dependency_length == 0 || dependency_length == remaining) {
+                serial_fprintk("Module %s has invalid dependency metadata\n",
+                               module->module_name);
                 return false;
             }
-        }
 
-        if (elf_symbol_is_imported(sym)) {
-            if (!append_unique_string(&plan->imports, &plan->import_count,
-                                      &plan->import_capacity, sym_name)) {
+            if (!append_module_dependency(module, dependency)) {
+                serial_fprintk("Cannot record dependency %s -> %s\n",
+                               module->module_name, dependency);
                 return false;
             }
+            cursor += dependency_length + 1;
         }
     }
 
@@ -603,10 +625,10 @@ static bool scan_module_symbols(module_t *module, module_plan_t *plan) {
     return true;
 }
 
-static size_t count_symbol_providers(module_plan_t *plans, size_t module_count,
-                                     const char *symbol_name,
-                                     size_t requester_index,
-                                     size_t *provider_index) {
+static size_t count_named_modules(module_t *modules, module_plan_t *plans,
+                                  size_t module_count, const char *module_name,
+                                  size_t requester_index,
+                                  size_t *provider_index) {
     size_t matches = 0;
 
     for (size_t i = 0; i < module_count; i++) {
@@ -614,8 +636,7 @@ static size_t count_symbol_providers(module_plan_t *plans, size_t module_count,
             continue;
         }
 
-        if (!string_list_contains(plans[i].exports, plans[i].export_count,
-                                  symbol_name)) {
+        if (strcmp(modules[i].module_name, module_name) != 0) {
             continue;
         }
 
@@ -635,39 +656,57 @@ static void resolve_module_dependencies(module_t *modules, module_plan_t *plans,
             continue;
         }
 
-        for (size_t j = 0; j < plans[i].import_count; j++) {
-            const char *symbol_name = plans[i].imports[j];
-
-            if (kernel_can_resolve_symbol(symbol_name)) {
-                continue;
+        for (size_t j = i + 1; j < module_count; j++) {
+            if (plans[j].scan_ok &&
+                strcmp(modules[i].module_name, modules[j].module_name) == 0) {
+                serial_fprintk("Duplicate module name %s in %s and %s\n",
+                               modules[i].module_name, modules[i].path,
+                               modules[j].path);
+                plans[i].has_ambiguous_dependency = true;
+                plans[j].has_ambiguous_dependency = true;
             }
+        }
+    }
 
+    for (size_t i = 0; i < module_count; i++) {
+        if (!plans[i].scan_ok) {
+            continue;
+        }
+
+        for (size_t j = 0; j < modules[i].dependency_count; j++) {
+            const char *dependency_name = modules[i].dependencies[j];
             size_t provider_index = 0;
-            size_t provider_count = count_symbol_providers(
-                plans, module_count, symbol_name, i, &provider_index);
+            size_t provider_count =
+                count_named_modules(modules, plans, module_count,
+                                    dependency_name, i, &provider_index);
 
             if (provider_count == 1) {
                 if (!append_unique_index(&plans[i].deps, &plans[i].dep_count,
                                          &plans[i].dep_capacity,
                                          provider_index)) {
                     serial_fprintk("Cannot record dependency %s -> %s\n",
-                                   modules[i].module_name,
-                                   modules[provider_index].module_name);
-                    plans[i].has_missing_provider = true;
+                                   modules[i].module_name, dependency_name);
+                    plans[i].has_missing_dependency = true;
                 }
                 continue;
             }
 
             if (provider_count == 0) {
-                serial_fprintk("Module %s misses provider for symbol %s\n",
-                               modules[i].module_name, symbol_name);
-                plans[i].has_missing_provider = true;
+                if (strcmp(modules[i].module_name, dependency_name) == 0) {
+                    serial_fprintk(
+                        "Module %s declares itself as a dependency\n",
+                        modules[i].module_name);
+                } else {
+                    serial_fprintk("Module %s misses dependency %s\n",
+                                   modules[i].module_name, dependency_name);
+                }
+                plans[i].has_missing_dependency = true;
                 continue;
             }
 
-            serial_fprintk("Module %s has ambiguous providers for symbol %s\n",
-                           modules[i].module_name, symbol_name);
-            plans[i].has_ambiguous_provider = true;
+            serial_fprintk("Module %s has ambiguous dependency %s\n",
+                           modules[i].module_name, dependency_name);
+            plans[i].has_ambiguous_dependency = true;
         }
     }
 }
@@ -678,8 +717,8 @@ static bool module_dependencies_ready(const module_plan_t *plan,
         return false;
     }
 
-    if (!plan->scan_ok || plan->has_missing_provider ||
-        plan->has_ambiguous_provider) {
+    if (!plan->scan_ok || plan->has_missing_dependency ||
+        plan->has_ambiguous_dependency) {
         return false;
     }
 
@@ -692,9 +731,42 @@ static bool module_dependencies_ready(const module_plan_t *plan,
     return true;
 }
 
-static bool resolve_symbol_address(Elf64_Sym *symtab, char *strtab,
-                                   uint32_t sym_idx, uint64_t offset,
-                                   uint64_t *addr) {
+static dlfunc_t *find_scoped_func(module_t *module, const char *name) {
+    dlfunc_t *kernel_func = find_kernel_func(name);
+    if (kernel_func != NULL) {
+        return kernel_func;
+    }
+
+    module_symbol_t *match = NULL;
+    for (size_t i = 0; i < module->dependency_count; i++) {
+        module_symbol_t *candidate =
+            find_module_symbol(module->dependencies[i], name);
+        if (candidate == NULL) {
+            continue;
+        }
+
+        if (match != NULL) {
+            serial_fprintk(
+                "Module %s has ambiguous symbol %s in dependencies %s and %s\n",
+                module->module_name, name, match->module_name,
+                candidate->module_name);
+            return NULL;
+        }
+        match = candidate;
+    }
+
+    if (match == NULL) {
+        return NULL;
+    }
+
+    resolved_func.name = match->name;
+    resolved_func.addr = (void *)match->addr;
+    return &resolved_func;
+}
+
+static bool resolve_symbol_address(module_t *module, Elf64_Sym *symtab,
+                                   char *strtab, uint32_t sym_idx,
+                                   uint64_t offset, uint64_t *addr) {
     if (symtab == NULL || strtab == NULL || addr == NULL) {
         return false;
     }
@@ -703,12 +775,14 @@ static bool resolve_symbol_address(Elf64_Sym *symtab, char *strtab,
     char *sym_name = &strtab[sym->st_name];
 
     if (sym->st_shndx == SHN_UNDEF) {
-        dlfunc_t *func = find_func(sym_name);
+        dlfunc_t *func = find_scoped_func(module, sym_name);
         if (func != NULL) {
             *addr = (uint64_t)func->addr;
             return true;
         }
-        serial_fprintk("Cannot resolve symbol: %s\n", sym_name);
+        serial_fprintk("Module %s cannot resolve symbol %s from the kernel or "
+                       "its declared dependencies\n",
+                       module->module_name, sym_name);
         return false;
     }
 
@@ -721,9 +795,9 @@ static bool resolve_symbol_address(Elf64_Sym *symtab, char *strtab,
     return true;
 }
 
-static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
-                               char *strtab, size_t jmprel_sz,
-                               uint64_t offset) {
+static bool handle_relocations(module_t *module, Elf64_Rela *rela_start,
+                               Elf64_Sym *symtab, char *strtab,
+                               size_t jmprel_sz, uint64_t offset) {
     if (!rela_start || jmprel_sz == 0) {
         return true;
     }
@@ -742,7 +816,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
 #if defined(__x86_64__)
         if (type == R_X86_64_JUMP_SLOT || type == R_X86_64_GLOB_DAT) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -754,7 +828,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
             *target_addr = offset + rela->r_addend;
         } else if (type == R_X86_64_64) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -766,7 +840,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
 #elif defined(__aarch64__)
         if (type == R_AARCH64_JUMP_SLOT || type == R_AARCH64_GLOB_DAT) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -778,7 +852,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
             *target_addr = offset + rela->r_addend;
         } else if (type == R_AARCH64_ABS64) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -798,7 +872,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
 #elif defined(__riscv) && (__riscv_xlen == 64)
         if (type == R_RISCV_JUMP_SLOT) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -810,7 +884,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
             *target_addr = offset + rela->r_addend;
         } else if (type == R_RISCV_64) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -822,7 +896,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
 #elif defined(__loongarch64__)
         if (type == R_LARCH_JUMP_SLOT) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -834,7 +908,7 @@ static bool handle_relocations(Elf64_Rela *rela_start, Elf64_Sym *symtab,
             *target_addr = offset + rela->r_addend;
         } else if (type == R_LARCH_64) {
             uint64_t sym_addr = 0;
-            if (!resolve_symbol_address(symtab, strtab, sym_idx, offset,
+            if (!resolve_symbol_address(module, symtab, strtab, sym_idx, offset,
                                         &sym_addr)) {
                 serial_fprintk("Failed relocating %s at %p\n", sym_name,
                                target_addr);
@@ -894,8 +968,8 @@ static void *find_symbol_address(const char *symbol_name, Elf64_Ehdr *ehdr,
     return NULL;
 }
 
-static dlinit_t load_dynamic(Elf64_Phdr *phdrs, Elf64_Ehdr *ehdr,
-                             uint64_t offset) {
+static dlinit_t load_dynamic(module_t *module, Elf64_Phdr *phdrs,
+                             Elf64_Ehdr *ehdr, uint64_t offset) {
     Elf64_Dyn *dyn_entry = NULL;
     for (size_t i = 0; i < ehdr->e_phnum; i++) {
         if (phdrs[i].p_type == PT_DYNAMIC) {
@@ -939,12 +1013,13 @@ static dlinit_t load_dynamic(Elf64_Phdr *phdrs, Elf64_Ehdr *ehdr,
         dyn_entry++;
     }
 
-    if (!handle_relocations(rel, symtab, strtab, relsz, offset)) {
+    if (!handle_relocations(module, rel, symtab, strtab, relsz, offset)) {
         serial_fprintk("Failed to handle RELA relocations.\n");
         return NULL;
     }
 
-    if (!handle_relocations(jmprel, symtab, strtab, jmprel_sz, offset)) {
+    if (!handle_relocations(module, jmprel, symtab, strtab, jmprel_sz,
+                            offset)) {
         serial_fprintk("Failed to handle PLT relocations.\n");
         return NULL;
     }
@@ -992,7 +1067,7 @@ bool dlinker_load(module_t *module) {
         kernel_modules_load_offset += PADDING_UP(module->load_size, PAGE_SIZE);
     }
 
-    dlinit_t dlinit = load_dynamic(phdrs, ehdr, module->load_base);
+    dlinit_t dlinit = load_dynamic(module, phdrs, ehdr, module->load_base);
     if (dlinit == NULL) {
         return false;
     }
@@ -1007,20 +1082,13 @@ bool dlinker_load(module_t *module) {
     return true;
 }
 
-dlfunc_t *find_func(const char *name) {
+static dlfunc_t *find_kernel_func(const char *name) {
     if (name == NULL) {
         return NULL;
     }
 
     if (strcmp(name, __printf.name) == 0) {
         return &__printf;
-    }
-
-    module_symbol_t *module_symbol = find_module_symbol(name);
-    if (module_symbol != NULL) {
-        resolved_func.name = module_symbol->name;
-        resolved_func.addr = (void *)module_symbol->addr;
-        return &resolved_func;
     }
 
     void *kernel_symbol = lookup_kernel_symbol_by_name(name);
@@ -1123,46 +1191,49 @@ void dlinker_init() {
 
     module_plan_t *plans = calloc(module_count, sizeof(*plans));
     bool *loaded_flags = calloc(module_count, sizeof(*loaded_flags));
-    if (plans == NULL || loaded_flags == NULL) {
+    bool *failed_flags = calloc(module_count, sizeof(*failed_flags));
+    if (plans == NULL || loaded_flags == NULL || failed_flags == NULL) {
         serial_fprintk("Cannot allocate module dependency planner\n");
         free(plans);
         free(loaded_flags);
+        free(failed_flags);
         plans = NULL;
         loaded_flags = NULL;
+        failed_flags = NULL;
     }
 
-    if (plans != NULL && loaded_flags != NULL) {
+    if (plans != NULL && loaded_flags != NULL && failed_flags != NULL) {
         for (size_t i = 0; i < module_count; i++) {
-            if (!scan_module_symbols(&modules[i], &plans[i])) {
-                serial_fprintk("Skipping dependency scan for module %s\n",
-                               modules[i].module_name);
+            if (!scan_module_metadata(&modules[i], &plans[i])) {
+                serial_fprintk("Skipping metadata scan for module %s\n",
+                               modules[i].path);
             }
         }
 
         resolve_module_dependencies(modules, plans, module_count);
 
-        size_t loaded_count = 0;
+        size_t finished_count = 0;
         bool progress = true;
 
-        while (loaded_count < module_count && progress) {
+        while (finished_count < module_count && progress) {
             progress = false;
 
             for (size_t i = 0; i < module_count; i++) {
-                if (loaded_flags[i] ||
+                if (loaded_flags[i] || failed_flags[i] ||
                     !module_dependencies_ready(&plans[i], loaded_flags)) {
                     continue;
                 }
 
                 if (dlinker_load(&modules[i])) {
                     loaded_flags[i] = true;
-                    loaded_count++;
-                    progress = true;
                 } else {
                     serial_fprintk(
                         "Module %s failed after dependency resolution\n",
                         modules[i].module_name);
-                    loaded_flags[i] = true;
+                    failed_flags[i] = true;
                 }
+                finished_count++;
+                progress = true;
             }
         }
 
@@ -1177,17 +1248,17 @@ void dlinker_init() {
                 continue;
             }
 
-            if (plans[i].has_missing_provider) {
+            if (plans[i].has_missing_dependency) {
                 serial_fprintk(
-                    "Module %s was not loaded: missing dependency provider\n",
+                    "Module %s was not loaded: missing declared dependency\n",
                     modules[i].module_name);
                 continue;
             }
 
-            if (plans[i].has_ambiguous_provider) {
-                serial_fprintk(
-                    "Module %s was not loaded: ambiguous dependency provider\n",
-                    modules[i].module_name);
+            if (plans[i].has_ambiguous_dependency) {
+                serial_fprintk("Module %s was not loaded: ambiguous module "
+                               "identity or dependency\n",
+                               modules[i].module_name);
                 continue;
             }
 
@@ -1205,10 +1276,17 @@ void dlinker_init() {
         if (modules[i].data != NULL) {
             free_frames_bytes(modules[i].data, modules[i].size);
         }
+
+        for (size_t j = 0; j < modules[i].dependency_count; j++) {
+            free(modules[i].dependencies[j]);
+        }
+        free(modules[i].dependencies);
+        free(modules[i].path);
     }
 
     free(plans);
     free(loaded_flags);
+    free(failed_flags);
     free(modules);
     vfs_close_file(modules_root);
 }

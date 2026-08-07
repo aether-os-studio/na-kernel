@@ -54,6 +54,9 @@ typedef struct virtio_driver_op {
     void (*set_interrupt_handler)(void *data,
                                   virtio_interrupt_handler_t handler,
                                   void *opaque);
+    uint64_t (*interrupt_seq)(void *data);
+    int (*wait_interrupt)(void *data, uint64_t observed_seq,
+                          int64_t timeout_ns);
 } virtio_driver_op_t;
 
 struct virtio_driver {
@@ -67,6 +70,7 @@ struct virtio_driver {
 struct virtio_device_driver {
     const char *name;
     virtio_device_type_t device_type;
+    void *data;
     int (*probe)(virtio_driver_t *driver);
     void (*remove)(virtio_driver_t *driver);
     void (*shutdown)(virtio_driver_t *driver);
@@ -93,6 +97,9 @@ uint32_t virtio_driver_read_config_u32(virtio_driver_t *driver,
 void virtio_driver_write_config_u32(virtio_driver_t *driver, uint32_t offset,
                                     uint32_t value);
 bool virtio_driver_supports_interrupts(virtio_driver_t *driver);
+uint64_t virtio_driver_interrupt_seq(virtio_driver_t *driver);
+int virtio_driver_wait_interrupt(virtio_driver_t *driver, uint64_t observed_seq,
+                                 int64_t timeout_ns);
 void virtio_driver_set_interrupt_handler(virtio_driver_t *driver,
                                          virtio_interrupt_handler_t handler,
                                          void *opaque);

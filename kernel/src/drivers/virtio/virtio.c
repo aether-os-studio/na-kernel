@@ -52,12 +52,13 @@ static int virtio_bind_device(virtio_driver_t *device,
         return -ENOENT;
     }
 
+    device->bound_driver = driver;
     int ret = driver->probe(device);
     if (ret == 0) {
-        device->bound_driver = driver;
         return 0;
     }
 
+    device->bound_driver = NULL;
     virtio_mark_failed(device);
     printk("virtio: %s probe failed for %s transport device type %u (ret=%d)\n",
            driver->name ? driver->name : "unnamed", device->transport_name,
@@ -270,6 +271,19 @@ bool virtio_driver_supports_interrupts(virtio_driver_t *driver) {
     if (!driver || !driver->op || !driver->op->supports_interrupts)
         return false;
     return driver->op->supports_interrupts(driver->data);
+}
+
+uint64_t virtio_driver_interrupt_seq(virtio_driver_t *driver) {
+    if (!driver || !driver->op || !driver->op->interrupt_seq)
+        return 0;
+    return driver->op->interrupt_seq(driver->data);
+}
+
+int virtio_driver_wait_interrupt(virtio_driver_t *driver, uint64_t observed_seq,
+                                 int64_t timeout_ns) {
+    if (!driver || !driver->op || !driver->op->wait_interrupt)
+        return -ENOTSUP;
+    return driver->op->wait_interrupt(driver->data, observed_seq, timeout_ns);
 }
 
 void virtio_driver_set_interrupt_handler(virtio_driver_t *driver,

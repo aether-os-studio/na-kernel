@@ -2850,10 +2850,6 @@ uint64_t sys_ioctl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 
     default:
         ret = vfs_ioctl_file(f, cmd, arg);
-        if (ret < 0 && (-ret != EBADF) && (-ret != EFAULT) &&
-            (-ret != EINVAL)) {
-            ret = -ENOTTY;
-        }
         break;
     }
 

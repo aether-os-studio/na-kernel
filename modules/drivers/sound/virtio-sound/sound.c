@@ -1,9 +1,14 @@
 #include "sound.h"
 
+#include <mod/module.h>
 #include <task/task.h>
+
+MODULE_DEPENDS("sound");
 
 #define VIRTIO_SOUND_MAX_STREAMS 32
 #define VIRTIO_SOUND_QUEUE_DEPTH SIZE
+#define VIRTIO_SOUND_RESPONSE_WATCHDOG_NS 10000000LL
+#define VIRTIO_SOUND_IDLE_POLL_NS 1000000LL
 
 typedef struct virtio_sound_tx_slot {
     bool active;
@@ -13,7 +18,6 @@ typedef struct virtio_sound_tx_slot {
     virtio_snd_pcm_status_t *status;
     snd_pcm_uframes_t frames;
 } virtio_sound_tx_slot_t;
-typedef virtio_sound_tx_slot_t virtio_sound_tx_slot_t;
 
 typedef struct virtio_sound_device virtio_sound_device_t;
 
@@ -25,7 +29,6 @@ typedef struct virtio_sound_stream {
     uint32_t tx_inflight;
     virtio_sound_tx_slot_t tx_slots[VIRTIO_SOUND_QUEUE_DEPTH];
 } virtio_sound_stream_t;
-typedef virtio_sound_stream_t virtio_sound_stream_t;
 
 struct virtio_sound_device {
     virtio_driver_t *driver;
@@ -34,13 +37,38 @@ struct virtio_sound_device {
     virtqueue_t *event_vq;
     virtqueue_t *tx_vq;
     virtqueue_t *rx_vq;
-    spinlock_t control_lock;
+    wait_mutex_t control_lock;
     spinlock_t tx_lock;
     uint32_t stream_count;
     virtio_sound_stream_t streams[VIRTIO_SOUND_MAX_STREAMS];
 };
 
-typedef struct virtio_sound_device virtio_sound_device_t;
+static uint16_t virtio_sound_control_wait_used(virtio_sound_device_t *dev,
+                                               uint32_t *used_len) {
+    for (;;) {
+        uint16_t used_idx = virt_queue_get_used_buf(dev->control_vq, used_len);
+        if (used_idx != 0xFFFF) {
+            return used_idx;
+        }
+
+        if (!current_task || !virtio_driver_supports_interrupts(dev->driver)) {
+            if (current_task) {
+                schedule(0);
+            } else {
+                arch_pause();
+            }
+            continue;
+        }
+
+        uint64_t observed_seq = virtio_driver_interrupt_seq(dev->driver);
+        used_idx = virt_queue_get_used_buf(dev->control_vq, used_len);
+        if (used_idx != 0xFFFF) {
+            return used_idx;
+        }
+        (void)virtio_driver_wait_interrupt(dev->driver, observed_seq,
+                                           VIRTIO_SOUND_RESPONSE_WATCHDOG_NS);
+    }
+}
 
 static int virtio_sound_validate(sound_pcm_substream_t *substream) {
     virtio_sound_stream_t *stream = substream ? substream->driver_data : NULL;
@@ -89,10 +117,10 @@ static int virtio_sound_ctl_send(virtio_sound_device_t *dev, const void *req,
     bufs[1].addr = (uint64_t)resp_buf;
     bufs[1].size = resp_size;
 
-    spin_lock(&dev->control_lock);
+    wait_mutex_lock(&dev->control_lock);
     desc_idx = virt_queue_add_buf(dev->control_vq, bufs, 2, writable);
     if (desc_idx == 0xFFFF) {
-        spin_unlock(&dev->control_lock);
+        wait_mutex_unlock(&dev->control_lock);
         ret = -EIO;
         goto out;
     }
@@ -100,12 +128,9 @@ static int virtio_sound_ctl_send(virtio_sound_device_t *dev, const void *req,
     virt_queue_submit_buf(dev->control_vq, desc_idx);
     virt_queue_notify(dev->driver, dev->control_vq);
 
-    while ((used_idx = virt_queue_get_used_buf(dev->control_vq, &used_len)) ==
-           0xFFFF) {
-        arch_pause();
-    }
+    used_idx = virtio_sound_control_wait_used(dev, &used_len);
     virt_queue_free_desc(dev->control_vq, used_idx);
-    spin_unlock(&dev->control_lock);
+    wait_mutex_unlock(&dev->control_lock);
 
     memcpy(resp, resp_buf, resp_size);
     if (((virtio_snd_hdr_t *)resp)->code != VIRTIO_SND_S_OK) {
@@ -593,6 +618,7 @@ static void virtio_sound_worker(uint64_t arg) {
     virtio_sound_device_t *dev = (virtio_sound_device_t *)arg;
 
     while (true) {
+        uint64_t observed_seq = virtio_driver_interrupt_seq(dev->driver);
         for (uint32_t i = 0; i < dev->stream_count; i++) {
             virtio_sound_stream_t *stream = &dev->streams[i];
             if (!stream->substream) {
@@ -603,7 +629,12 @@ static void virtio_sound_worker(uint64_t arg) {
             spin_unlock(&stream->substream->lock);
         }
 
-        task_block(current_task, TASK_BLOCKING, 1000000, "virtio_sound");
+        if (!current_task || !virtio_driver_supports_interrupts(dev->driver)) {
+            (void)task_block(current_task, TASK_BLOCKING,
+                             VIRTIO_SOUND_IDLE_POLL_NS, "virtio_sound");
+            continue;
+        }
+        (void)virtio_driver_wait_interrupt(dev->driver, observed_seq, -1);
     }
 }
 
@@ -629,7 +660,7 @@ int virtio_sound_init(virtio_driver_t *driver) {
     }
 
     dev->driver = driver;
-    spin_init(&dev->control_lock);
+    wait_mutex_init(&dev->control_lock);
     spin_init(&dev->tx_lock);
     dev->stream_count = MIN(cfg.streams, (uint32_t)VIRTIO_SOUND_MAX_STREAMS);
 

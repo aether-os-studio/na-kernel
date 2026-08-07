@@ -3,10 +3,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+    }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -19,7 +25,17 @@
       devShells = forAllSystems (
         system:
         let
-          pkgs = import nixpkgs { inherit system; };
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+
+          rustToolchain = pkgs.rust-bin.selectLatestNightlyWith (
+            toolchain:
+            toolchain.default.override {
+              extensions = [ "rust-src" ];
+            }
+          );
 
           toolchainWrappers = pkgs.runCommand "naos-toolchain-wrappers" { } ''
             mkdir -p "$out/bin"
@@ -105,6 +121,8 @@
               pkg-config
               perl
               python3
+              rust-bindgen
+              rustToolchain
               which
               xz
               toolchainWrappers

@@ -41,9 +41,7 @@ void init_thread(uint64_t arg) {
     pci_controller_init();
     virtio_bus_init();
 
-#if !defined(__x86_64__)
     fdt_init();
-#endif
 
     pidfd_init();
     mountfd_init();

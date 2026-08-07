@@ -821,10 +821,10 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_KCMP, (syscall_handle_t)sys_kcmp);
     // regist_syscall_handler(SYS_FINIT_MODULE,
     // (syscall_handle_t)sys_finit_module);
-    // regist_syscall_handler(SYS_SCHED_SETATTR,
-    // (syscall_handle_t)sys_sched_setattr);
-    // regist_syscall_handler(SYS_SCHED_GETATTR,
-    // (syscall_handle_t)sys_sched_getattr);
+    regist_syscall_handler(SYS_SCHED_SETATTR,
+                           (syscall_handle_t)dummy_syscall_handler);
+    regist_syscall_handler(SYS_SCHED_GETATTR,
+                           (syscall_handle_t)dummy_syscall_handler);
     regist_syscall_handler(SYS_RENAMEAT2, (syscall_handle_t)sys_renameat2);
     // regist_syscall_handler(SYS_SECCOMP, (syscall_handle_t)sys_seccomp);
     regist_syscall_handler(SYS_GETRANDOM, (syscall_handle_t)sys_getrandom);

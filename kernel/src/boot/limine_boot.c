@@ -306,7 +306,6 @@ uint64_t boot_get_system_table() {
                : 0;
 }
 
-#if !defined(__x86_64__)
 LIMINE_REQUEST static volatile struct limine_dtb_request dtb_request = {
     .id = LIMINE_DTB_REQUEST_ID,
     .revision = 0,
@@ -316,8 +315,6 @@ LIMINE_REQUEST static volatile struct limine_dtb_request dtb_request = {
 uint64_t boot_get_dtb() {
     return dtb_request.response ? (uint64_t)dtb_request.response->dtb_ptr : 0;
 }
-
-#endif
 
 #if defined(__riscv__)
 

@@ -7,10 +7,8 @@ all:
 	$(call PRINT_STEP,MKDIR,$(PROJECT_ROOT)/modules-$(ARCH))
 	$(Q)mkdir -p $(PROJECT_ROOT)/modules-$(ARCH)
 
-ifneq ($(BUILD_LINUX_DRIVERS), 0)
-	$(call PRINT_STEP,MAKE,modules/lcompat)
-	$(Q)$(MAKE) -C lcompat
-endif
+	$(call PRINT_STEP,MAKE,modules/na-std)
+	$(Q)$(MAKE) -C na-std
 
 	$(call PRINT_STEP,MAKE,modules/drivers)
 	$(Q)$(MAKE) -C drivers

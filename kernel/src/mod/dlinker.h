@@ -50,8 +50,6 @@ typedef struct symbol_lookup_result {
  */
 bool dlinker_load(module_t *module);
 
-dlfunc_t *find_func(const char *name);
-
 bool dlinker_lookup_symbol_by_addr(uint64_t addr,
                                    symbol_lookup_result_t *result);
 

@@ -1,0 +1,363 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <libs/errno.h>
+
+struct pci_device;
+typedef struct pci_device pci_device_t;
+typedef struct pci_device PciDevice;
+
+typedef struct na_spinlock {
+    uint8_t lock;
+    bool irq_state;
+} RawSpinLock;
+
+struct na_mutex;
+typedef struct na_mutex na_mutex_t;
+
+typedef struct na_acpi_table {
+    void *ptr;
+    size_t index;
+} UacpiTable;
+
+void *na_memory_allocate(uint64_t bytes);
+void na_memory_free(void *ptr, uint64_t bytes);
+void *na_heap_allocate(size_t bytes);
+void na_heap_free(void *ptr);
+uint64_t na_memory_physical_address(const void *ptr);
+void na_dma_sync_for_device(void *address, size_t size);
+void na_dma_sync_for_cpu(void *address, size_t size);
+int na_user_read(uint64_t address, void *destination, size_t size);
+int na_user_write(uint64_t address, const void *source, size_t size);
+void na_spin_lock(RawSpinLock *lock);
+void na_spin_unlock(RawSpinLock *lock);
+na_mutex_t *na_mutex_create(void);
+void na_mutex_destroy(na_mutex_t *mutex);
+void na_mutex_lock(na_mutex_t *mutex);
+void na_mutex_unlock(na_mutex_t *mutex);
+int na_acpi_table_find(const char signature[4], UacpiTable *table);
+void na_acpi_table_release(UacpiTable *table);
+
+typedef struct na_pci_device_info {
+    uint32_t class_code;
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t subsystem_vendor_id;
+    uint16_t subsystem_device_id;
+    uint16_t segment;
+    uint8_t revision_id;
+    uint8_t bus;
+    uint8_t slot;
+    uint8_t function;
+    uint8_t irq_line;
+    uint8_t irq_pin;
+} na_pci_device_info_t;
+typedef na_pci_device_info_t PciDeviceInfo;
+
+typedef struct na_pci_bar_info {
+    uint64_t address;
+    uint64_t size;
+    bool is_mmio;
+    bool prefetchable;
+} na_pci_bar_info_t;
+typedef na_pci_bar_info_t PciBarInfo;
+
+typedef struct na_pci_driver_ops {
+    void *context;
+    bool (*matches)(void *context, pci_device_t *device);
+    int (*probe)(void *context, pci_device_t *device);
+} na_pci_driver_ops_t;
+typedef na_pci_driver_ops_t PciDriverOps;
+
+void *na_mmio_map(uint64_t physical_address, size_t size);
+void na_log(const char *message);
+
+int na_pci_device_info(pci_device_t *device, na_pci_device_info_t *info);
+int na_pci_bar_info(pci_device_t *device, uint8_t index,
+                    na_pci_bar_info_t *info);
+int na_pci_config_read(pci_device_t *device, uint16_t offset, uint8_t width,
+                       uint32_t *value);
+int na_pci_config_write(pci_device_t *device, uint16_t offset, uint8_t width,
+                        uint32_t value);
+int na_pci_driver_register(const char *name, uint32_t class_id, int flags,
+                           const na_pci_driver_ops_t *ops);
+
+struct na_virtio_device;
+typedef struct na_virtio_device na_virtio_device_t;
+struct na_virtio_queue;
+typedef struct na_virtio_queue na_virtio_queue_t;
+
+typedef struct na_virtio_driver_ops {
+    void *context;
+    int (*probe)(void *context, na_virtio_device_t *device);
+} na_virtio_driver_ops_t;
+
+int na_virtio_driver_register(const char *name, uint32_t device_type,
+                              uint64_t supported_features,
+                              const na_virtio_driver_ops_t *ops);
+uint64_t na_virtio_device_features(const na_virtio_device_t *device);
+void na_virtio_device_finish(na_virtio_device_t *device);
+uint32_t na_virtio_device_config_read(const na_virtio_device_t *device,
+                                      uint32_t offset);
+void na_virtio_device_config_write(na_virtio_device_t *device, uint32_t offset,
+                                   uint32_t value);
+pci_device_t *na_virtio_device_pci(const na_virtio_device_t *device);
+int na_virtio_device_queue(na_virtio_device_t *device, uint16_t queue_index,
+                           na_virtio_queue_t **queue);
+int na_virtio_queue_submit(na_virtio_queue_t *queue, const void *request,
+                           size_t request_size, const void *extra,
+                           size_t extra_size, void *response,
+                           size_t response_size);
+void na_virtio_device_set_config_handler(na_virtio_device_t *device,
+                                         void *context,
+                                         void (*handler)(void *context));
+
+struct drm_device;
+typedef struct drm_device drm_device_t;
+typedef struct drm_device DrmDevice;
+struct drm_connector;
+typedef struct drm_connector drm_connector_t;
+typedef struct drm_connector DrmConnector;
+struct drm_crtc;
+typedef struct drm_crtc drm_crtc_t;
+typedef struct drm_crtc DrmCrtc;
+struct drm_encoder;
+typedef struct drm_encoder drm_encoder_t;
+typedef struct drm_encoder DrmEncoder;
+struct drm_plane;
+typedef struct drm_plane drm_plane_t;
+typedef struct drm_plane DrmPlane;
+
+typedef struct na_drm_dumb_buffer {
+    uint32_t height;
+    uint32_t width;
+    uint32_t bits_per_pixel;
+    uint32_t flags;
+    uint32_t handle;
+    uint32_t pitch;
+    uint64_t size;
+} na_drm_dumb_buffer_t;
+typedef na_drm_dumb_buffer_t DrmDumbBuffer;
+
+typedef struct na_drm_mode_info {
+    uint32_t clock;
+    uint16_t hdisplay;
+    uint16_t hsync_start;
+    uint16_t hsync_end;
+    uint16_t htotal;
+    uint16_t hskew;
+    uint16_t vdisplay;
+    uint16_t vsync_start;
+    uint16_t vsync_end;
+    uint16_t vtotal;
+    uint16_t vscan;
+    uint32_t vrefresh;
+    uint32_t flags;
+    uint32_t mode_type;
+    char name[32];
+} na_drm_mode_info_t;
+typedef na_drm_mode_info_t DrmModeInfo;
+
+typedef struct na_drm_connector_info {
+    uint32_t connector_type;
+    uint32_t connection;
+    uint32_t encoder_index;
+    uint32_t crtc_index;
+    uint32_t mm_width;
+    uint32_t mm_height;
+    uint32_t subpixel;
+} na_drm_connector_info_t;
+typedef na_drm_connector_info_t DrmConnectorInfo;
+
+typedef struct na_drm_crtc_info {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t gamma_size;
+    bool mode_valid;
+    na_drm_mode_info_t mode_info;
+} na_drm_crtc_info_t;
+typedef na_drm_crtc_info_t DrmCrtcInfo;
+
+typedef struct na_drm_encoder_info {
+    uint32_t encoder_type;
+    uint32_t crtc_index;
+    uint32_t possible_crtcs;
+    uint32_t possible_clones;
+} na_drm_encoder_info_t;
+typedef na_drm_encoder_info_t DrmEncoderInfo;
+
+typedef struct na_drm_plane_info {
+    uint32_t crtc_index;
+    uint32_t possible_crtcs;
+    uint32_t gamma_size;
+    uint32_t plane_type;
+} na_drm_plane_info_t;
+typedef na_drm_plane_info_t DrmPlaneInfo;
+
+typedef struct na_drm_framebuffer_request {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_format;
+    uint32_t flags;
+    uint32_t bits_per_pixel;
+    uint32_t depth;
+    uint32_t handles[4];
+    uint32_t pitches[4];
+    uint32_t offsets[4];
+    uint64_t modifiers[4];
+} na_drm_framebuffer_request_t;
+typedef na_drm_framebuffer_request_t DrmFramebufferRequest;
+
+typedef struct na_drm_clip {
+    uint16_t x1;
+    uint16_t y1;
+    uint16_t x2;
+    uint16_t y2;
+} na_drm_clip_t;
+typedef na_drm_clip_t DrmClip;
+
+typedef struct na_drm_plane_update {
+    uint32_t plane_id;
+    uint32_t crtc_id;
+    uint32_t framebuffer_id;
+    uint32_t framebuffer_handle;
+    uint32_t flags;
+    int32_t crtc_x;
+    int32_t crtc_y;
+    uint32_t crtc_width;
+    uint32_t crtc_height;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t source_width;
+    uint32_t source_height;
+} na_drm_plane_update_t;
+typedef na_drm_plane_update_t DrmPlaneUpdate;
+
+typedef struct na_drm_crtc_update {
+    uint32_t crtc_id;
+    uint32_t framebuffer_id;
+    uint32_t framebuffer_handle;
+    uint32_t x;
+    uint32_t y;
+    uint32_t gamma_size;
+    bool mode_valid;
+    na_drm_mode_info_t mode_info;
+} na_drm_crtc_update_t;
+typedef na_drm_crtc_update_t DrmCrtcUpdate;
+
+typedef struct na_drm_page_flip {
+    uint32_t crtc_id;
+    uint32_t framebuffer_id;
+    uint32_t framebuffer_handle;
+    uint32_t flags;
+    uint64_t user_data;
+} na_drm_page_flip_t;
+typedef na_drm_page_flip_t DrmPageFlip;
+
+typedef struct na_drm_cursor_update {
+    uint32_t flags;
+    uint32_t crtc_id;
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t handle;
+} na_drm_cursor_update_t;
+typedef na_drm_cursor_update_t DrmCursorUpdate;
+
+typedef struct na_drm_atomic_property {
+    uint32_t object_id;
+    uint32_t property_id;
+    uint64_t value;
+    uint32_t framebuffer_handle;
+} na_drm_atomic_property_t;
+typedef na_drm_atomic_property_t DrmAtomicProperty;
+
+typedef struct na_drm_driver_ops {
+    void *context;
+    bool supports_render_node;
+    int (*open)(void *context, uint64_t file_id);
+    void (*close)(void *context, uint64_t file_id);
+    int (*get_capability)(void *context, uint64_t capability, uint64_t *value);
+    int (*get_display_info)(void *context, uint32_t *width, uint32_t *height,
+                            uint32_t *bits_per_pixel);
+    int (*get_framebuffer)(void *context, uint32_t *width, uint32_t *height,
+                           uint32_t *bits_per_pixel,
+                           uint64_t *physical_address);
+    int (*create_dumb_buffer)(void *context, na_drm_dumb_buffer_t *buffer);
+    int (*destroy_dumb_buffer)(void *context, uint32_t handle);
+    int (*map_dumb_buffer)(void *context, uint32_t handle, uint64_t *offset);
+    int (*get_dumb_buffer_mapping)(void *context, uint32_t handle,
+                                   uint64_t *physical_address, uint64_t *size);
+    int (*get_connectors)(void *context, drm_device_t *device,
+                          drm_connector_t **connectors, uint32_t capacity,
+                          uint32_t *count);
+    int (*get_crtcs)(void *context, drm_device_t *device, drm_crtc_t **crtcs,
+                     uint32_t capacity, uint32_t *count);
+    int (*get_encoders)(void *context, drm_device_t *device,
+                        drm_encoder_t **encoders, uint32_t capacity,
+                        uint32_t *count);
+    int (*get_planes)(void *context, drm_device_t *device, drm_plane_t **planes,
+                      uint32_t capacity, uint32_t *count);
+    int (*create_framebuffer)(void *context,
+                              na_drm_framebuffer_request_t *request);
+    void (*release_framebuffer)(void *context, uint32_t handle);
+    int (*dirty_framebuffer)(void *context, uint32_t framebuffer_id,
+                             uint32_t framebuffer_handle, uint32_t flags,
+                             uint32_t color, const na_drm_clip_t *clips,
+                             uint32_t clip_count);
+    int (*set_plane)(void *context, const na_drm_plane_update_t *update);
+    int (*set_crtc)(void *context, const na_drm_crtc_update_t *update,
+                    const uint32_t *connector_ids, uint32_t connector_count);
+    int (*page_flip)(void *context, const na_drm_page_flip_t *flip);
+    int (*set_cursor)(void *context, const na_drm_cursor_update_t *cursor);
+    int (*atomic_commit)(void *context, uint32_t flags, uint64_t user_data,
+                         const na_drm_atomic_property_t *properties,
+                         size_t property_count);
+    int64_t (*driver_ioctl)(void *context, uint32_t command, void *arg,
+                            size_t arg_size, bool render_node,
+                            uint64_t file_id);
+} na_drm_driver_ops_t;
+typedef na_drm_driver_ops_t DrmDriverOps;
+
+drm_device_t *
+na_drm_device_register(const na_drm_driver_ops_t *ops, const char *node_name,
+                       pci_device_t *pci_device, const char *driver_name,
+                       const char *driver_date, const char *driver_description);
+void na_drm_device_unregister(drm_device_t *device);
+int na_drm_device_notify_hotplug(drm_device_t *device);
+drm_connector_t *na_drm_connector_create(const na_drm_connector_info_t *info);
+int na_drm_connector_add_mode(drm_connector_t *connector,
+                              const na_drm_mode_info_t *mode);
+void na_drm_connector_destroy(drm_connector_t *connector);
+drm_crtc_t *na_drm_crtc_create(const na_drm_crtc_info_t *info);
+void na_drm_crtc_destroy(drm_crtc_t *crtc);
+drm_encoder_t *na_drm_encoder_create(const na_drm_encoder_info_t *info);
+void na_drm_encoder_destroy(drm_encoder_t *encoder);
+drm_plane_t *na_drm_plane_create(drm_device_t *device,
+                                 const na_drm_plane_info_t *info);
+int na_drm_plane_add_format(drm_plane_t *plane, uint32_t format);
+void na_drm_plane_destroy(drm_plane_t *plane);
+
+struct fdt_device;
+typedef struct fdt_device fdt_device_t;
+typedef struct fdt_device FdtDevice;
+
+typedef struct na_fdt_driver_ops {
+    void *context;
+    int (*probe)(void *context, fdt_device_t *device, const char *compatible);
+} na_fdt_driver_ops_t;
+typedef na_fdt_driver_ops_t FdtDriverOps;
+
+int na_fdt_driver_register(const char *name, const char *compatible_blob,
+                           size_t compatible_blob_size,
+                           const na_fdt_driver_ops_t *ops);
+const char *na_fdt_device_name(const fdt_device_t *device);
+const void *na_fdt_device_property(const fdt_device_t *device, const char *name,
+                                   size_t *length);
+int na_fdt_device_reg_cells(const fdt_device_t *device, uint32_t *address_cells,
+                            uint32_t *size_cells);
