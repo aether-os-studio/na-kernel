@@ -531,7 +531,6 @@ static int epollfs_get_tree(struct vfs_fs_context *fc) {
 
     inode = vfs_alloc_inode(sb);
     if (!inode) {
-        free(fsi);
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -545,7 +544,6 @@ static int epollfs_get_tree(struct vfs_fs_context *fc) {
     root = vfs_d_alloc(sb, NULL, NULL);
     if (!root) {
         vfs_iput(inode);
-        free(fsi);
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -553,6 +551,7 @@ static int epollfs_get_tree(struct vfs_fs_context *fc) {
     vfs_d_instantiate(root, inode);
     sb->s_root = root;
     fc->sb = sb;
+    vfs_iput(inode);
     return 0;
 }
 

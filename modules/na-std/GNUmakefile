@@ -20,7 +20,7 @@ BINDGEN ?= bindgen
 CARGO_FLAGS := -Z build-std=core --target $(RUST_TARGET) \
 	--profile $(CARGO_PROFILE)
 
-.PHONY: all check
+.PHONY: all check fmt
 all:
 	$(call PRINT_STEP,CARGO,na-std/$(RUST_TARGET))
 	$(Q)CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) \
@@ -36,3 +36,7 @@ check:
 		BINDGEN=$(BINDGEN) \
 		RUSTFLAGS='-C relocation-model=pic' \
 		$(CARGO) check $(CARGO_FLAGS)
+
+fmt:
+	$(call PRINT_STEP,CARGO-FMT,na-std/$(RUST_TARGET))
+	$(Q)$(CARGO) fmt

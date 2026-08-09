@@ -203,7 +203,6 @@ static int mountfdfs_get_tree(struct vfs_fs_context *fc) {
 
     inode = vfs_alloc_inode(sb);
     if (!inode) {
-        free(fsi);
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -217,7 +216,6 @@ static int mountfdfs_get_tree(struct vfs_fs_context *fc) {
     root = vfs_d_alloc(sb, NULL, NULL);
     if (!root) {
         vfs_iput(inode);
-        free(fsi);
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -225,6 +223,7 @@ static int mountfdfs_get_tree(struct vfs_fs_context *fc) {
     vfs_d_instantiate(root, inode);
     sb->s_root = root;
     fc->sb = sb;
+    vfs_iput(inode);
     return 0;
 }
 
@@ -289,6 +288,7 @@ int mountfd_create_file(struct vfs_mount *mnt, struct vfs_dentry *root,
     fsi = mountfdfs_sb_info(sb);
     inode = vfs_alloc_inode(sb);
     if (!inode) {
+        vfs_dput(ctx->root);
         free(ctx);
         vfs_mntput(internal_mnt);
         return -ENOMEM;
@@ -315,6 +315,7 @@ int mountfd_create_file(struct vfs_mount *mnt, struct vfs_dentry *root,
     dentry = vfs_d_alloc(sb, sb->s_root, &name);
     if (!dentry) {
         vfs_iput(inode);
+        vfs_dput(ctx->root);
         free(ctx);
         vfs_mntput(internal_mnt);
         return -ENOMEM;
@@ -327,6 +328,7 @@ int mountfd_create_file(struct vfs_mount *mnt, struct vfs_dentry *root,
     if (!file) {
         vfs_dput(dentry);
         vfs_iput(inode);
+        vfs_dput(ctx->root);
         free(ctx);
         vfs_mntput(internal_mnt);
         return -ENOMEM;

@@ -1,6 +1,8 @@
+include ../../../build/common-env.mk
+include ../../build/common-flags.mk
+
 KM_NAME := ext
-
-override SRCFILES := $(shell find . -name "*.[Sc]" | LC_ALL=C sort)
-MODULE_LINK_LIBS := $(PROJECT_ROOT)/libgcc_$(ARCH).a
-
-include $(PROJECT_ROOT)/modules/build/module.mk
+RUST_CRATE_NAME := ext
+RUST_MODULE_DIR := $(CURDIR)
+include $(PROJECT_ROOT)/modules/build/rust-module.mk
+MAKEFLAGS += -rR --no-print-directory

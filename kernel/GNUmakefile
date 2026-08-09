@@ -412,3 +412,5 @@ clean:
 distclean:
 	$(call PRINT_STEP,DISTCLEAN,kernel)
 	$(Q)rm -rf bin-* obj-* freestnd-c-hdrs src/limine.h
+
+fmt:

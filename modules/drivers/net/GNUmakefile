@@ -6,3 +6,5 @@ endif
 
 	$(call PRINT_STEP,MAKE,modules/drivers/net/virtio-net)
 	$(Q)$(MAKE) -C virtio-net
+
+fmt:

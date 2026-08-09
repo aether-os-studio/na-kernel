@@ -392,10 +392,10 @@ impl Driver for GpuDevice {
             }
         }
         if _commit.flags & TEST_ONLY != 0 {
-            if let Some((_, handle)) = framebuffer {
-                if handle != 0 {
-                    Self::find_buffer(&self.state.lock(), handle)?;
-                }
+            if let Some((_, handle)) = framebuffer
+                && handle != 0
+            {
+                Self::find_buffer(&self.state.lock(), handle)?;
             }
             return Ok(());
         }

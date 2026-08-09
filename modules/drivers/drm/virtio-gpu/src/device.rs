@@ -30,7 +30,6 @@ pub struct Capset {
 
 pub struct Context {
     pub id: u32,
-    pub capset_id: u32,
     pub resources: KernelVec<u32>,
 }
 
@@ -127,7 +126,7 @@ impl GpuDevice {
         protocol::check_response(response, expected)
     }
 
-    pub(crate) fn find_buffer<'a>(state: &'a State, handle: u32) -> Result<&'a Buffer> {
+    pub(crate) fn find_buffer(state: &State, handle: u32) -> Result<&Buffer> {
         state
             .buffers
             .iter()
@@ -135,7 +134,7 @@ impl GpuDevice {
             .ok_or(Error::NotFound)
     }
 
-    pub(crate) fn find_buffer_mut<'a>(state: &'a mut State, handle: u32) -> Result<&'a mut Buffer> {
+    pub(crate) fn find_buffer_mut(state: &mut State, handle: u32) -> Result<&mut Buffer> {
         state
             .buffers
             .iter_mut()

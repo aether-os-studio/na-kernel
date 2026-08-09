@@ -65,3 +65,6 @@ $(RUST_MODULE_OUTPUT): $(RUST_STATICLIB) $(RUST_METADATA_OBJS) GNUmakefile \
 	$(Q)mkdir -p "$$(dirname $@)"
 	$(Q)$(LD) -shared --whole-archive $(RUST_STATICLIB) --no-whole-archive \
 		$(RUST_METADATA_OBJS) -o $@
+
+fmt:
+	$(Q)$(CARGO) fmt

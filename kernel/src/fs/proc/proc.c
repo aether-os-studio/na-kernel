@@ -1691,6 +1691,7 @@ static int procfs_get_tree(struct vfs_fs_context *fc) {
     vfs_d_instantiate(root_dentry, root_inode);
     sb->s_root = root_dentry;
     fc->sb = sb;
+    vfs_iput(root_inode);
     return 0;
 }
 

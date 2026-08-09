@@ -647,19 +647,25 @@ static int sysfs_get_tree(struct vfs_fs_context *fc) {
     sb->s_magic = 0x62656572;
 
     root_inode = sysfs_new_inode(sb, &sysfs_tree_root);
-    if (!root_inode)
+    if (!root_inode) {
+        vfs_put_super(sb);
         return -ENOMEM;
+    }
 
     root_dentry = vfs_d_alloc(sb, NULL, &root_name);
     if (!root_dentry) {
         vfs_iput(root_inode);
+        vfs_put_super(sb);
         return -ENOMEM;
     }
 
     vfs_d_instantiate(root_dentry, root_inode);
     sb->s_root = root_dentry;
     fc->sb = sb;
-    if (!sysfs_internal_mounting)
+    /* Keep exported sysfs inodes anchored to the private lifetime mount.
+     * Ordinary user-visible mounts may be detached at any time and must not
+     * replace the global backing superblock or keep an unmounted tree alive. */
+    if (sysfs_internal_mounting)
         sysfs_root = vfs_igrab(root_inode);
     vfs_iput(root_inode);
     return 0;

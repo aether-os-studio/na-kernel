@@ -891,6 +891,7 @@ int vfs_truncate_path(const struct vfs_path *path, uint64_t size) {
 
     vfs_fill_generic_kstat(path, &stat);
     stat.size = size;
+    stat.mask = STATX_SIZE;
 
     ret = inode->i_op->setattr(path->dentry, &stat);
     if (ret == 0) {

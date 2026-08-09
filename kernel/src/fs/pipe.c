@@ -357,7 +357,9 @@ static void pipefs_evict_inode(struct vfs_inode *inode) {
             if (pipe->read_node == inode)
                 pipe->read_node = NULL;
         }
-        if (!pipe->read_node && !pipe->write_node)
+        if (pipe->endpoint_refs > 0)
+            pipe->endpoint_refs--;
+        if (pipe->endpoint_refs == 0)
             free_pipe = true;
         spin_unlock(&pipe->lock);
     }
@@ -402,7 +404,6 @@ static int pipefs_get_tree(struct vfs_fs_context *fc) {
 
     inode = vfs_alloc_inode(sb);
     if (!inode) {
-        free(fsi);
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -416,7 +417,6 @@ static int pipefs_get_tree(struct vfs_fs_context *fc) {
     root = vfs_d_alloc(sb, NULL, NULL);
     if (!root) {
         vfs_iput(inode);
-        free(fsi);
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -424,6 +424,7 @@ static int pipefs_get_tree(struct vfs_fs_context *fc) {
     vfs_d_instantiate(root, inode);
     sb->s_root = root;
     fc->sb = sb;
+    vfs_iput(inode);
     return 0;
 }
 
@@ -889,6 +890,7 @@ static int pipefs_create_endpoint(struct vfs_file **out_file, pipe_info_t *pipe,
     file->f_mode |= VFS_FMODE_NO_POS_LOCK;
     spin_lock(&pipe->lock);
     pipe->owns_node_refs = true;
+    pipe->endpoint_refs++;
     if (write_end)
         pipe->write_node = vfs_igrab(inode);
     else

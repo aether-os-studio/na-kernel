@@ -29,6 +29,7 @@ typedef struct pipe_info {
 
     int write_fds;
     int read_fds;
+    uint32_t endpoint_refs;
 
     vfs_node_t *read_node;
     vfs_node_t *write_node;

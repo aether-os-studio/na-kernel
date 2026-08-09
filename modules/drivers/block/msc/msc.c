@@ -185,6 +185,12 @@ static int msc_test_unit_ready(usb_msc_lun_t *lun) {
     return msc_command(lun->ctrl, lun->lun, cmd, sizeof(cmd), NULL, 0, true);
 }
 
+static int usb_msc_flush(void *data) {
+    usb_msc_lun_t *lun = data;
+    uint8_t cmd[10] = {0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    return msc_command(lun->ctrl, lun->lun, cmd, sizeof(cmd), NULL, 0, false);
+}
+
 static int msc_request_sense(usb_msc_lun_t *lun, uint8_t *sense) {
     uint8_t cmd[6] = {0x03, 0, 0, 0, 18, 0};
     return msc_command(lun->ctrl, lun->lun, cmd, sizeof(cmd), sense, 18, true);
@@ -387,7 +393,7 @@ static int msc_probe_lun(usb_msc_lun_t *lun) {
     sprintf(name, "usbmsc%dl%d", usbmsc_drive_id++, lun->lun);
     regist_blkdev(name, lun, lun->block_size,
                   lun->block_count * lun->block_size, MSC_MAX_TRANSFER_SIZE,
-                  usb_msc_read_blocks, usb_msc_write_blocks);
+                  usb_msc_read_blocks, usb_msc_write_blocks, usb_msc_flush);
 
     lun->registered = true;
     printk("MSC: Registered LUN%u, block_size=%u, blocks=%lu\n", lun->lun,

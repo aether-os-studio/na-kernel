@@ -16,3 +16,14 @@ all:
 	$(Q)$(MAKE) -C fs
 	$(call PRINT_STEP,MAKE,modules/net)
 	$(Q)$(MAKE) -C net
+
+fmt:
+	$(call PRINT_STEP,MAKE-FMT,modules/na-std)
+	$(Q)$(MAKE) -C na-std fmt
+
+	$(call PRINT_STEP,MAKE-FMT,modules/drivers)
+	$(Q)$(MAKE) -C drivers fmt
+	$(call PRINT_STEP,MAKE-FMT,modules/fs)
+	$(Q)$(MAKE) -C fs fmt
+	$(call PRINT_STEP,MAKE-FMT,modules/net)
+	$(Q)$(MAKE) -C net fmt

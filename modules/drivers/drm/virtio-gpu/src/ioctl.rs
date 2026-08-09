@@ -1,5 +1,5 @@
 use na_std::{
-    Error, Result, bindings,
+    Error, Result,
     drm::{FileId, Ioctl},
     memory::{KernelBuffer, KernelVec},
     user::UserAddress,
@@ -82,10 +82,7 @@ impl Arg<'_> {
 }
 
 impl GpuDevice {
-    fn file_mut<'a>(
-        state: &'a mut crate::device::State,
-        file: FileId,
-    ) -> Result<&'a mut FileState> {
+    fn file_mut(state: &mut crate::device::State, file: FileId) -> Result<&mut FileState> {
         state
             .files
             .iter_mut()
@@ -93,7 +90,7 @@ impl GpuDevice {
             .ok_or(Error::InvalidArgument)
     }
 
-    fn context_mut<'a>(state: &'a mut crate::device::State, id: u32) -> Result<&'a mut Context> {
+    fn context_mut(state: &mut crate::device::State, id: u32) -> Result<&mut Context> {
         state
             .contexts
             .iter_mut()
@@ -114,9 +111,11 @@ impl GpuDevice {
 
     fn supported_capsets(state: &crate::device::State) -> u64 {
         state.capsets.iter().fold(0, |mask, capset| {
-            (capset.id < 64)
-                .then_some(mask | (1u64 << capset.id))
-                .unwrap_or(mask)
+            if capset.id < 64 {
+                mask | (1u64 << capset.id)
+            } else {
+                mask
+            }
         })
     }
 
@@ -143,7 +142,6 @@ impl GpuDevice {
         self.submit(&command, None, &mut response, protocol::RESP_OK_NODATA)?;
         state.contexts.push(Context {
             id,
-            capset_id,
             resources: KernelVec::new(),
         })?;
         Self::ensure_file(state, file)?.context = Some(id);
@@ -357,7 +355,7 @@ impl GpuDevice {
         };
         let mut capset_id = CAPSET_VIRGL;
         if let Some(parameters) = parameters.as_mut() {
-            for parameter in parameters.as_slice().chunks_exact(16) {
+            for parameter in parameters.as_slice().as_chunks::<16>().0 {
                 let kind = u64::from_ne_bytes(parameter[..8].try_into().unwrap());
                 let value = u64::from_ne_bytes(parameter[8..].try_into().unwrap());
                 match kind {
@@ -418,8 +416,8 @@ impl GpuDevice {
         let mut state = self.state.lock();
         let context_id = self.ensure_context(&mut state, file)?;
         if let Some(handles) = handles.as_mut() {
-            for bytes in handles.as_slice().chunks_exact(4) {
-                let handle = u32::from_ne_bytes(bytes.try_into().unwrap());
+            for bytes in handles.as_slice().as_chunks::<4>().0 {
+                let handle = u32::from_ne_bytes(*bytes);
                 let resource_id = Self::find_buffer(&state, handle)?.resource_id;
                 self.attach_resource(&mut state, context_id, resource_id)?;
             }
@@ -445,7 +443,7 @@ impl GpuDevice {
         let response_flags = u32::from_le_bytes(response[4..8].try_into().unwrap());
         let response_fence = u64::from_le_bytes(response[8..16].try_into().unwrap());
         if response_flags & protocol::FLAG_FENCE == 0 || response_fence != fence_id {
-            return Err(Error::Kernel(-(bindings::EIO as i32)));
+            return Err(Error::Io);
         }
         Ok(())
     }
@@ -457,12 +455,14 @@ impl GpuDevice {
         protocol::box3(
             command.bytes_mut(),
             24,
-            arg.u32(4)?,
-            arg.u32(8)?,
-            arg.u32(12)?,
-            arg.u32(16)?,
-            arg.u32(20)?,
-            arg.u32(24)?,
+            [
+                arg.u32(4)?,
+                arg.u32(8)?,
+                arg.u32(12)?,
+                arg.u32(16)?,
+                arg.u32(20)?,
+                arg.u32(24)?,
+            ],
         );
         command.put_u64(48, arg.u32(32)? as u64);
         command.put_u32(56, buffer.resource_id);
@@ -516,18 +516,17 @@ impl GpuDevice {
                     let _ = self.put_buffer(&mut state, *handle);
                 }
             }
-            if let Some(context_id) = file_state.context {
-                if let Some(context_index) = state
+            if let Some(context_id) = file_state.context
+                && let Some(context_index) = state
                     .contexts
                     .iter()
                     .position(|context| context.id == context_id)
-                {
-                    let mut destroy = Command::<24>::new(protocol::CMD_CTX_DESTROY);
-                    destroy.put_u32(16, context_id);
-                    let mut response = [0; 24];
-                    let _ = self.submit(&destroy, None, &mut response, protocol::RESP_OK_NODATA);
-                    let _ = state.contexts.remove(context_index);
-                }
+            {
+                let mut destroy = Command::<24>::new(protocol::CMD_CTX_DESTROY);
+                destroy.put_u32(16, context_id);
+                let mut response = [0; 24];
+                let _ = self.submit(&destroy, None, &mut response, protocol::RESP_OK_NODATA);
+                let _ = state.contexts.remove(context_index);
             }
         }
     }
@@ -550,7 +549,7 @@ impl GpuDevice {
                 }
                 let buffer = Self::find_buffer_mut(&mut state, handle)?;
                 buffer.ref_count = buffer.ref_count.checked_add(1).ok_or(Error::NoSpace)?;
-                Err(Error::Kernel(-(bindings::ENOTTY as i32)))
+                Err(Error::NotATerminal)
             }
             DRM_IOCTL_PRIME_FD_TO_HANDLE => {
                 let handle = arg.u32(0)?;
@@ -611,10 +610,8 @@ impl GpuDevice {
                 .map(|_| 0),
             DRM_IOCTL_VIRTGPU_WAIT => self.ioctl_wait(&arg, ioctl.file).map(|_| 0),
             DRM_IOCTL_VIRTGPU_CONTEXT_INIT => self.ioctl_context_init(&arg, ioctl.file).map(|_| 0),
-            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => {
-                Err(Error::Kernel(-(bindings::ENOSYS as i32)))
-            }
-            _ => Err(Error::Kernel(-(bindings::ENOTTY as i32))),
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => Err(Error::Unsupported),
+            _ => Err(Error::NotATerminal),
         }
     }
 }

@@ -119,9 +119,11 @@ pub struct Queue {
 impl Queue {
     pub fn submit(&self, request: &[u8], extra: Option<&[u8]>, response: &mut [u8]) -> Result<()> {
         let extra = extra.unwrap_or_default();
-        let extra_ptr = (!extra.is_empty())
-            .then_some(extra.as_ptr())
-            .unwrap_or(core::ptr::null());
+        let extra_ptr = if extra.is_empty() {
+            core::ptr::null()
+        } else {
+            extra.as_ptr()
+        };
         let status = unsafe {
             bindings::na_virtio_queue_submit(
                 self.raw.as_ptr(),

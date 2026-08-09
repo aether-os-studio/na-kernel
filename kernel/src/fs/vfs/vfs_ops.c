@@ -82,18 +82,26 @@ int vfs_mkdirat(int dfd, const char *pathname, umode_t mode, bool kernel) {
     }
 
     dir = parent.dentry ? parent.dentry->d_inode : NULL;
-    if (!dir || !dir->i_op || !dir->i_op->mkdir) {
-        ret = -EOPNOTSUPP;
+    if (!dir) {
+        ret = -ENOENT;
         goto out;
     }
 
-    dentry = vfs_d_lookup(parent.dentry, &last);
-    if (dentry) {
-        if (dentry->d_inode) {
-            vfs_dput(dentry);
-            ret = -EEXIST;
-            goto out;
-        }
+    dentry = vfs_lookup_component(&parent, last.name, LOOKUP_CREATE);
+    if (IS_ERR(dentry)) {
+        ret = (int)PTR_ERR(dentry);
+        goto out;
+    }
+    if (dentry->d_inode) {
+        vfs_dput(dentry);
+        ret = -EEXIST;
+        goto out;
+    }
+
+    if (!dir->i_op || !dir->i_op->mkdir) {
+        vfs_dput(dentry);
+        ret = -EOPNOTSUPP;
+        goto out;
     }
 
     if (!kernel) {
@@ -101,14 +109,6 @@ int vfs_mkdirat(int dfd, const char *pathname, umode_t mode, bool kernel) {
         if (ret < 0) {
             if (dentry)
                 vfs_dput(dentry);
-            goto out;
-        }
-    }
-
-    if (!dentry) {
-        dentry = vfs_d_alloc(parent.dentry->d_sb, parent.dentry, &last);
-        if (!dentry) {
-            ret = -ENOMEM;
             goto out;
         }
     }
@@ -519,6 +519,22 @@ int vfs_statx(int dfd, const char *pathname, int flags, uint32_t mask,
     return ret;
 }
 
+static void vfs_discard_context_super(struct vfs_fs_context *fc) {
+    struct vfs_super_block *sb;
+    struct vfs_dentry *root;
+
+    if (!fc || !fc->sb)
+        return;
+
+    sb = fc->sb;
+    fc->sb = NULL;
+    root = sb->s_root;
+    sb->s_root = NULL;
+    if (root)
+        vfs_dput(root);
+    vfs_put_super(sb);
+}
+
 int vfs_kern_mount(const char *fs_name, unsigned long mnt_flags,
                    const char *source, void *data, struct vfs_mount **out) {
     struct vfs_file_system_type *fstype;
@@ -541,19 +557,33 @@ int vfs_kern_mount(const char *fs_name, unsigned long mnt_flags,
 
     if (fstype->init_fs_context) {
         ret = fstype->init_fs_context(&fc);
-        if (ret < 0)
+        if (ret < 0) {
+            vfs_discard_context_super(&fc);
             return ret;
+        }
     }
 
     ret = fstype->get_tree(&fc);
-    if (ret < 0)
+    if (ret < 0) {
+        vfs_discard_context_super(&fc);
         return ret;
-    if (!fc.sb || !fc.sb->s_root)
+    }
+    if (!fc.sb || !fc.sb->s_root) {
+        vfs_discard_context_super(&fc);
         return -EINVAL;
+    }
 
     mnt = vfs_mount_alloc(fc.sb, mnt_flags);
-    if (!mnt)
+    if (!mnt) {
+        vfs_discard_context_super(&fc);
         return -ENOMEM;
+    }
+
+    /* vfs_mount_alloc() acquired the mount's superblock reference.  Drop the
+     * construction reference owned by the fs context now that the mount has
+     * taken over the completed tree. */
+    vfs_put_super(fc.sb);
+    fc.sb = NULL;
 
     *out = mnt;
     return 0;

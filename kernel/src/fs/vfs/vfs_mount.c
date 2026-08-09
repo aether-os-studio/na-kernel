@@ -1036,8 +1036,11 @@ static int vfs_mount_attach_tree(struct vfs_mount *parent,
 void vfs_mntput(struct vfs_mount *mnt) {
     struct vfs_mount *parent;
     struct vfs_dentry *mountpoint;
+    struct vfs_dentry *super_root = NULL;
+    struct vfs_super_block *sb;
     struct vfs_mount *below;
     struct vfs_mount *above;
+    bool last_super_mount = false;
 
     if (!mnt)
         return;
@@ -1061,14 +1064,30 @@ void vfs_mntput(struct vfs_mount *mnt) {
 
     if (!llist_empty(&mnt->mnt_child))
         llist_delete(&mnt->mnt_child);
-    if (!llist_empty(&mnt->mnt_sb_link))
-        llist_delete(&mnt->mnt_sb_link);
+    sb = mnt->mnt_sb;
+    if (sb) {
+        spin_lock(&sb->s_mount_lock);
+        if (!llist_empty(&mnt->mnt_sb_link))
+            llist_delete(&mnt->mnt_sb_link);
+        if (llist_empty(&sb->s_mounts) && sb->s_root) {
+            super_root = sb->s_root;
+            sb->s_root = NULL;
+            last_super_mount = true;
+        }
+        spin_unlock(&sb->s_mount_lock);
+    }
     if (mountpoint)
         vfs_dput(mountpoint);
     if (mnt->mnt_root)
         vfs_dput(mnt->mnt_root);
-    if (mnt->mnt_sb)
-        vfs_put_super(mnt->mnt_sb);
+    if (last_super_mount && sb->s_type && sb->s_type->kill_sb)
+        sb->s_type->kill_sb(sb);
+    if (last_super_mount)
+        vfs_dcache_shrink_super(sb);
+    if (super_root)
+        vfs_dput(super_root);
+    if (sb)
+        vfs_put_super(sb);
     mnt->mnt_parent = NULL;
     mnt->mnt_master = NULL;
     mnt->mnt_stack_prev = NULL;

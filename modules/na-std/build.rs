@@ -61,7 +61,11 @@ fn main() {
         "--allowlist-function",
         "^na_.*$",
         "--allowlist-var",
-        "^E[A-Z0-9]+$",
+        "^(E[A-Z0-9]+|NA_(VFS|DEVICE)_[A-Z0-9_]+)$",
+        "--allowlist-type",
+        "^vfs_.*$",
+        "--allowlist-function",
+        "^(vfs_register_filesystem|vfs_alloc_super|vfs_get_super|vfs_put_super|vfs_alloc_inode|vfs_igrab|vfs_iput|vfs_d_alloc|vfs_dget|vfs_dput|vfs_d_add|vfs_d_instantiate|vfs_d_lookup|vfs_qstr_make|vfs_qstr_dup|vfs_qstr_destroy|device_read|device_write)$",
         "--output",
         output.to_str().unwrap(),
     ]);

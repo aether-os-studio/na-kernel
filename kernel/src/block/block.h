@@ -20,6 +20,7 @@ typedef struct blkdev {
     bool mounted;
     uint64_t (*read)(void *data, uint64_t lba, void *buffer, uint64_t size);
     uint64_t (*write)(void *data, uint64_t lba, void *buffer, uint64_t size);
+    int (*flush)(void *data);
 } blkdev_t;
 
 extern struct llist_header blk_dev_list;
@@ -55,7 +56,8 @@ void regist_blkdev(char *name, void *ptr, uint64_t block_size, uint64_t size,
                    uint64_t (*read)(void *data, uint64_t lba, void *buffer,
                                     uint64_t size),
                    uint64_t (*write)(void *data, uint64_t lba, void *buffer,
-                                     uint64_t size));
+                                     uint64_t size),
+                   int (*flush)(void *data));
 void unregist_blkdev(void *ptr);
 
 enum {
@@ -77,3 +79,5 @@ uint64_t blkdev_read(uint64_t drive, uint64_t offset, void *buf, uint64_t len);
  */
 uint64_t blkdev_write(uint64_t drive, uint64_t offset, const void *buf,
                       uint64_t len);
+/** Persist all completed writes to stable storage. */
+int blkdev_flush(uint64_t drive);

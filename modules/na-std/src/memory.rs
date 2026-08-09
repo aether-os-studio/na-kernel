@@ -266,7 +266,7 @@ impl<T> KernelVec<T> {
     }
 
     fn grow(&mut self) -> Result<()> {
-        let capacity = self.capacity.checked_mul(2).unwrap_or(usize::MAX).max(1);
+        let capacity = self.capacity.saturating_mul(2).max(1);
         let bytes = capacity
             .checked_mul(size_of::<T>())
             .ok_or(Error::OutOfMemory)?;

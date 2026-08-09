@@ -87,6 +87,45 @@ void vfs_dentry_unhash(struct vfs_dentry *dentry) {
         vfs_dput(dentry);
 }
 
+void vfs_dcache_shrink_super(struct vfs_super_block *sb) {
+    unsigned int i;
+
+    if (!sb)
+        return;
+
+    for (i = 0; i < VFS_DCACHE_BUCKETS; ++i) {
+        struct vfs_dcache_bucket *bucket = &vfs_dcache[i];
+
+        for (;;) {
+            struct vfs_dentry *victim = NULL;
+            struct hlist_node *node;
+
+            spin_lock(&bucket->lock);
+            for (node = bucket->head; node; node = node->next) {
+                struct vfs_dentry *dentry =
+                    container_of(node, struct vfs_dentry, d_hash);
+
+                if (dentry->d_sb != sb)
+                    continue;
+                victim = vfs_dget(dentry);
+                if (!victim)
+                    continue;
+                hlist_delete(&victim->d_hash);
+                victim->d_flags &= ~VFS_DENTRY_HASHED;
+                break;
+            }
+            spin_unlock(&bucket->lock);
+
+            if (!victim)
+                break;
+            /* Drop the dcache reference removed above and our temporary
+             * traversal reference. */
+            vfs_dput(victim);
+            vfs_dput(victim);
+        }
+    }
+}
+
 struct vfs_dentry *vfs_d_alloc(struct vfs_super_block *sb,
                                struct vfs_dentry *parent,
                                const struct vfs_qstr *name) {

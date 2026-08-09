@@ -4,6 +4,32 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <libs/errno.h>
+#include <fs/fs_syscall.h>
+#include <fs/vfs/vfs.h>
+#include <dev/device.h>
+
+enum { NA_VFS_FS_REQUIRES_DEV = VFS_FS_REQUIRES_DEV };
+enum { NA_DEVICE_FLUSH = DEV_CMD_FLUSH };
+enum na_vfs_statx_bits {
+    NA_VFS_STATX_MODE = STATX_MODE,
+    NA_VFS_STATX_UID = STATX_UID,
+    NA_VFS_STATX_GID = STATX_GID,
+    NA_VFS_STATX_ATIME = STATX_ATIME,
+    NA_VFS_STATX_MTIME = STATX_MTIME,
+    NA_VFS_STATX_CTIME = STATX_CTIME,
+    NA_VFS_STATX_SIZE = STATX_SIZE,
+};
+enum {
+    NA_VFS_RENAME_NOREPLACE = VFS_RENAME_NOREPLACE,
+    NA_VFS_RENAME_EXCHANGE = VFS_RENAME_EXCHANGE,
+    NA_VFS_RENAME_WHITEOUT = VFS_RENAME_WHITEOUT,
+};
+enum {
+    NA_VFS_QUOTA_USER = USRQUOTA,
+    NA_VFS_QUOTA_BLOCK_LIMITS = QIF_BLIMITS,
+};
+
+typedef struct statfs na_vfs_statfs;
 
 struct pci_device;
 typedef struct pci_device pci_device_t;
@@ -31,6 +57,37 @@ void na_dma_sync_for_device(void *address, size_t size);
 void na_dma_sync_for_cpu(void *address, size_t size);
 int na_user_read(uint64_t address, void *destination, size_t size);
 int na_user_write(uint64_t address, const void *source, size_t size);
+int na_vfs_resolve_device(const struct vfs_fs_context *context,
+                          uint64_t *device);
+void *na_vfs_general_map(struct vfs_file *file, void *address, size_t offset,
+                         size_t size, size_t protection, uint64_t flags);
+ssize_t na_vfs_file_cached_read(struct vfs_file *file, void *buffer,
+                                size_t count, int64_t *position);
+ssize_t na_vfs_file_cached_write(struct vfs_file *file, const void *buffer,
+                                 size_t count, int64_t *position);
+int na_vfs_file_install_anonymous_inode(struct vfs_file *file,
+                                        struct vfs_inode *inode);
+int na_vfs_mapping_writeback(struct vfs_inode *inode, uint64_t end);
+int na_vfs_mapping_writeback_range(struct vfs_inode *inode, uint64_t start,
+                                   uint64_t end, bool datasync);
+void na_vfs_mapping_truncate(struct vfs_inode *inode, uint64_t size);
+void na_vfs_init_new_inode_owner(struct vfs_inode *parent, uint16_t *mode,
+                                 uint32_t *uid, uint32_t *gid);
+uint64_t na_vfs_realtime_seconds(void);
+uint32_t na_vfs_current_fsuid(void);
+uint32_t na_vfs_current_fsgid(void);
+int64_t na_vfs_device_open(uint64_t device, struct vfs_file *file);
+int64_t na_vfs_device_close(uint64_t device, struct vfs_file *file);
+int64_t na_vfs_device_read(uint64_t device, struct vfs_file *file, void *buffer,
+                           uint64_t offset, size_t size);
+int64_t na_vfs_device_write(uint64_t device, struct vfs_file *file,
+                            const void *buffer, uint64_t offset, size_t size);
+int64_t na_vfs_device_ioctl(uint64_t device, struct vfs_file *file,
+                            uint64_t command, uint64_t argument);
+int64_t na_vfs_device_poll(uint64_t device, struct vfs_file *file,
+                           uint32_t events);
+void *na_vfs_device_map(uint64_t device, struct vfs_file *file, void *address,
+                        size_t offset, size_t size, size_t protection);
 void na_spin_lock(RawSpinLock *lock);
 void na_spin_unlock(RawSpinLock *lock);
 na_mutex_t *na_mutex_create(void);

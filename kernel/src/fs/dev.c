@@ -925,6 +925,7 @@ static int devtmpfs_get_tree(struct vfs_fs_context *fc) {
     sb = vfs_alloc_super(fc->fs_type, fc->sb_flags);
     if (!sb) {
         free(fsi);
+        fc->fs_private = NULL;
         return -ENOMEM;
     }
 
@@ -960,6 +961,7 @@ static int devtmpfs_get_tree(struct vfs_fs_context *fc) {
     vfs_d_instantiate(root_dentry, root_inode);
     sb->s_root = root_dentry;
     fc->sb = sb;
+    vfs_iput(root_inode);
     return 0;
 }
 

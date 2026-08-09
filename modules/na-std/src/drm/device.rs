@@ -40,11 +40,11 @@ pub trait Driver: Sync + 'static {
     fn close(&self, _file: FileId) {}
 
     fn driver_ioctl(&self, _ioctl: Ioctl<'_>) -> Result<usize> {
-        Err(Error::Kernel(-(bindings::ENOTTY as i32)))
+        Err(Error::NotATerminal)
     }
 
     fn capability(&self, _capability: u64) -> Result<u64> {
-        Err(Error::Kernel(-(bindings::ENOTSUP as i32)))
+        Err(Error::Unsupported)
     }
 
     fn display_info(&self) -> Result<DisplayInfo> {

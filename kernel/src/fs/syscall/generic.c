@@ -690,14 +690,23 @@ static int generic_setattr_path(const struct vfs_path *path, bool set_mode,
         return -EOPNOTSUPP;
 
     vfs_fill_generic_kstat(path, &stat);
-    if (set_mode)
+    stat.mask = 0;
+    if (set_mode) {
         stat.mode = (stat.mode & S_IFMT) | (mode & 07777);
-    if (set_uid)
+        stat.mask |= STATX_MODE;
+    }
+    if (set_uid) {
         stat.uid = uid;
-    if (set_gid)
+        stat.mask |= STATX_UID;
+    }
+    if (set_gid) {
         stat.gid = gid;
-    if (set_size)
+        stat.mask |= STATX_GID;
+    }
+    if (set_size) {
         stat.size = size;
+        stat.mask |= STATX_SIZE;
+    }
     return inode->i_op->setattr(path->dentry, &stat);
 }
 
@@ -939,14 +948,19 @@ static int generic_link_pathat(const struct vfs_path *old_path, int newdfd,
 
     existing = vfs_d_lookup(new_parent.dentry, &last);
     if (existing) {
-        ret = -EEXIST;
-        goto out;
-    }
-
-    new_dentry = vfs_d_alloc(new_parent.dentry->d_sb, new_parent.dentry, &last);
-    if (!new_dentry) {
-        ret = -ENOMEM;
-        goto out;
+        if (existing->d_inode) {
+            ret = -EEXIST;
+            goto out;
+        }
+        new_dentry = existing;
+        existing = NULL;
+    } else {
+        new_dentry =
+            vfs_d_alloc(new_parent.dentry->d_sb, new_parent.dentry, &last);
+        if (!new_dentry) {
+            ret = -ENOMEM;
+            goto out;
+        }
     }
 
     ret = new_dir->i_op->link(old_path->dentry, new_dir, new_dentry);

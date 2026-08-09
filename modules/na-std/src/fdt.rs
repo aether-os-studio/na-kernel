@@ -63,9 +63,8 @@ impl Node<'_> {
     }
 
     fn cells(bytes: &[u8]) -> u64 {
-        bytes.chunks_exact(4).fold(0, |value, cell| {
-            let cell = [cell[0], cell[1], cell[2], cell[3]];
-            value << 32 | u32::from_be_bytes(cell) as u64
+        bytes.as_chunks::<4>().0.iter().fold(0, |value, cell| {
+            value << 32 | u64::from(u32::from_be_bytes(*cell))
         })
     }
 
@@ -127,10 +126,10 @@ impl<D: Driver> DriverBuilder<D> {
         compatible: *const core::ffi::c_char,
     ) -> i32 {
         let Some(node) = Node::from_raw(raw) else {
-            return -19;
+            return Error::NoDevice.status();
         };
         if compatible.is_null() {
-            return -22;
+            return Error::InvalidArgument.status();
         }
         let compatible = unsafe { CStr::from_ptr(compatible) };
         let driver = unsafe { &*context.cast::<D>() };

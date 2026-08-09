@@ -312,6 +312,8 @@ uint64_t virtio_write(void *data, uint64_t lba, void *buffer, uint64_t count) {
     return ret / blk->block_size;
 }
 
+static int virtio_flush(void *data) { return virtio_blk_flush(data); }
+
 int virtio_blk_init(virtio_driver_t *driver) {
     uint64_t supported_features = (1ULL << 5) | (1ULL << 9) |
                                   VIRTIO_F_RING_INDIRECT_DESC |
@@ -432,7 +434,7 @@ int virtio_blk_init(virtio_driver_t *driver) {
 
     regist_blkdev(name, blk_device, blk_device->block_size,
                   config.capacity * blk_device->sector_size, PAGE_SIZE * 32,
-                  virtio_read, virtio_write);
+                  virtio_read, virtio_write, virtio_flush);
 
     return 0;
 }

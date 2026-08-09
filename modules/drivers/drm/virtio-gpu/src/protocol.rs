@@ -1,7 +1,6 @@
-use na_std::{Error, Result, bindings};
+use na_std::{Error, Result};
 
 pub const QUEUE_CONTROL: u16 = 0;
-pub const QUEUE_CURSOR: u16 = 1;
 pub const MAX_SCANOUTS: usize = 64;
 
 pub const FLAG_FENCE: u32 = 1;
@@ -14,10 +13,7 @@ pub const F_VERSION_1: u64 = 1 << 32;
 pub const SUPPORTED_FEATURES: u64 =
     F_VIRGL | F_EDID | F_CONTEXT_INIT | F_SUPPORTED_CAPSET_IDS | F_RING_INDIRECT_DESC | F_VERSION_1;
 
-pub const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 pub const FORMAT_B8G8R8X8_UNORM: u32 = 2;
-pub const FORMAT_A8R8G8B8_UNORM: u32 = 3;
-pub const FORMAT_X8R8G8B8_UNORM: u32 = 4;
 
 pub const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 pub const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
@@ -81,9 +77,7 @@ pub fn check_response(response: &[u8], expected: u32) -> Result<()> {
     if kind >= 0x1200 {
         return Err(Error::Kernel(-(kind as i32)));
     }
-    (kind == expected)
-        .then_some(())
-        .ok_or(Error::Kernel(-(bindings::EIO as i32)))
+    (kind == expected).then_some(()).ok_or(Error::Io)
 }
 
 pub fn rect(command: &mut [u8], offset: usize, x: u32, y: u32, w: u32, h: u32) {
@@ -93,8 +87,8 @@ pub fn rect(command: &mut [u8], offset: usize, x: u32, y: u32, w: u32, h: u32) {
     command[offset + 12..offset + 16].copy_from_slice(&h.to_le_bytes());
 }
 
-pub fn box3(command: &mut [u8], offset: usize, x: u32, y: u32, z: u32, w: u32, h: u32, d: u32) {
-    for (index, value) in [x, y, z, w, h, d].into_iter().enumerate() {
+pub fn box3(command: &mut [u8], offset: usize, values: [u32; 6]) {
+    for (index, value) in values.into_iter().enumerate() {
         command[offset + index * 4..offset + index * 4 + 4].copy_from_slice(&value.to_le_bytes());
     }
 }

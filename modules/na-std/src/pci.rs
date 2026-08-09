@@ -206,7 +206,7 @@ impl<D: Driver> DriverBuilder<D> {
         raw: *mut bindings::PciDevice,
     ) -> i32 {
         let Some(device) = Device::from_raw(raw) else {
-            return -19;
+            return Error::NoDevice.status();
         };
         let driver = unsafe { &*context.cast::<D>() };
         match driver.probe(device) {

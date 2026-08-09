@@ -827,6 +827,26 @@ static uint64_t nvme_wait_io_done(nvme_controller_t *ctrl, nvme_queue_t *queue,
     return 0;
 }
 
+static int nvme_flush(void *data) {
+    nvme_ns_t *ns = data;
+    nvme_queue_t *queue = nvme_pick_io_queue(ns->ctrl);
+    nvme_callback_ctx_t cb_ctx = {0};
+    nvme_sqe_t cmd = {0};
+    uint16_t cid = nvme_alloc_cid(ns->ctrl, nvme_io_callback, &cb_ctx);
+    if (cid == UINT16_MAX)
+        return -1;
+
+    cmd.cdw0 = NVME_CMD_FLUSH | ((uint32_t)cid << 16);
+    cmd.nsid = ns->ns->nsid;
+    if (nvme_submit_cmd(queue, &cmd) != 0) {
+        nvme_release_cid(ns->ctrl, cid);
+        return -1;
+    }
+    return nvme_wait_io_done(ns->ctrl, queue, &cb_ctx, 1, "flush", 5000) == 1
+               ? 0
+               : -1;
+}
+
 uint64_t nvme_read(void *data, uint64_t lba, void *buffer, uint64_t size) {
     nvme_ns_t *ns = data;
     nvme_queue_t *queue = nvme_pick_io_queue(ns->ctrl);
@@ -1022,7 +1042,7 @@ int nvme_probe(pci_device_t *device) {
                           ns->ns->block_count * ns->ns->block_size,
                           MIN(ns->ctrl->max_transfer_size,
                               NVME_MAX_PRP_LIST_ENTRIES * PAGE_SIZE),
-                          nvme_read, nvme_write);
+                          nvme_read, nvme_write, nvme_flush);
         }
     }
 

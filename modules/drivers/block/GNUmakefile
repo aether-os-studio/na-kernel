@@ -7,3 +7,5 @@ all:
 
 	$(call PRINT_STEP,MAKE,modules/drivers/block/virtio-blk)
 	$(Q)$(MAKE) -C virtio-blk
+
+fmt:

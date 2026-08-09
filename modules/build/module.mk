@@ -58,3 +58,5 @@ $(MODULE_META_OBJ): $(PROJECT_ROOT)/kernel/src/mod/module.h GNUmakefile \
 	$(Q)$(CC) $(CFLAGS) $(MODULE_INCLUDE_FLAGS) -x c -include $< \
 		-DMODULE_BUILD_NAME='"$(KM_NAME)"' -c /dev/null -o $@
 endif
+
+fmt:

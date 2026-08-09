@@ -8,6 +8,7 @@ void vfs_ops_init(void);
 
 void vfs_sync_inode_compat(struct vfs_inode *inode);
 void vfs_dentry_unhash(struct vfs_dentry *dentry);
+void vfs_dcache_shrink_super(struct vfs_super_block *sb);
 
 struct vfs_mount *vfs_active_namespace_root_mount(void);
 struct vfs_mount *vfs_child_mount_at(struct vfs_mount *parent,

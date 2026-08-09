@@ -17,6 +17,8 @@ typedef struct pty_pair {
 
     int masterFds;
     int slaveFds;
+    int active_releases;
+    bool cleanup_started;
 
     termios term;
     uint32_t input_speed;

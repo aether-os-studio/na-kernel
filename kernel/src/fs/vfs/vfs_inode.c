@@ -1,5 +1,6 @@
 #include "fs/vfs/vfs_internal.h"
 #include "mm/mm.h"
+#include "mm/cache.h"
 #include "task/task.h"
 
 static uint32_t vfs_mode_to_type(umode_t mode) {
@@ -38,7 +39,7 @@ struct vfs_inode *vfs_alloc_inode(struct vfs_super_block *sb) {
         return NULL;
     if (sb->s_op && sb->s_op->alloc_inode)
         inode = sb->s_op->alloc_inode(sb);
-    if (!inode)
+    else
         inode = calloc(1, sizeof(*inode));
     if (!inode) {
         vfs_put_super(sb);
@@ -105,8 +106,14 @@ void vfs_iput(struct vfs_inode *inode) {
     }
     if (sb && sb->s_op && sb->s_op->evict_inode)
         sb->s_op->evict_inode(inode);
+    /* Filesystems may evict cached data as part of their own teardown, but
+     * the VFS must not let an omitted callback leave cache entries pointing
+     * at an inode that is about to be destroyed. */
+    page_cache_evict(&inode->i_mapping);
     if (sb && sb->s_op && sb->s_op->destroy_inode)
         sb->s_op->destroy_inode(inode);
+    else
+        free(inode);
     if (sb)
         vfs_put_super(sb);
 }

@@ -1072,13 +1072,17 @@ bool dlinker_load(module_t *module) {
         return false;
     }
 
-    register_module_symbols(module, ehdr, module->load_base);
+    int init_status = dlinit();
+    if (init_status < 0) {
+        serial_fprintk("Module %s initialization failed: %d\n",
+                       module->module_name, init_status);
+        return false;
+    }
 
+    register_module_symbols(module, ehdr, module->load_base);
+    module->is_use = true;
     serial_fprintk("Loaded module %s at %#018lx\n", module->module_name,
                    module->load_base);
-
-    dlinit();
-    module->is_use = true;
     return true;
 }
 

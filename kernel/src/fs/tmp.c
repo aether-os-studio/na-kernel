@@ -493,6 +493,15 @@ static int tmpfs_tmpfile(struct vfs_inode *dir, struct vfs_file *file,
         vfs_dput(dentry);
         return -ENOENT;
     }
+    if (file->f_mode & VFS_FMODE_WRITE_ACCESS) {
+        int ret = vfs_inode_get_write_access(new_inode);
+        if (ret < 0) {
+            vfs_iput(new_inode);
+            vfs_path_put(&new_path);
+            vfs_dput(dentry);
+            return ret;
+        }
+    }
 
     old_path = file->f_path;
     file->f_path = new_path;

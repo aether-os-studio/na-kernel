@@ -54,6 +54,10 @@ sign-modules: modules module-signing-keys
 clippy:
 	$(MAKE) -C kernel clippy
 
+fmt:
+	$(MAKE) -C kernel fmt
+	$(MAKE) -C modules fmt
+
 clean:
 	$(MAKE) -C kernel clean
 	rm -rf obj-modules-$(ARCH) modules-$(ARCH)

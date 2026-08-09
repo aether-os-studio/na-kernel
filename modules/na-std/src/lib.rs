@@ -22,6 +22,7 @@ pub mod memory;
 pub mod pci;
 pub mod sync;
 pub mod user;
+pub mod vfs;
 pub mod virtio;
 
 pub use error::{Error, Result};
@@ -34,7 +35,7 @@ macro_rules! module_entry {
         pub extern "C" fn dlmain() -> i32 {
             match $init() {
                 Ok(()) => 0,
-                Err(_) => -1,
+                Err(error) => error.status(),
             }
         }
     };

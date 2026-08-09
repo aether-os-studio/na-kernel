@@ -38,6 +38,8 @@ int partition_ioctl(void *data, int cmd, void *args, fd_t *fd) {
         return part->ending_lba - part->starting_lba + 1;
     case DEV_CMD_SECTOR_SIZE:
         return partition_lba_size(part);
+    case DEV_CMD_FLUSH:
+        return blkdev_flush(part->blkdev_id);
     default:
         return -EINVAL;
     }

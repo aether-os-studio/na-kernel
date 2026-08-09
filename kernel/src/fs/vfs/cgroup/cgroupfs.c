@@ -1036,20 +1036,22 @@ static int cgroupfs_get_tree(struct vfs_fs_context *fc) {
     struct vfs_qstr root_name = {.name = "", .len = 0, .hash = 0};
     int ret;
 
-    if (!sb)
+    if (!sb) {
+        free(fsi);
+        fc->fs_private = NULL;
         return -ENOMEM;
+    }
 
     sb->s_op = &cgroupfs_super_ops;
     sb->s_magic = 0x63677270;
     sb->s_type = fc->fs_type;
     sb->s_fs_info = fsi;
+    fc->fs_private = NULL;
 
     root_inode =
         cgroupfs_new_inode(sb, NULL, cgroup_hierarchy_root(fsi->hierarchy),
                            CGROUPFS_INODE_DIR, S_IFDIR | 0755);
     if (!root_inode) {
-        free(fsi);
-        fc->fs_private = NULL;
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -1057,8 +1059,6 @@ static int cgroupfs_get_tree(struct vfs_fs_context *fc) {
     ret = cgroupfs_populate_dir(root_inode);
     if (ret < 0) {
         vfs_iput(root_inode);
-        free(fsi);
-        fc->fs_private = NULL;
         vfs_put_super(sb);
         return ret;
     }
@@ -1066,8 +1066,6 @@ static int cgroupfs_get_tree(struct vfs_fs_context *fc) {
     root_dentry = vfs_d_alloc(sb, NULL, &root_name);
     if (!root_dentry) {
         vfs_iput(root_inode);
-        free(fsi);
-        fc->fs_private = NULL;
         vfs_put_super(sb);
         return -ENOMEM;
     }
@@ -1075,7 +1073,6 @@ static int cgroupfs_get_tree(struct vfs_fs_context *fc) {
     vfs_d_instantiate(root_dentry, root_inode);
     sb->s_root = root_dentry;
     fc->sb = sb;
-    fc->fs_private = NULL;
     vfs_iput(root_inode);
     return 0;
 }

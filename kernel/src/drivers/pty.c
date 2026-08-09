@@ -658,12 +658,14 @@ static int ptmx_open_file(struct vfs_inode *inode, struct vfs_file *file) {
 static int ptmx_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     pty_pair_t *pair = pty_pair_from_file(file);
     bool notify_hup = false;
+    bool cleanup = false;
 
     (void)inode;
     if (!pair)
         return 0;
 
     spin_lock(&pair->lock);
+    pair->active_releases++;
     if (pair->masterFds > 0)
         pair->masterFds--;
     notify_hup = pair->masterFds == 0;
@@ -672,7 +674,16 @@ static int ptmx_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     if (notify_hup)
         pty_notify_slaves(pair, EPOLLHUP | EPOLLRDHUP | EPOLLIN | EPOLLOUT |
                                     EPOLLRDNORM | EPOLLWRNORM);
-    if (!pair->masterFds && !pair->slaveFds)
+
+    spin_lock(&pair->lock);
+    pair->active_releases--;
+    if (!pair->masterFds && !pair->slaveFds && !pair->active_releases &&
+        !pair->cleanup_started) {
+        pair->cleanup_started = true;
+        cleanup = true;
+    }
+    spin_unlock(&pair->lock);
+    if (cleanup)
         pty_pair_cleanup(pair);
     file->private_data = NULL;
     return 0;
@@ -1042,11 +1053,13 @@ static int pts_open_file(struct vfs_inode *inode, struct vfs_file *file) {
 static int pts_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     pty_pair_t *pair = pty_pair_from_file(file);
     bool notify_hup = false;
+    bool cleanup = false;
     (void)inode;
     if (!pair)
         return 0;
 
     spin_lock(&pair->lock);
+    pair->active_releases++;
     if (pair->slaveFds > 0)
         pair->slaveFds--;
     notify_hup = pair->slaveFds == 0;
@@ -1055,7 +1068,16 @@ static int pts_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     if (notify_hup)
         pty_notify_master(pair, EPOLLHUP | EPOLLRDHUP | EPOLLIN | EPOLLOUT |
                                     EPOLLRDNORM | EPOLLWRNORM);
-    if (!pair->masterFds && !pair->slaveFds)
+
+    spin_lock(&pair->lock);
+    pair->active_releases--;
+    if (!pair->masterFds && !pair->slaveFds && !pair->active_releases &&
+        !pair->cleanup_started) {
+        pair->cleanup_started = true;
+        cleanup = true;
+    }
+    spin_unlock(&pair->lock);
+    if (cleanup)
         pty_pair_cleanup(pair);
     file->private_data = NULL;
     return 0;

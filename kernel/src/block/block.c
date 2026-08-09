@@ -239,7 +239,8 @@ void regist_blkdev(char *name, void *ptr, uint64_t block_size, uint64_t size,
                    uint64_t (*read)(void *data, uint64_t lba, void *buffer,
                                     uint64_t size),
                    uint64_t (*write)(void *data, uint64_t lba, void *buffer,
-                                     uint64_t size)) {
+                                     uint64_t size),
+                   int (*flush)(void *data)) {
     blkdev_t *dev = (blkdev_t *)malloc(sizeof(blkdev_t));
     dev->name = strdup(name);
     dev->ptr = ptr;
@@ -248,6 +249,7 @@ void regist_blkdev(char *name, void *ptr, uint64_t block_size, uint64_t size,
     dev->max_op_size = max_op_size;
     dev->read = read;
     dev->write = write;
+    dev->flush = flush;
 
     blkdev_register(dev);
     blkdev_mount(dev);
@@ -550,4 +552,13 @@ uint64_t blkdev_write(uint64_t drive, uint64_t offset, const void *buf,
     }
 
     return total;
+}
+
+int blkdev_flush(uint64_t drive) {
+    blkdev_t *dev = find_blkdev_by_id(drive);
+    if (!dev)
+        return -ENODEV;
+    if (!dev->flush)
+        return -EOPNOTSUPP;
+    return dev->flush(dev->ptr);
 }
