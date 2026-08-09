@@ -274,8 +274,10 @@ static void notifyfs_watch_unindex_locked(notifyfs_watch_t *watch,
     entry = watch->bucket;
     if (!entry && watch->watch_inode)
         entry = notifyfs_find_bucket_entry_locked(bucket, watch->watch_inode);
-    if (entry && !llist_empty(&watch->inode_node))
+    if (entry && !llist_empty(&watch->inode_node)) {
         llist_delete(&watch->inode_node);
+        __atomic_sub_fetch(&entry->inode->notify_watchers, 1, __ATOMIC_RELEASE);
+    }
 
     watch->bucket = NULL;
     if (drop_empty_entry && entry && llist_empty(&entry->watches)) {
@@ -309,8 +311,10 @@ static int notifyfs_watch_index_locked(notifyfs_watch_t *watch) {
         llist_append(&bucket->entries, &entry->node);
     }
 
-    if (llist_empty(&watch->inode_node))
+    if (llist_empty(&watch->inode_node)) {
         llist_append(&entry->watches, &watch->inode_node);
+        __atomic_add_fetch(&entry->inode->notify_watchers, 1, __ATOMIC_RELEASE);
+    }
     watch->bucket = entry;
     spin_unlock(&bucket->lock);
     return 0;
@@ -726,6 +730,8 @@ bool notifyfs_queue_inode_event(struct vfs_inode *watch_inode,
     uint64_t event_mask;
 
     if (!watch_inode || !mask)
+        return false;
+    if (!__atomic_load_n(&watch_inode->notify_watchers, __ATOMIC_ACQUIRE))
         return false;
 
     event_mask = mask;

@@ -899,11 +899,6 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_FCHMODAT2, (syscall_handle_t)sys_fchmodat2);
 }
 
-static inline uint64_t syscall_account_running_ns(task_t *task,
-                                                  uint64_t now_ns) {
-    return task_account_runtime_ns(task, now_ns);
-}
-
 void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     uint64_t idx = regs->rax & 0xFFFFFFFF;
     bool irq_enabled_for_syscall = false;
@@ -921,14 +916,18 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
         regs->rax = (uint64_t)-ENOSYS;
         goto done;
     }
+    self->in_syscall = true;
 
     arch_enable_interrupt();
     irq_enabled_for_syscall = true;
 
     regs->rax = self->last_syscall_ret;
-    ptrace_on_syscall_enter(regs);
+    if (ptrace_is_traced(self))
+        ptrace_on_syscall_enter(regs);
 
-    task_membarrier_checkpoint(self);
+    if (self->mm && __atomic_load_n(&self->mm->membarrier_private_expedited_seq,
+                                    __ATOMIC_ACQUIRE))
+        task_membarrier_checkpoint(self);
 
     uint64_t arg1 = regs->rdi;
     uint64_t arg2 = regs->rsi;
@@ -936,10 +935,6 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
     uint64_t arg4 = regs->r10;
     uint64_t arg5 = regs->r8;
     uint64_t arg6 = regs->r9;
-
-    if (self)
-        syscall_account_running_ns(self, nano_time());
-    uint64_t syscall_user_base = self ? self->user_time_ns : 0;
 
     if (idx >= MAX_SYSCALL_NUM) {
         regs->rax = (uint64_t)-ENOSYS;
@@ -967,17 +962,11 @@ void syscall_handler(struct pt_regs *regs, uint64_t user_rsp) {
         regs->rax |= 0xffffffff00000000;
 
 done:
-    if (self) {
-        syscall_account_running_ns(self, nano_time());
-
-        if (self->user_time_ns > syscall_user_base)
-            self->system_time_ns += self->user_time_ns - syscall_user_base;
-    }
-
     if (self)
         self->last_syscall_ret = regs->rax;
 
-    ptrace_on_syscall_exit(regs);
+    if (ptrace_is_traced(self))
+        ptrace_on_syscall_exit(regs);
 
     if (idx != SYS_BRK && idx != SYS_RSEQ && regs->rax == (uint64_t)-ENOSYS) {
         serial_fprintk("syscall %d not implemented\n", idx);
@@ -986,10 +975,11 @@ done:
         serial_fprintk("syscall %d accessed a invalid address\n", idx);
     }
 
-    sched_resched_if_needed();
+    if (task_need_resched(self))
+        sched_resched_if_needed();
 
-    if (self && (self->signal->sighand->group_exit ||
-                 (self->signal && self->signal->signal != 0)))
+    if (self && self->signal &&
+        (self->signal->sighand->group_exit || self->signal->signal != 0))
         task_signal(regs);
 
     if (idx != SYS_RT_SIGRETURN) {
@@ -997,6 +987,8 @@ done:
         regs->r11 = regs->rflags;
     }
 
+    if (self)
+        self->in_syscall = false;
     if (irq_enabled_for_syscall)
         arch_disable_interrupt();
 }

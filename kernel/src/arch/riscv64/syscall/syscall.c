@@ -790,6 +790,7 @@ void riscv64_do_syscall(struct pt_regs *frame) {
         frame->sepc += 4;
         return;
     }
+    self->in_syscall = true;
 
     frame->a0 = self->last_syscall_ret;
     frame->syscallno = idx;
@@ -826,4 +827,5 @@ done:
     if (!restored_context && frame->sepc == next_sepc - 4) {
         frame->sepc = next_sepc;
     }
+    self->in_syscall = false;
 }

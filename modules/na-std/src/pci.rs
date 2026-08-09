@@ -43,6 +43,10 @@ pub struct Device<'a> {
 }
 
 impl Device<'_> {
+    const COMMAND_OFFSET: u16 = 0x04;
+    const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+    const COMMAND_BUS_MASTER: u16 = 1 << 2;
+
     pub fn info(&self) -> Result<DeviceInfo> {
         let mut raw = bindings::PciDeviceInfo::default();
         let status = unsafe { bindings::na_pci_device_info(self.raw.ptr.as_ptr(), &mut raw) };
@@ -96,6 +100,17 @@ impl Device<'_> {
             bindings::na_pci_config_write(self.raw.ptr.as_ptr(), offset, T::WIDTH, value.into_u32())
         };
         Error::from_status(status)
+    }
+
+    pub fn enable_memory_and_bus_master(&mut self) -> Result<()> {
+        let command = self.read_config::<u16>(Self::COMMAND_OFFSET)?;
+        let required = Self::COMMAND_MEMORY_SPACE | Self::COMMAND_BUS_MASTER;
+        self.write_config(Self::COMMAND_OFFSET, command | required)?;
+
+        if self.read_config::<u16>(Self::COMMAND_OFFSET)? & required != required {
+            return Err(Error::Io);
+        }
+        Ok(())
     }
 
     pub(crate) fn from_raw(raw: *mut bindings::PciDevice) -> Option<Self> {

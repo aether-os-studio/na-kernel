@@ -2403,43 +2403,49 @@ uint64_t sys_copy_file_range(uint64_t fd_in, int *offset_in_user,
 
 uint64_t sys_read(uint64_t fd, void *buf, uint64_t len) {
     struct vfs_file *file;
+    bool needs_put;
 
     if (rw_validate_user_buffer(buf, len) < 0) {
         return (uint64_t)-EFAULT;
     }
-    file = task_get_file(current_task, (int)fd);
+    file = task_get_file_for_io(current_task, (int)fd, &needs_put);
     if (!file)
         return (uint64_t)-EBADF;
     if (S_ISDIR(file->f_inode->i_mode)) {
-        vfs_file_put(file);
+        if (needs_put)
+            vfs_file_put(file);
         return (uint64_t)-EISDIR;
     }
 
     ssize_t ret = (ssize_t)vfs_read_file(file, buf, len, NULL);
 
-    vfs_file_put(file);
+    if (needs_put)
+        vfs_file_put(file);
 
     return ret;
 }
 
 uint64_t sys_write(uint64_t fd, const void *buf, uint64_t len) {
     struct vfs_file *file;
+    bool needs_put;
 
     if (len != 0 && rw_validate_user_buffer(buf, len) < 0) {
         return (uint64_t)-EFAULT;
     }
 
-    file = task_get_file(current_task, (int)fd);
+    file = task_get_file_for_io(current_task, (int)fd, &needs_put);
     if (!file)
         return (uint64_t)-EBADF;
     if (S_ISDIR(file->f_inode->i_mode)) {
-        vfs_file_put(file);
+        if (needs_put)
+            vfs_file_put(file);
         return (uint64_t)-EISDIR;
     }
 
     ssize_t ret = (ssize_t)vfs_write_file(file, buf, len, NULL);
 
-    vfs_file_put(file);
+    if (needs_put)
+        vfs_file_put(file);
     return ret;
 }
 

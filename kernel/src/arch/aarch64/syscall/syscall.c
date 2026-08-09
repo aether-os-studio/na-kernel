@@ -832,6 +832,7 @@ void aarch64_do_syscall(struct pt_regs *frame) {
         frame->x0 = (uint64_t)-ENOSYS;
         goto done;
     }
+    self->in_syscall = true;
 
     frame->x0 = self->last_syscall_ret;
     frame->syscallno = idx;
@@ -876,4 +877,6 @@ done:
 
     task_signal(frame);
     frame->syscallno = NO_SYSCALL;
+    if (self)
+        self->in_syscall = false;
 }

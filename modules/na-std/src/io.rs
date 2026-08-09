@@ -46,6 +46,19 @@ impl MmioRegion {
         Ok(unsafe { ptr.as_ptr().read_volatile() })
     }
 
+    pub fn read_into(&self, offset: usize, destination: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(destination.len())
+            .ok_or(Error::InvalidArgument)?;
+        if end > self.length {
+            return Err(Error::InvalidArgument);
+        }
+        for (index, byte) in destination.iter_mut().enumerate() {
+            *byte = self.read::<u8>(offset + index)?;
+        }
+        Ok(())
+    }
+
     pub fn write<T: RegisterValue>(&mut self, offset: usize, value: T) -> Result<()> {
         let ptr = self.register::<T>(offset)?;
         unsafe { ptr.as_ptr().write_volatile(value) };

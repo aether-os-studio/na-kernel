@@ -78,6 +78,21 @@ impl PhysicalRange {
         self.length
     }
 
+    pub fn subrange(self, offset: usize, length: usize) -> Result<Self> {
+        let end = offset.checked_add(length).ok_or(Error::InvalidArgument)?;
+        if length == 0 || end > self.length {
+            return Err(Error::InvalidArgument);
+        }
+        let offset = u64::try_from(offset).map_err(|_| Error::InvalidArgument)?;
+        let length = u64::try_from(length).map_err(|_| Error::InvalidArgument)?;
+        let start = self
+            .start
+            .get()
+            .checked_add(offset)
+            .ok_or(Error::InvalidArgument)?;
+        Self::new(start, length)
+    }
+
     pub(crate) fn new(start: u64, length: u64) -> Result<Self> {
         let length = usize::try_from(length).map_err(|_| Error::InvalidArgument)?;
         if length == 0 || start.checked_add(length as u64).is_none() {

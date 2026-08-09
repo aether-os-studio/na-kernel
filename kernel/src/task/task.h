@@ -222,7 +222,10 @@ static inline uint64_t task_account_runtime_ns(task_t *task, uint64_t now_ns) {
     uint64_t delta = now_ns - task->last_sched_in_ns;
     task->last_sched_in_ns = now_ns;
 
-    task->user_time_ns += delta;
+    if (task->is_kernel || task->in_syscall)
+        task->system_time_ns += delta;
+    else
+        task->user_time_ns += delta;
     if (task->signal && task->signal->cpu_account)
         __atomic_add_fetch(&task->signal->cpu_account->runtime_ns, delta,
                            __ATOMIC_RELAXED);
@@ -320,6 +323,7 @@ int task_fd_slot_install(fd_info_t *fd_info, int fd, struct vfs_file *file,
 struct vfs_file *task_fd_slot_take(fd_info_t *fd_info, int fd,
                                    unsigned int *flags);
 struct vfs_file *task_get_file(task_t *task, int fd);
+struct vfs_file *task_get_file_for_io(task_t *task, int fd, bool *needs_put);
 int task_get_fd_flags_for_file(task_t *task, int fd, struct vfs_file *file,
                                unsigned int *flags);
 int task_set_fd_flags_mask_for_file(task_t *task, int fd, struct vfs_file *file,

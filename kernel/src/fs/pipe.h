@@ -6,6 +6,7 @@
 
 #define PIPE_BUFF (512 * 1024)
 #define PIPE_ATOMIC_MAX MIN(PIPE_BUFF, PAGE_SIZE)
+#define PIPE_WRITE_BATCH MIN(PIPE_BUFF, 16 * PAGE_SIZE)
 #define PIPE_MAX_BUFFERS (PIPE_BUFF / PAGE_SIZE + 32)
 #define PIPE_PAGE_CACHE_MAX 16
 
@@ -26,6 +27,9 @@ typedef struct pipe_info {
     uint32_t nr_buffers;
     uint32_t nr_cached_pages;
     uint64_t cached_pages[PIPE_PAGE_CACHE_MAX];
+
+    struct llist_header write_waiters;
+    size_t write_wakeup;
 
     int write_fds;
     int read_fds;

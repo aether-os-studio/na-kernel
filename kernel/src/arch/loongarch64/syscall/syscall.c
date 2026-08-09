@@ -610,6 +610,7 @@ void loongarch64_do_syscall(struct pt_regs *frame) {
         frame->pc += 4;
         return;
     }
+    self->in_syscall = true;
 
     frame->a0 = self->last_syscall_ret;
     frame->syscallno = idx;
@@ -645,4 +646,5 @@ done:
     if (!restored_context && frame->pc == next_pc - 4) {
         frame->pc = next_pc;
     }
+    self->in_syscall = false;
 }

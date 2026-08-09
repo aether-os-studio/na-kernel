@@ -18,6 +18,13 @@ typedef struct pipefs_inode_info {
     struct vfs_inode vfs_inode;
 } pipefs_inode_info_t;
 
+typedef struct pipefs_write_waiter {
+    struct llist_header node;
+    task_t *task;
+    size_t min_space;
+    bool notified;
+} pipefs_write_waiter_t;
+
 static struct vfs_file_system_type pipefs_fs_type;
 static const struct vfs_super_operations pipefs_super_ops;
 static const struct vfs_file_operations pipefs_dir_file_ops;
@@ -54,24 +61,86 @@ static pipe_info_t *pipefs_alloc_info(void) {
     if (!info)
         return NULL;
     spin_init(&info->lock);
+    llist_init_head(&info->write_waiters);
     return info;
+}
+
+static void pipefs_recompute_write_wakeup_locked(pipe_info_t *pipe) {
+    pipefs_write_waiter_t *waiter, *tmp;
+    size_t min_space = 0;
+
+    llist_for_each(waiter, tmp, &pipe->write_waiters, node) {
+        if (waiter->notified)
+            continue;
+        if (!min_space || waiter->min_space < min_space)
+            min_space = waiter->min_space;
+    }
+    pipe->write_wakeup = min_space;
+}
+
+static void pipefs_wake_writers_locked(pipe_info_t *pipe, bool force) {
+    pipefs_write_waiter_t *waiter, *tmp;
+    size_t available;
+
+    if (!pipe || llist_empty(&pipe->write_waiters))
+        return;
+
+    available = PIPE_BUFF - pipe->ptr;
+    if (!force && (!pipe->write_wakeup || available < pipe->write_wakeup))
+        return;
+
+    llist_for_each(waiter, tmp, &pipe->write_waiters, node) {
+        if (waiter->notified || (!force && available < waiter->min_space))
+            continue;
+        waiter->notified = true;
+        task_unblock(waiter->task, EOK);
+    }
+    pipefs_recompute_write_wakeup_locked(pipe);
+}
+
+static int pipefs_wait_write_space(pipe_info_t *pipe, size_t min_space) {
+    pipefs_write_waiter_t waiter = {
+        .task = current_task,
+        .min_space = min_space,
+    };
+    int reason;
+
+    llist_init_head(&waiter.node);
+    task_prepare_block(current_task);
+
+    spin_lock(&pipe->lock);
+    if (pipe->read_fds == 0 || PIPE_BUFF - pipe->ptr >= min_space) {
+        spin_unlock(&pipe->lock);
+        task_cancel_block_prepare(current_task);
+        return EOK;
+    }
+    llist_append(&pipe->write_waiters, &waiter.node);
+    if (!pipe->write_wakeup || min_space < pipe->write_wakeup)
+        pipe->write_wakeup = min_space;
+    spin_unlock(&pipe->lock);
+
+    if (task_signal_has_deliverable(current_task))
+        reason = -EINTR;
+    else
+        reason = task_block(current_task, TASK_BLOCKING, -1, "pipe_write");
+
+    spin_lock(&pipe->lock);
+    if (!llist_empty(&waiter.node))
+        llist_delete(&waiter.node);
+    pipefs_recompute_write_wakeup_locked(pipe);
+    spin_unlock(&pipe->lock);
+    task_cancel_block_prepare(current_task);
+
+    if (reason < 0)
+        return reason;
+    if (reason != EOK && task_signal_has_deliverable(current_task))
+        return -EINTR;
+    return EOK;
 }
 
 static void pipefs_notify_node(vfs_node_t *node, uint32_t events) {
     if (node && events)
         vfs_poll_notify_inode(node, events);
-}
-
-static void pipefs_update_size_locked(pipe_info_t *pipe,
-                                      struct vfs_file *file) {
-    if (!pipe)
-        return;
-    if (file && file->f_inode)
-        file->f_inode->i_size = pipe->ptr;
-    if (pipe->write_node)
-        pipe->write_node->i_size = pipe->ptr;
-    if (pipe->read_node)
-        pipe->read_node->i_size = pipe->ptr;
 }
 
 static pipe_buffer_t *pipefs_buffers(pipe_info_t *pipe) {
@@ -277,6 +346,7 @@ static bool pipefs_move_one_locked(pipe_info_t *dst, pipe_info_t *src,
 
     dst->ptr += (uint32_t)chunk;
     pipefs_buffer_consume_locked(src, in, chunk);
+    pipefs_wake_writers_locked(src, false);
     if (moved)
         *moved = chunk;
     return true;
@@ -556,16 +626,18 @@ static ssize_t pipe_read_inner(struct vfs_file *file, void *addr, size_t size,
         spin_lock(&pipe->lock);
 
         if (pipe->ptr > 0) {
+            bool was_full = pipe->ptr == PIPE_BUFF;
             size_t to_read = MIN(size, pipe->ptr);
             to_read = pipefs_copy_out_locked(pipe, addr, to_read);
-            pipefs_update_size_locked(pipe, file);
+            pipefs_wake_writers_locked(pipe, false);
             vfs_node_t *write_node = pipe->write_node;
-            if (write_node)
+            if (was_full && write_node)
                 vfs_igrab(write_node);
             spin_unlock(&pipe->lock);
 
-            pipefs_notify_node(write_node, EPOLLOUT | EPOLLWRNORM);
-            if (write_node)
+            if (was_full)
+                pipefs_notify_node(write_node, EPOLLOUT | EPOLLWRNORM);
+            if (was_full && write_node)
                 vfs_iput(write_node);
             return (ssize_t)to_read;
         }
@@ -623,6 +695,9 @@ static ssize_t pipe_write_inner(struct vfs_file *file, const void *addr,
     pipe = spec->info;
 
     while (true) {
+        bool nonblock = file->f_flags & O_NONBLOCK;
+        size_t wait_space = atomic ? size : (size_t)PIPE_WRITE_BATCH;
+
         spin_lock(&pipe->lock);
 
         if (pipe->read_fds == 0) {
@@ -632,7 +707,7 @@ static ssize_t pipe_write_inner(struct vfs_file *file, const void *addr,
         }
 
         size_t available = PIPE_BUFF - pipe->ptr;
-        if (available > 0 && (!atomic || available >= size)) {
+        if ((atomic && available >= size) || (!atomic && available > 0)) {
             bool was_empty = pipe->ptr == 0;
             size_t to_write = atomic ? size : MIN(size, available);
             to_write = pipefs_ring_write_locked(pipe, addr, to_write);
@@ -640,7 +715,6 @@ static ssize_t pipe_write_inner(struct vfs_file *file, const void *addr,
                 spin_unlock(&pipe->lock);
                 return -ENOMEM;
             }
-            pipefs_update_size_locked(pipe, file);
             vfs_node_t *read_node = pipe->read_node;
             if (was_empty && read_node)
                 vfs_igrab(read_node);
@@ -657,11 +731,10 @@ static ssize_t pipe_write_inner(struct vfs_file *file, const void *addr,
 
         if (!allow_wait)
             return 0;
-        if (file->f_flags & O_NONBLOCK)
+        if (nonblock)
             return -EWOULDBLOCK;
 
-        int reason = vfs_poll_wait_interruptible(
-            file, EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLNVAL);
+        int reason = pipefs_wait_write_space(pipe, wait_space);
         if (reason < 0)
             return reason;
     }
@@ -771,6 +844,8 @@ static int pipefs_release(struct vfs_inode *inode, struct vfs_file *file) {
         if (pipe->read_fds > 0) {
             pipe->read_fds--;
         }
+        if (pipe->read_fds == 0)
+            pipefs_wake_writers_locked(pipe, true);
         if (pipe->owns_node_refs && pipe->read_fds == 0 && pipe->read_node) {
             drop_read_node = pipe->read_node;
             pipe->read_node = NULL;
@@ -1135,8 +1210,6 @@ static ssize_t pipefs_splice_pipe_to_pipe(struct vfs_file *in,
                 break;
             return -ENOMEM;
         }
-        pipefs_update_size_locked(ipipe, in);
-        pipefs_update_size_locked(opipe, out);
         if (ipipe->write_node)
             write_node = vfs_igrab(ipipe->write_node);
         if (was_empty && opipe->read_node)
@@ -1212,7 +1285,7 @@ ssize_t pipefs_splice_to(struct vfs_file *in, struct vfs_file *out,
         spin_lock(&pipe->lock);
         pipefs_buffer_consume_locked(pipe, pipefs_front_buffer(pipe),
                                      (size_t)wr);
-        pipefs_update_size_locked(pipe, in);
+        pipefs_wake_writers_locked(pipe, false);
         if (pipe->write_node)
             write_node = vfs_igrab(pipe->write_node);
         spin_unlock(&pipe->lock);
@@ -1299,7 +1372,6 @@ ssize_t pipefs_splice_from_user(struct vfs_file *file, const struct iovec *iov,
                     return ret;
                 continue;
             }
-            pipefs_update_size_locked(pipe, file);
             if (was_empty && pipe->read_node)
                 read_node = vfs_igrab(pipe->read_node);
             spin_unlock(&pipe->lock);

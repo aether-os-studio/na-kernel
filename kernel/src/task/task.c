@@ -408,23 +408,58 @@ fd_info_t *task_fd_info_detach(task_t *task) {
 struct vfs_file *task_get_file(task_t *task, int fd) {
     struct vfs_file *file = NULL;
     fd_info_t *fd_info;
+    bool borrowed_fd_info = false;
 
     if (!task || fd < 0)
         return NULL;
 
-    fd_info = task_fd_info_get(task);
+    /*
+     * The running task cannot replace its own fd table concurrently with this
+     * lookup. Avoid taking a temporary fd_info reference on every read/write;
+     * shared tables are still serialized by fdt_lock below.
+     */
+    if (task == current_task) {
+        fd_info = __atomic_load_n(&task->fd_info, __ATOMIC_ACQUIRE);
+        borrowed_fd_info = true;
+    } else {
+        fd_info = task_fd_info_get(task);
+    }
     if (!fd_info)
         return NULL;
 
     with_fd_info_lock(fd_info, {
         if ((size_t)fd >= fd_info->max_fds)
             break;
-        file = vfs_file_get(fd_info->fds[fd].file);
+        file = fd_info->fds[fd].file;
+        if (file)
+            vfs_ref_get(&file->f_ref);
     });
 
-    task_fd_info_put(fd_info, task);
+    if (!borrowed_fd_info)
+        task_fd_info_put(fd_info, task);
 
     return file;
+}
+
+struct vfs_file *task_get_file_for_io(task_t *task, int fd, bool *needs_put) {
+    fd_info_t *fd_info;
+
+    if (needs_put)
+        *needs_put = true;
+    if (!task || fd < 0)
+        return NULL;
+
+    fd_info = __atomic_load_n(&task->fd_info, __ATOMIC_ACQUIRE);
+    if (task == current_task && fd_info &&
+        task_fd_info_ref_read(fd_info) == 1 && (size_t)fd < fd_info->max_fds) {
+        struct vfs_file *file =
+            __atomic_load_n(&fd_info->fds[fd].file, __ATOMIC_ACQUIRE);
+        if (file && needs_put)
+            *needs_put = false;
+        return file;
+    }
+
+    return task_get_file(task, fd);
 }
 
 int task_get_fd_flags_for_file(task_t *task, int fd, struct vfs_file *file,

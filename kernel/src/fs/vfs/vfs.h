@@ -484,6 +484,7 @@ struct vfs_inode {
     vfs_ref_t i_ref;
     wait_queue_head_t poll_wait;
     uint64_t poll_seq;
+    volatile uint32_t notify_watchers;
 };
 
 #define VFS_FMODE_WRITE_ACCESS (1U << 0)

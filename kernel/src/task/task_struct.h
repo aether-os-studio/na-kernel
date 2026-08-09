@@ -435,6 +435,7 @@ typedef struct task {
     bool ptrace_wait_pending;
     bool ptrace_syscall_exit_pending;
     bool ptrace_exec_event_pending;
+    bool in_syscall;
     uint32_t personality;
     uint64_t clone_flags;
     uint64_t flags;
