@@ -1,6 +1,8 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 pub mod acpi;
 pub mod arch;
 #[allow(
@@ -16,6 +18,7 @@ pub mod bindings {
 pub mod drm;
 pub mod error;
 pub mod fdt;
+pub mod firmware;
 pub mod io;
 pub mod log;
 pub mod memory;

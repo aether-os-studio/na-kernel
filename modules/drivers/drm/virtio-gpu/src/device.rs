@@ -1,7 +1,7 @@
+use alloc::{boxed::Box, vec::Vec};
 use na_std::{
     Error, KernelLog, Result,
     drm::{self, FileId},
-    memory::{KernelBox, KernelVec},
     sync::Mutex,
     virtio,
 };
@@ -10,10 +10,10 @@ use crate::{buffer::Buffer, display::DisplayState, protocol};
 
 pub struct State {
     pub display: DisplayState,
-    pub buffers: KernelVec<Buffer>,
-    pub capsets: KernelVec<Capset>,
-    pub contexts: KernelVec<Context>,
-    pub files: KernelVec<FileState>,
+    pub buffers: Vec<Buffer>,
+    pub capsets: Vec<Capset>,
+    pub contexts: Vec<Context>,
+    pub files: Vec<FileState>,
     pub next_handle: u32,
     pub next_resource: u32,
     pub next_context: u32,
@@ -30,13 +30,13 @@ pub struct Capset {
 
 pub struct Context {
     pub id: u32,
-    pub resources: KernelVec<u32>,
+    pub resources: Vec<u32>,
 }
 
 pub struct FileState {
     pub id: FileId,
     pub context: Option<u32>,
-    pub handles: KernelVec<u32>,
+    pub handles: Vec<u32>,
 }
 
 pub struct GpuDevice {
@@ -46,35 +46,35 @@ pub struct GpuDevice {
 }
 
 impl GpuDevice {
-    pub fn new(mut device: virtio::Device) -> Result<KernelBox<Self>> {
+    pub fn new(mut device: virtio::Device) -> Result<Box<Self>> {
         let control = device.queue(protocol::QUEUE_CONTROL)?;
         KernelLog::write(c"virtio-gpu: control queue ready\n");
         device.finish();
         let display = DisplayState::query(&control)?;
-        let mut capsets = KernelVec::new();
+        let mut capsets = Vec::new();
         let capset_count = device.config_read(12);
         for index in 0..capset_count {
             if let Some(capset) = Self::query_capset(&control, index)? {
-                capsets.push(capset)?;
+                capsets.push(capset);
             }
         }
         let state = Mutex::new(State {
             display,
-            buffers: KernelVec::new(),
+            buffers: Vec::new(),
             capsets,
-            contexts: KernelVec::new(),
-            files: KernelVec::new(),
+            contexts: Vec::new(),
+            files: Vec::new(),
             next_handle: 1,
             next_resource: 1,
             next_context: 1,
             next_fence: 1,
             current_scanout: None,
         })?;
-        KernelBox::new(Self {
+        Ok(Box::new(Self {
             device,
             control,
             state,
-        })
+        }))
     }
 
     fn query_capset(queue: &virtio::Queue, index: u32) -> Result<Option<Capset>> {
@@ -107,7 +107,7 @@ impl GpuDevice {
         .render_node(true)
         .register(pci.as_ref())?;
         KernelLog::write(c"virtio-gpu: drm registered\n");
-        let _ = KernelBox::leak(KernelBox::new(drm)?);
+        let _ = Box::leak(Box::new(drm));
         Ok(())
     }
 
@@ -172,10 +172,9 @@ impl GpuDevice {
             detach.put_u32(24, resource_id);
             let mut response = [0; 24];
             self.submit(&detach, None, &mut response, protocol::RESP_OK_NODATA)?;
-            let _ = state
-                .contexts
-                .get_mut(context_index)
-                .and_then(|context| context.resources.remove(resource_index));
+            if let Some(context) = state.contexts.get_mut(context_index) {
+                context.resources.remove(resource_index);
+            }
         }
 
         let mut response = [0; 24];
@@ -185,7 +184,7 @@ impl GpuDevice {
         let mut unref = protocol::Command::<32>::new(protocol::CMD_RESOURCE_UNREF);
         unref.put_u32(24, resource_id);
         self.submit(&unref, None, &mut response, protocol::RESP_OK_NODATA)?;
-        let _ = state.buffers.remove(index).ok_or(Error::NotFound)?;
+        state.buffers.remove(index);
         Ok(())
     }
 }

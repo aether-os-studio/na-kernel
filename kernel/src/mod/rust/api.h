@@ -51,7 +51,11 @@ typedef struct na_acpi_table {
 void *na_memory_allocate(uint64_t bytes);
 void na_memory_free(void *ptr, uint64_t bytes);
 void *na_heap_allocate(size_t bytes);
+void *na_heap_allocate_aligned(size_t bytes, size_t alignment);
+void *na_heap_reallocate(void *ptr, size_t bytes);
+void *na_heap_reallocate_aligned(void *ptr, size_t bytes, size_t alignment);
 void na_heap_free(void *ptr);
+int na_firmware_request(const char *name, void **data, size_t *size);
 uint64_t na_memory_physical_address(const void *ptr);
 void na_dma_sync_for_device(void *address, size_t size);
 void na_dma_sync_for_cpu(void *address, size_t size);

@@ -38,7 +38,7 @@ $(RUST_STATICLIB): $(RUST_SOURCE_DEPENDENCIES) \
 	$(call PRINT_STEP,CARGO,$(KM_NAME))
 	$(Q)CARGO_TARGET_DIR=$(CARGO_TARGET_DIR) RUSTC=$(RUSTC) BINDGEN=$(BINDGEN) \
 		RUSTFLAGS='-C relocation-model=pic' \
-		$(CARGO) build -Z build-std=core --target $(RUST_TARGET) \
+		$(CARGO) build -Z build-std=core,alloc --target $(RUST_TARGET) \
 			--profile $(CARGO_PROFILE)
 
 $(RUST_META_OBJ): $(PROJECT_ROOT)/kernel/src/mod/module.h GNUmakefile \

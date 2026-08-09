@@ -17,7 +17,7 @@ CARGO_TARGET_DIR := $(PROJECT_ROOT)/obj-modules-$(ARCH)/$(BUILD_MODE)/na-std
 CARGO ?= cargo
 RUSTC ?= rustc
 BINDGEN ?= bindgen
-CARGO_FLAGS := -Z build-std=core --target $(RUST_TARGET) \
+CARGO_FLAGS := -Z build-std=core,alloc --target $(RUST_TARGET) \
 	--profile $(CARGO_PROFILE)
 
 .PHONY: all check fmt

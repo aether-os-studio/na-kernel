@@ -1,6 +1,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 mod buffer;
 mod device;
 mod display;
@@ -21,7 +23,7 @@ impl virtio::Driver for Driver {
 
     fn probe(&self, device: virtio::Device) -> Result<()> {
         let gpu = GpuDevice::new(device)?;
-        let gpu = na_std::memory::KernelBox::leak(gpu);
+        let gpu = alloc::boxed::Box::leak(gpu);
         gpu.start()?;
         Ok(())
     }

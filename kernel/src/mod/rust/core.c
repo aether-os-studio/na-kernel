@@ -8,6 +8,71 @@
 #include <mm/mm_syscall.h>
 #include <mod/rust/api.h>
 
+int na_firmware_request(const char *name, void **data, size_t *size) {
+    static const char prefix[] = "/lib/firmware/";
+    struct vfs_open_how how = {.flags = O_RDONLY};
+    struct vfs_file *file = NULL;
+    char *path = NULL;
+    void *buffer = NULL;
+    loff_t position = 0;
+    size_t name_length;
+    size_t path_length;
+    ssize_t result;
+    int status;
+
+    if (!name || !data || !size || !name[0] || name[0] == '/')
+        return -EINVAL;
+    for (const char *component = name; *component; component++) {
+        if (component != name && component[-1] != '/')
+            continue;
+        if (component[0] == '.' && component[1] == '.' &&
+            (component[2] == '\0' || component[2] == '/'))
+            return -EINVAL;
+    }
+    *data = NULL;
+    *size = 0;
+    name_length = strlen(name);
+    if (name_length > SIZE_MAX - sizeof(prefix))
+        return -EINVAL;
+    path_length = (sizeof(prefix) - 1) + name_length;
+    path = malloc(path_length + 1);
+    if (!path)
+        return -ENOMEM;
+    memcpy(path, prefix, sizeof(prefix) - 1);
+    memcpy(path + sizeof(prefix) - 1, name, name_length + 1);
+
+    status = vfs_openat(AT_FDCWD, path, &how, &file, true);
+    free(path);
+    if (status < 0)
+        return status;
+    if (!file->f_inode || !S_ISREG(file->f_inode->i_mode)) {
+        vfs_file_put(file);
+        return -EINVAL;
+    }
+    if (file->f_inode->i_size > SIZE_MAX) {
+        vfs_file_put(file);
+        return -EOVERFLOW;
+    }
+
+    *size = (size_t)file->f_inode->i_size;
+    if (*size) {
+        buffer = malloc(*size);
+        if (!buffer) {
+            vfs_file_put(file);
+            return -ENOMEM;
+        }
+    }
+    result = vfs_read_kernel_file(file, buffer, *size, &position);
+    vfs_file_put(file);
+    if (result < 0 || (size_t)result != *size) {
+        free(buffer);
+        *size = 0;
+        return result < 0 ? (int)result : -EIO;
+    }
+    *data = buffer;
+    return 0;
+}
+
 void na_log(const char *message) {
     if (message)
         serial_fprintk("%s", message);

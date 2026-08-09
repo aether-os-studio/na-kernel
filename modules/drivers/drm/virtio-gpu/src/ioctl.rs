@@ -1,7 +1,8 @@
+use alloc::vec::Vec;
 use na_std::{
     Error, Result,
     drm::{FileId, Ioctl},
-    memory::{KernelBuffer, KernelVec},
+    memory::KernelBuffer,
     user::UserAddress,
 };
 
@@ -103,8 +104,8 @@ impl GpuDevice {
             state.files.push(FileState {
                 id: file,
                 context: None,
-                handles: KernelVec::new(),
-            })?;
+                handles: Vec::new(),
+            });
         }
         Self::file_mut(state, file)
     }
@@ -142,8 +143,8 @@ impl GpuDevice {
         self.submit(&command, None, &mut response, protocol::RESP_OK_NODATA)?;
         state.contexts.push(Context {
             id,
-            resources: KernelVec::new(),
-        })?;
+            resources: Vec::new(),
+        });
         Self::ensure_file(state, file)?.context = Some(id);
         Ok(id)
     }
@@ -179,7 +180,7 @@ impl GpuDevice {
         command.put_u32(24, resource_id);
         let mut response = [0; 24];
         self.submit(&command, None, &mut response, protocol::RESP_OK_NODATA)?;
-        context.resources.push(resource_id)?;
+        context.resources.push(resource_id);
         Ok(())
     }
 
@@ -329,8 +330,8 @@ impl GpuDevice {
         )?;
 
         let actual_size = u32::try_from(buffer.memory.length()).map_err(|_| Error::NoSpace)?;
-        state.buffers.push(buffer)?;
-        Self::ensure_file(&mut state, file)?.handles.push(handle)?;
+        state.buffers.push(buffer);
+        Self::ensure_file(&mut state, file)?.handles.push(handle);
         arg.set_u32(40, handle)?;
         arg.set_u32(44, resource_id)?;
         arg.set_u32(48, actual_size)?;
@@ -508,9 +509,7 @@ impl GpuDevice {
     pub(crate) fn drm_close(&self, file: FileId) {
         let mut state = self.state.lock();
         if let Some(index) = state.files.iter().position(|entry| entry.id == file) {
-            let Some(file_state) = state.files.remove(index) else {
-                return;
-            };
+            let file_state = state.files.remove(index);
             for handle in file_state.handles.iter() {
                 if state.buffers.iter().any(|buffer| buffer.handle == *handle) {
                     let _ = self.put_buffer(&mut state, *handle);
@@ -563,7 +562,7 @@ impl GpuDevice {
                     .map(|entry| entry.handles.iter().any(|candidate| *candidate == handle))
                     .unwrap_or(false);
                 if !tracked {
-                    Self::ensure_file(&mut state, file)?.handles.push(handle)?;
+                    Self::ensure_file(&mut state, file)?.handles.push(handle);
                     let buffer = Self::find_buffer_mut(&mut state, handle)?;
                     buffer.ref_count = buffer.ref_count.checked_add(1).ok_or(Error::NoSpace)?;
                 }

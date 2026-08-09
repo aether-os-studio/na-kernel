@@ -202,7 +202,7 @@ impl Driver for GpuDevice {
             pitch: buffer.pitch,
             size: buffer.memory.length() as u64,
         };
-        state.buffers.push(buffer)?;
+        state.buffers.push(buffer);
         Ok(result)
     }
 

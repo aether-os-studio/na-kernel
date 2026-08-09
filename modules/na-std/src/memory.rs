@@ -1,13 +1,54 @@
 use core::{
+    alloc::{GlobalAlloc, Layout},
     ffi::c_void,
     marker::PhantomData,
-    mem::{ManuallyDrop, size_of},
-    ops::{Deref, DerefMut},
     ptr::NonNull,
     slice,
 };
 
 use crate::{Error, Result, bindings};
+
+pub struct KernelAllocator;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: KernelAllocator = KernelAllocator;
+
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.size() == 0 {
+            return core::ptr::null_mut();
+        }
+        let ptr = if layout.align() <= 16 {
+            unsafe { bindings::na_heap_allocate(layout.size()) }
+        } else {
+            unsafe { bindings::na_heap_allocate_aligned(layout.size(), layout.align()) }
+        };
+        ptr.cast()
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        unsafe { bindings::na_heap_free(ptr.cast()) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            let Ok(layout) = Layout::from_size_align(new_size, layout.align()) else {
+                return core::ptr::null_mut();
+            };
+            return unsafe { self.alloc(layout) };
+        }
+        if new_size == 0 {
+            unsafe { self.dealloc(ptr, layout) };
+            return core::ptr::null_mut();
+        }
+        let ptr = if layout.align() <= 16 {
+            unsafe { bindings::na_heap_reallocate(ptr.cast(), new_size) }
+        } else {
+            unsafe { bindings::na_heap_reallocate_aligned(ptr.cast(), new_size, layout.align()) }
+        };
+        ptr.cast()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PhysicalAddress(u64);
@@ -46,62 +87,6 @@ impl PhysicalRange {
             start: PhysicalAddress::new(start),
             length,
         })
-    }
-}
-
-pub struct KernelBox<T> {
-    ptr: NonNull<T>,
-    allocation_size: usize,
-}
-
-unsafe impl<T: Send> Send for KernelBox<T> {}
-unsafe impl<T: Sync> Sync for KernelBox<T> {}
-
-impl<T> KernelBox<T> {
-    pub fn new(value: T) -> Result<Self> {
-        let allocation_size = size_of::<T>();
-        let ptr = if allocation_size == 0 {
-            NonNull::dangling()
-        } else {
-            let raw = unsafe { bindings::na_heap_allocate(allocation_size) };
-            NonNull::new(raw.cast::<T>()).ok_or(Error::OutOfMemory)?
-        };
-        unsafe { ptr.as_ptr().write(value) };
-        Ok(Self {
-            ptr,
-            allocation_size,
-        })
-    }
-
-    pub fn leak(this: Self) -> &'static mut T
-    where
-        T: 'static,
-    {
-        let this = ManuallyDrop::new(this);
-        unsafe { &mut *this.ptr.as_ptr() }
-    }
-}
-
-impl<T> Deref for KernelBox<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.ptr.as_ref() }
-    }
-}
-
-impl<T> DerefMut for KernelBox<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.ptr.as_mut() }
-    }
-}
-
-impl<T> Drop for KernelBox<T> {
-    fn drop(&mut self) {
-        unsafe { self.ptr.as_ptr().drop_in_place() };
-        if self.allocation_size != 0 {
-            unsafe { bindings::na_heap_free(self.ptr.as_ptr().cast::<c_void>()) };
-        }
     }
 }
 
@@ -188,119 +173,6 @@ impl Drop for DmaBuffer {
         unsafe { bindings::na_memory_free(self.ptr.as_ptr().cast::<c_void>(), self.length as u64) };
     }
 }
-
-pub struct KernelVec<T> {
-    ptr: NonNull<T>,
-    length: usize,
-    capacity: usize,
-}
-
-impl<T> KernelVec<T> {
-    pub const fn new() -> Self {
-        Self {
-            ptr: NonNull::dangling(),
-            length: 0,
-            capacity: if size_of::<T>() == 0 { usize::MAX } else { 0 },
-        }
-    }
-
-    pub const fn len(&self) -> usize {
-        self.length
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.length == 0
-    }
-
-    pub fn push(&mut self, value: T) -> Result<usize> {
-        if self.length == self.capacity {
-            self.grow()?;
-        }
-        let index = self.length;
-        unsafe { self.ptr.as_ptr().add(index).write(value) };
-        self.length += 1;
-        Ok(index)
-    }
-
-    pub fn remove(&mut self, index: usize) -> Option<T> {
-        if index >= self.length {
-            return None;
-        }
-        let value = unsafe { self.ptr.as_ptr().add(index).read() };
-        let trailing = self.length - index - 1;
-        if trailing != 0 {
-            unsafe {
-                core::ptr::copy(
-                    self.ptr.as_ptr().add(index + 1),
-                    self.ptr.as_ptr().add(index),
-                    trailing,
-                )
-            };
-        }
-        self.length -= 1;
-        Some(value)
-    }
-
-    pub fn get(&self, index: usize) -> Option<&T> {
-        (index < self.length).then(|| unsafe { &*self.ptr.as_ptr().add(index) })
-    }
-
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        (index < self.length).then(|| unsafe { &mut *self.ptr.as_ptr().add(index) })
-    }
-
-    pub fn iter(&self) -> slice::Iter<'_, T> {
-        self.as_slice().iter()
-    }
-
-    pub fn iter_mut(&mut self) -> slice::IterMut<'_, T> {
-        self.as_mut_slice().iter_mut()
-    }
-
-    pub fn as_slice(&self) -> &[T] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.length) }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.length) }
-    }
-
-    fn grow(&mut self) -> Result<()> {
-        let capacity = self.capacity.saturating_mul(2).max(1);
-        let bytes = capacity
-            .checked_mul(size_of::<T>())
-            .ok_or(Error::OutOfMemory)?;
-        let raw = unsafe { bindings::na_heap_allocate(bytes) };
-        let replacement = NonNull::new(raw.cast::<T>()).ok_or(Error::OutOfMemory)?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), replacement.as_ptr(), self.length)
-        };
-        if self.capacity != 0 {
-            unsafe { bindings::na_heap_free(self.ptr.as_ptr().cast()) };
-        }
-        self.ptr = replacement;
-        self.capacity = capacity;
-        Ok(())
-    }
-}
-
-impl<T> Default for KernelVec<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T> Drop for KernelVec<T> {
-    fn drop(&mut self) {
-        unsafe { core::ptr::drop_in_place(self.as_mut_slice()) };
-        if self.capacity != 0 && size_of::<T>() != 0 {
-            unsafe { bindings::na_heap_free(self.ptr.as_ptr().cast()) };
-        }
-    }
-}
-
-unsafe impl<T: Send> Send for KernelVec<T> {}
-unsafe impl<T: Sync> Sync for KernelVec<T> {}
 
 pub(crate) struct Borrowed<'a, T> {
     pub ptr: NonNull<T>,
