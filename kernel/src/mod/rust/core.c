@@ -78,6 +78,24 @@ void na_log(const char *message) {
         serial_fprintk("%s", message);
 }
 
+uint64_t na_monotonic_time_ns(void) { return nano_time(); }
+
+void na_delay_us(uint64_t microseconds) {
+    uint64_t now = nano_time();
+    uint64_t delay_ns =
+        microseconds > UINT64_MAX / 1000 ? UINT64_MAX : microseconds * 1000;
+    uint64_t deadline =
+        now > UINT64_MAX - delay_ns ? UINT64_MAX : now + delay_ns;
+
+    if (!now) {
+        for (uint64_t i = 0; i < microseconds * 64; i++)
+            arch_pause();
+        return;
+    }
+    while (nano_time() < deadline)
+        arch_pause();
+}
+
 void *na_mmio_map(uint64_t physical_address, size_t size) {
     if (!size || physical_address > UINT64_MAX - size)
         return NULL;

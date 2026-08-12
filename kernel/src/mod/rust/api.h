@@ -59,6 +59,8 @@ int na_firmware_request(const char *name, void **data, size_t *size);
 uint64_t na_memory_physical_address(const void *ptr);
 void na_dma_sync_for_device(void *address, size_t size);
 void na_dma_sync_for_cpu(void *address, size_t size);
+uint64_t na_monotonic_time_ns(void);
+void na_delay_us(uint64_t microseconds);
 int na_user_read(uint64_t address, void *destination, size_t size);
 int na_user_write(uint64_t address, const void *source, size_t size);
 int na_vfs_resolve_device(const struct vfs_fs_context *context,
@@ -142,6 +144,8 @@ int na_pci_config_read(pci_device_t *device, uint16_t offset, uint8_t width,
                        uint32_t *value);
 int na_pci_config_write(pci_device_t *device, uint16_t offset, uint8_t width,
                         uint32_t value);
+int na_pci_bar_claim(pci_device_t *device, uint8_t index);
+void na_pci_bar_release(pci_device_t *device, uint8_t index);
 int na_pci_driver_register(const char *name, uint32_t class_id, int flags,
                            const na_pci_driver_ops_t *ops);
 

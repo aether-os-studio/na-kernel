@@ -36,7 +36,7 @@ static uint64_t device_install_internal(int type, int subtype, void *ptr,
                                         void *close, void *ioctl, void *poll,
                                         void *read, void *write, void *map,
                                         bool use_fixed_minor,
-                                        uint64_t fixed_minor) {
+                                        uint64_t fixed_minor, umode_t mode) {
     device_t *device;
     uint64_t devnr;
 
@@ -78,6 +78,7 @@ static uint64_t device_install_internal(int type, int subtype, void *ptr,
     device->parent = parent;
     device->type = type;
     device->subtype = subtype;
+    device->mode = mode;
     device->dev = (dev_major << 8) | dev_minor;
     device->name = strdup(name);
     if (!device->name) {
@@ -239,7 +240,16 @@ uint64_t device_install(int type, int subtype, void *ptr, char *name,
                         void *poll, void *read, void *write, void *map) {
     return device_install_internal(type, subtype, ptr, name, parent, open,
                                    close, ioctl, poll, read, write, map, false,
-                                   0);
+                                   0, 0600);
+}
+
+uint64_t device_install_with_mode(int type, int subtype, void *ptr, char *name,
+                                  uint64_t parent, void *open, void *close,
+                                  void *ioctl, void *poll, void *read,
+                                  void *write, void *map, umode_t mode) {
+    return device_install_internal(type, subtype, ptr, name, parent, open,
+                                   close, ioctl, poll, read, write, map, false,
+                                   0, mode);
 }
 
 uint64_t device_install_with_minor(int type, int subtype, void *ptr, char *name,
@@ -248,7 +258,7 @@ uint64_t device_install_with_minor(int type, int subtype, void *ptr, char *name,
                                    void *write, void *map, uint64_t minor) {
     return device_install_internal(type, subtype, ptr, name, parent, open,
                                    close, ioctl, poll, read, write, map, true,
-                                   minor);
+                                   minor, 0600);
 }
 
 int device_uninstall(uint64_t dev) {

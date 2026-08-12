@@ -372,7 +372,7 @@ impl GpuDevice {
             return Err(Error::InvalidArgument);
         }
         if Self::ensure_file(&mut state, file)?.context.is_some() {
-            return Err(Error::InvalidArgument);
+            return Ok(());
         }
         self.create_context(&mut state, file, capset_id).map(|_| ())
     }

@@ -6,18 +6,18 @@
 uint8_t *pty_bitmap = 0;
 spinlock_t pty_global_lock = SPIN_INIT;
 pty_pair_t first_pair;
+static bool ptmx_device_registered;
 
 ssize_t pts_write_inner(fd_t *fd, uint8_t *in, size_t limit);
 extern void send_process_group_signal(int pgid, int sig);
 
-static const struct vfs_file_operations ptmx_file_ops;
 static const struct vfs_file_operations pts_file_ops;
 static const struct vfs_file_operations devpts_dir_file_ops;
 static const struct vfs_inode_operations devpts_inode_ops;
 static const struct vfs_dentry_operations devpts_dentry_ops;
 static const struct vfs_super_operations devpts_super_ops;
 static struct vfs_file_system_type devpts_fs_type;
-int pts_ioctl(pty_pair_t *pair, uint64_t request, void *arg);
+static __poll_t ptmx_poll(fd_t *file, struct vfs_poll_table *pt);
 
 typedef struct devpts_fs_info {
     struct vfs_super_block *sb;
@@ -37,27 +37,18 @@ static inline devpts_inode_info_t *devpts_i(vfs_node_t *inode) {
 }
 
 static inline pty_pair_t *pty_pair_from_file(fd_t *file) {
+    device_file_t *device_file;
+
     if (!file)
         return NULL;
+    device_file = device_file_context(file);
+    if (device_file)
+        return (pty_pair_t *)device_file_private(file);
     if (file->private_data)
         return (pty_pair_t *)file->private_data;
     if (!file->f_inode)
         return NULL;
     return (pty_pair_t *)file->f_inode->i_private;
-}
-
-static vfs_node_t *pty_lookup_inode_path(const char *path) {
-    struct vfs_path p = {0};
-    vfs_node_t *inode = NULL;
-
-    if (!path)
-        return NULL;
-    if (vfs_filename_lookup(AT_FDCWD, path, LOOKUP_FOLLOW, &p) < 0)
-        return NULL;
-    if (p.dentry && p.dentry->d_inode)
-        inode = vfs_igrab(p.dentry->d_inode);
-    vfs_path_put(&p);
-    return inode;
 }
 
 static inline void pty_packet_queue_locked(pty_pair_t *pair, uint8_t status,
@@ -120,6 +111,7 @@ static void pty_set_termios2_locked(pty_pair_t *pair,
 
 static void pty_notify_master(pty_pair_t *pair, uint32_t events) {
     vfs_node_t *node = NULL;
+    vfs_node_t *ctrl_node = NULL;
 
     if (!pair || !events)
         return;
@@ -127,34 +119,51 @@ static void pty_notify_master(pty_pair_t *pair, uint32_t events) {
     spin_lock(&pty_global_lock);
     if (pair->ptmx_node)
         node = vfs_igrab(pair->ptmx_node);
+    if (pair->ctrl_node)
+        ctrl_node = vfs_igrab(pair->ctrl_node);
     spin_unlock(&pty_global_lock);
 
-    if (!node)
-        return;
-    vfs_poll_notify_inode(node, events);
-    vfs_iput(node);
+    if (node) {
+        vfs_poll_notify_inode(node, events);
+        vfs_iput(node);
+    }
+    if (ctrl_node) {
+        vfs_poll_notify_inode(ctrl_node, events);
+        vfs_iput(ctrl_node);
+    }
 }
 
 static void pty_notify_slaves(pty_pair_t *pair, uint32_t events) {
     devpts_inode_info_t *info, *tmp;
     vfs_node_t **nodes;
+    vfs_node_t *ctrl_node = NULL;
     size_t count = 0, used = 0;
 
     if (!pair || !events)
         return;
 
     spin_lock(&pty_global_lock);
+    if (pair->ctrl_node)
+        ctrl_node = vfs_igrab(pair->ctrl_node);
     llist_for_each(info, tmp, &pair->pts_nodes, pair_node) {
         if (info->vfs_inode.i_private == pair)
             count++;
     }
     spin_unlock(&pty_global_lock);
-    if (!count)
+    if (!count) {
+        if (ctrl_node) {
+            vfs_poll_notify_inode(ctrl_node, events);
+            vfs_iput(ctrl_node);
+        }
         return;
+    }
 
     nodes = calloc(count, sizeof(*nodes));
-    if (!nodes)
+    if (!nodes) {
+        if (ctrl_node)
+            vfs_iput(ctrl_node);
         return;
+    }
 
     spin_lock(&pty_global_lock);
     llist_for_each(info, tmp, &pair->pts_nodes, pair_node) {
@@ -171,6 +180,10 @@ static void pty_notify_slaves(pty_pair_t *pair, uint32_t events) {
     for (size_t i = 0; i < used; i++) {
         vfs_poll_notify_inode(nodes[i], events);
         vfs_iput(nodes[i]);
+    }
+    if (ctrl_node) {
+        vfs_poll_notify_inode(ctrl_node, events);
+        vfs_iput(ctrl_node);
     }
     free(nodes);
 }
@@ -338,6 +351,9 @@ static struct vfs_inode *devpts_new_inode(struct vfs_super_block *sb,
     info->pair = pair;
     llist_init_head(&info->pair_node);
     if (pair) {
+        inode->i_uid = pair->slave_uid;
+        inode->i_gid = pair->slave_gid;
+        inode->i_mode = S_IFCHR | (pair->slave_mode & 07777);
         spin_lock(&pty_global_lock);
         llist_append(&pair->pts_nodes, &info->pair_node);
         if (!pair->pts_node)
@@ -384,6 +400,9 @@ devpts_new_slave_inode_for_id(struct vfs_super_block *sb, int id) {
     }
 
     inode->i_private = pair;
+    inode->i_uid = pair->slave_uid;
+    inode->i_gid = pair->slave_gid;
+    inode->i_mode = S_IFCHR | (pair->slave_mode & 07777);
     info->pair = pair;
     llist_append(&pair->pts_nodes, &info->pair_node);
     if (!pair->pts_node)
@@ -402,6 +421,7 @@ static void pty_pair_cleanup(pty_pair_t *pair) {
     devpts_inode_info_t *info;
     vfs_node_t *pts_node;
     vfs_node_t *ptmx_node;
+    vfs_node_t *ctrl_node;
 
     if (!pair)
         return;
@@ -409,8 +429,10 @@ static void pty_pair_cleanup(pty_pair_t *pair) {
     spin_lock(&pty_global_lock);
     pts_node = pair->pts_node;
     ptmx_node = pair->ptmx_node;
+    ctrl_node = pair->ctrl_node;
     pair->pts_node = NULL;
     pair->ptmx_node = NULL;
+    pair->ctrl_node = NULL;
     while (!llist_empty(&pair->pts_nodes)) {
         info = list_entry(pair->pts_nodes.next, devpts_inode_info_t, pair_node);
         llist_delete(&info->pair_node);
@@ -429,6 +451,8 @@ static void pty_pair_cleanup(pty_pair_t *pair) {
         vfs_iput(pts_node);
     if (ptmx_node)
         vfs_iput(ptmx_node);
+    if (ctrl_node)
+        vfs_iput(ctrl_node);
     free(pair->bufferMaster);
     free(pair->bufferSlave);
     free(pair);
@@ -442,6 +466,37 @@ static void pts_ctrl_assign(pty_pair_t *pair) {
     pair->ctrlPgid = current_task->pgid;
     if (!pair->frontProcessGroup)
         pair->frontProcessGroup = pair->ctrlPgid;
+}
+
+pty_pair_t *pty_lookup_session_by_sid(uint64_t sid) {
+    pty_pair_t *pair;
+
+    if (!sid)
+        return NULL;
+    spin_lock(&pty_global_lock);
+    for (pair = first_pair.next; pair; pair = pair->next) {
+        if (pair->ctrlSession == (int)sid)
+            break;
+    }
+    spin_unlock(&pty_global_lock);
+    return pair;
+}
+
+void pty_session_bind_devnode(pty_pair_t *pair, vfs_node_t *node) {
+    vfs_node_t *old;
+
+    if (!pair || !node)
+        return;
+    spin_lock(&pty_global_lock);
+    if (pair->ctrl_node == node) {
+        spin_unlock(&pty_global_lock);
+        return;
+    }
+    old = pair->ctrl_node;
+    pair->ctrl_node = vfs_igrab(node);
+    spin_unlock(&pty_global_lock);
+    if (old)
+        vfs_iput(old);
 }
 
 static int pty_foreground_pgid_locked(pty_pair_t *pair) {
@@ -637,6 +692,9 @@ static int ptmx_open_file(struct vfs_inode *inode, struct vfs_file *file) {
     pair->win.ws_col = 80;
     pair->tty_kbmode = K_XLATE;
     pair->masterFds = 1;
+    pair->slave_mode = 0620;
+    pair->slave_uid = 0;
+    pair->slave_gid = 0;
     pair->ptmx_node = vfs_igrab(inode);
 
     spin_lock(&pty_global_lock);
@@ -651,7 +709,10 @@ static int ptmx_open_file(struct vfs_inode *inode, struct vfs_file *file) {
         return -EIO;
     }
 
-    file->private_data = pair;
+    if (device_file_context(file))
+        device_file_set_private(file, pair);
+    else
+        file->private_data = pair;
     return 0;
 }
 
@@ -685,7 +746,10 @@ static int ptmx_release_file(struct vfs_inode *inode, struct vfs_file *file) {
     spin_unlock(&pair->lock);
     if (cleanup)
         pty_pair_cleanup(pair);
-    file->private_data = NULL;
+    if (device_file_context(file))
+        device_file_set_private(file, NULL);
+    else
+        file->private_data = NULL;
     return 0;
 }
 
@@ -954,6 +1018,20 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
                       : 0;
             break;
         }
+        case TIOCGPTLCK: {
+            int locked = pair->locked ? 1 : 0;
+            ret = (!arg || copy_to_user((void *)arg, &locked, sizeof(locked)))
+                      ? -EFAULT
+                      : 0;
+            break;
+        }
+        case TIOCGDEV: {
+            uint32_t dev = ((uint32_t)136 << 8) | (uint32_t)pair->id;
+            ret = (!arg || copy_to_user((void *)arg, &dev, sizeof(dev)))
+                      ? -EFAULT
+                      : 0;
+            break;
+        }
         case FIONREAD: {
             int available = 0;
             if (!pair->packet_mode ||
@@ -1011,6 +1089,39 @@ static long ptmx_ioctl(fd_t *fd, unsigned long request, unsigned long arg) {
     if (!ret)
         pty_notify_pair(pair, notify_master, notify_slave);
     return ret;
+}
+
+ssize_t ptmx_device_open(void *data, void *arg) {
+    (void)data;
+    return ptmx_open_file(arg ? ((fd_t *)arg)->f_inode : NULL, arg);
+}
+
+ssize_t ptmx_device_close(void *data, void *arg) {
+    (void)data;
+    return ptmx_release_file(arg ? ((fd_t *)arg)->f_inode : NULL, arg);
+}
+
+ssize_t ptmx_device_ioctl(void *data, ssize_t request, ssize_t arg, fd_t *fd) {
+    (void)data;
+    return ptmx_ioctl(fd, (unsigned long)request, (unsigned long)arg);
+}
+
+ssize_t ptmx_device_poll(void *data, int events, fd_t *fd) {
+    (void)data;
+    (void)events;
+    return ptmx_poll(fd, NULL);
+}
+
+ssize_t ptmx_device_read(void *data, void *buf, uint64_t offset, size_t size,
+                         fd_t *fd) {
+    (void)data;
+    return ptmx_read(fd, buf, offset, size);
+}
+
+ssize_t ptmx_device_write(void *data, void *buf, uint64_t offset, size_t size,
+                          fd_t *fd) {
+    (void)data;
+    return ptmx_write(fd, buf, offset, size);
 }
 
 static __poll_t ptmx_poll(fd_t *file, struct vfs_poll_table *pt) {
@@ -1096,9 +1207,8 @@ static size_t pts_data_avail(pty_pair_t *pair) {
     return 0;
 }
 
-static ssize_t pts_read(fd_t *fd, void *out, size_t offset, size_t limit) {
-    pty_pair_t *pair = pty_pair_from_file(fd);
-    (void)offset;
+static ssize_t pts_read_pair(pty_pair_t *pair, fd_t *fd, void *out,
+                             size_t limit) {
     if (!pair)
         return -EINVAL;
 
@@ -1131,8 +1241,13 @@ static ssize_t pts_read(fd_t *fd, void *out, size_t offset, size_t limit) {
     }
 }
 
-ssize_t pts_write_inner(fd_t *fd, uint8_t *in, size_t limit) {
-    pty_pair_t *pair = pty_pair_from_file(fd);
+static ssize_t pts_read(fd_t *fd, void *out, size_t offset, size_t limit) {
+    (void)offset;
+    return pts_read_pair(pty_pair_from_file(fd), fd, out, limit);
+}
+
+static ssize_t pts_write_inner_pair(fd_t *fd, pty_pair_t *pair, uint8_t *in,
+                                    size_t limit) {
     if (!pair)
         return -EINVAL;
 
@@ -1196,6 +1311,63 @@ ssize_t pts_write_inner(fd_t *fd, uint8_t *in, size_t limit) {
         if (reason < 0)
             return reason;
     }
+}
+
+ssize_t pts_write_inner(fd_t *fd, uint8_t *in, size_t limit) {
+    return pts_write_inner_pair(fd, pty_pair_from_file(fd), in, limit);
+}
+
+ssize_t pty_session_read(pty_pair_t *pair, fd_t *fd, void *buf, size_t count) {
+    return pts_read_pair(pair, fd, buf, count);
+}
+
+ssize_t pty_session_write(pty_pair_t *pair, fd_t *fd, const void *buf,
+                          size_t count) {
+    ssize_t ret = 0;
+    size_t chunks = count / PTY_BUFF_SIZE;
+    size_t remainder = count % PTY_BUFF_SIZE;
+    const uint8_t *input = buf;
+
+    for (size_t i = 0; i < chunks; i++) {
+        size_t done = 0;
+        while (done < PTY_BUFF_SIZE) {
+            ssize_t written = pts_write_inner_pair(
+                fd, pair, (uint8_t *)input + i * PTY_BUFF_SIZE + done,
+                PTY_BUFF_SIZE - done);
+            if (written < 0)
+                return ret ? ret : written;
+            done += (size_t)written;
+        }
+        ret += (ssize_t)done;
+    }
+    while (remainder) {
+        ssize_t written =
+            pts_write_inner_pair(fd, pair,
+                                 (uint8_t *)input + chunks * PTY_BUFF_SIZE +
+                                     (ret - (ssize_t)(chunks * PTY_BUFF_SIZE)),
+                                 remainder);
+        if (written < 0)
+            return ret ? ret : written;
+        ret += written;
+        remainder -= (size_t)written;
+    }
+    return ret;
+}
+
+int pty_session_poll(pty_pair_t *pair, struct vfs_poll_table *pt) {
+    int events = 0;
+    (void)pt;
+    if (!pair)
+        return -ENXIO;
+    spin_lock(&pair->lock);
+    if (pts_data_avail(pair) > 0)
+        events |= EPOLLIN | EPOLLRDNORM;
+    if (pair->ptrMaster < PTY_BUFF_SIZE)
+        events |= EPOLLOUT | EPOLLWRNORM;
+    if (!pair->masterFds)
+        events |= EPOLLHUP | EPOLLRDHUP;
+    spin_unlock(&pair->lock);
+    return events;
 }
 
 static ssize_t pts_write(fd_t *fd, const void *in, size_t offset,
@@ -1362,18 +1534,6 @@ static long pts_ioctl_file(fd_t *fd, unsigned long request, unsigned long arg) {
     return pts_ioctl(pty_pair_from_file(fd), request, (void *)arg);
 }
 
-static ssize_t ptmx_read_file(struct vfs_file *fd, void *buf, size_t count,
-                              loff_t *ppos) {
-    (void)ppos;
-    return ptmx_read(fd, buf, 0, count);
-}
-
-static ssize_t ptmx_write_file(struct vfs_file *fd, const void *buf,
-                               size_t count, loff_t *ppos) {
-    (void)ppos;
-    return ptmx_write(fd, buf, 0, count);
-}
-
 static ssize_t pts_read_file(struct vfs_file *fd, void *buf, size_t count,
                              loff_t *ppos) {
     (void)ppos;
@@ -1404,25 +1564,7 @@ static __poll_t pts_poll(fd_t *file, struct vfs_poll_table *pt) {
     return revents;
 }
 
-static loff_t pty_llseek(struct vfs_file *file, loff_t offset, int whence) {
-    (void)file;
-    (void)offset;
-    (void)whence;
-    return -ESPIPE;
-}
-
-static const struct vfs_file_operations ptmx_file_ops = {
-    .llseek = pty_llseek,
-    .read = ptmx_read_file,
-    .write = ptmx_write_file,
-    .unlocked_ioctl = ptmx_ioctl,
-    .poll = ptmx_poll,
-    .open = ptmx_open_file,
-    .release = ptmx_release_file,
-};
-
 static const struct vfs_file_operations pts_file_ops = {
-    .llseek = pty_llseek,
     .read = pts_read_file,
     .write = pts_write_file,
     .unlocked_ioctl = pts_ioctl_file,
@@ -1432,15 +1574,13 @@ static const struct vfs_file_operations pts_file_ops = {
 };
 
 void ptmx_init() {
-    vfs_node_t *ptmx;
-
-    (void)vfs_mknodat(AT_FDCWD, "/dev/ptmx", S_IFCHR | 0666, (5U << 8) | 2U,
-                      true);
-    ptmx = pty_lookup_inode_path("/dev/ptmx");
-    if (!ptmx)
+    if (ptmx_device_registered)
         return;
-    ptmx->i_fop = &ptmx_file_ops;
-    vfs_iput(ptmx);
+    if (device_install_with_mode(
+            DEV_CHAR, DEV_SYSDEV, NULL, "ptmx", 0, ptmx_device_open,
+            ptmx_device_close, ptmx_device_ioctl, ptmx_device_poll,
+            ptmx_device_read, ptmx_device_write, NULL, 0666))
+        ptmx_device_registered = true;
 }
 
 void pts_init() {
@@ -1535,6 +1675,32 @@ static struct vfs_dentry *devpts_lookup(struct vfs_inode *dir,
 
 static int devpts_permission(struct vfs_inode *inode, int mask) {
     return vfs_inode_permission(inode, mask);
+}
+
+static int devpts_setattr(struct vfs_dentry *dentry,
+                          const struct vfs_kstat *stat) {
+    devpts_inode_info_t *info;
+    pty_pair_t *pair;
+
+    if (!dentry || !dentry->d_inode || !stat)
+        return -EINVAL;
+    info = devpts_i(dentry->d_inode);
+    pair = info ? info->pair : NULL;
+    if (!pair)
+        return -EINVAL;
+
+    spin_lock(&pair->lock);
+    if (stat->mask & STATX_UID)
+        pair->slave_uid = stat->uid;
+    if (stat->mask & STATX_GID)
+        pair->slave_gid = stat->gid;
+    if (stat->mask & STATX_MODE)
+        pair->slave_mode = (pair->slave_mode & S_IFMT) | (stat->mode & 07777);
+    dentry->d_inode->i_uid = pair->slave_uid;
+    dentry->d_inode->i_gid = pair->slave_gid;
+    dentry->d_inode->i_mode = S_IFCHR | (pair->slave_mode & 07777);
+    spin_unlock(&pair->lock);
+    return 0;
 }
 
 static int devpts_getattr(const struct vfs_path *path, struct vfs_kstat *stat,
@@ -1662,6 +1828,7 @@ static int devpts_get_tree(struct vfs_fs_context *fc) {
     fsi->sb = sb;
     llist_init_head(&fsi->node);
 
+    sb->s_dev = (0UL << 8) | 35;
     sb->s_op = &devpts_super_ops;
     sb->s_d_op = &devpts_dentry_ops;
     sb->s_type = &devpts_fs_type;
@@ -1720,6 +1887,7 @@ static const struct vfs_inode_operations devpts_inode_ops = {
     .lookup = devpts_lookup,
     .permission = devpts_permission,
     .getattr = devpts_getattr,
+    .setattr = devpts_setattr,
 };
 
 static const struct vfs_dentry_operations devpts_dentry_ops = {
@@ -1727,7 +1895,6 @@ static const struct vfs_dentry_operations devpts_dentry_ops = {
 };
 
 static const struct vfs_file_operations devpts_dir_file_ops = {
-    .llseek = pty_llseek,
     .iterate_shared = devpts_iterate_shared,
     .open = devpts_open_file,
 };

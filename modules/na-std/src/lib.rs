@@ -24,6 +24,7 @@ pub mod log;
 pub mod memory;
 pub mod pci;
 pub mod sync;
+pub mod time;
 pub mod user;
 pub mod vfs;
 pub mod virtio;

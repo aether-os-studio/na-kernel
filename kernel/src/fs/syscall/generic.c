@@ -2795,8 +2795,7 @@ uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
         vfs_file_put(file);
         return (uint64_t)-EBADF;
     }
-    if (S_ISSOCK(node->i_mode) || S_ISFIFO(node->i_mode) ||
-        S_ISCHR(node->i_mode)) {
+    if (S_ISSOCK(node->i_mode) || S_ISFIFO(node->i_mode)) {
         vfs_file_put(file);
         return (uint64_t)-ESPIPE;
     }

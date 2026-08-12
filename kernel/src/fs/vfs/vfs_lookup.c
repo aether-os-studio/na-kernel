@@ -384,8 +384,14 @@ static int vfs_walk_dotdot(struct vfs_path *path, const struct vfs_path *root,
 
     if (path->dentry == path->mnt->mnt_root && path->mnt->mnt_parent &&
         path->mnt->mnt_parent != path->mnt && path->mnt->mnt_mountpoint) {
+        if (lookup_flags & LOOKUP_NO_XDEV)
+            return -EXDEV;
+
+        struct vfs_dentry *mountpoint = path->mnt->mnt_mountpoint;
         next_mnt = vfs_mntget(path->mnt->mnt_parent);
-        next_dentry = vfs_dget(path->mnt->mnt_mountpoint);
+
+        next_dentry = mountpoint->d_parent ? vfs_dget(mountpoint->d_parent)
+                                           : vfs_dget(mountpoint);
         if (!next_mnt || !next_dentry) {
             if (next_dentry)
                 vfs_dput(next_dentry);
@@ -408,6 +414,27 @@ static int vfs_walk_dotdot(struct vfs_path *path, const struct vfs_path *root,
     }
 
     return vfs_lookup_apply_scope(path, root, lookup_flags);
+}
+
+static int vfs_parent_resolve_dotdot(struct vfs_path *parent,
+                                     const struct vfs_path *root,
+                                     struct vfs_qstr *last,
+                                     unsigned int lookup_flags) {
+    int ret;
+
+    if (!vfs_qstr_is_dotdot(last))
+        return 0;
+
+    ret = vfs_walk_dotdot(parent, root, lookup_flags);
+    if (ret < 0)
+        return ret;
+
+    // Parent lookup normally leaves the final component for its caller.
+    // Resolve a final ".." here because dentry-only lookup has no mount
+    // context and cannot cross from a mounted root into its parent mount.
+    vfs_qstr_destroy(last);
+    vfs_qstr_dup(last, ".");
+    return last->name ? 0 : -ENOMEM;
 }
 
 static int vfs_follow_symlink(struct vfs_path *parent,
@@ -728,6 +755,13 @@ int vfs_path_parent_lookup_from(const struct vfs_path *start,
             return ret;
         }
         vfs_qstr_dup(last, copy);
+        ret = vfs_parent_resolve_dotdot(parent, root, last, lookup_flags);
+        if (ret < 0) {
+            vfs_path_put(parent);
+            vfs_qstr_destroy(last);
+            free(copy);
+            return ret;
+        }
         if (type)
             *type = 0;
         free(copy);
@@ -749,8 +783,10 @@ int vfs_path_parent_lookup_from(const struct vfs_path *start,
     }
     ret = vfs_filename_lookup_from(start, root, copy[0] ? copy : "/",
                                    lookup_flags, parent);
-    if (ret == 0)
+    if (ret == 0) {
         vfs_follow_mount(parent);
+        ret = vfs_parent_resolve_dotdot(parent, root, last, lookup_flags);
+    }
     if (type)
         *type = 0;
     free(copy);

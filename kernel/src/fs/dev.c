@@ -167,10 +167,12 @@ static inline devtmpfs_fs_info_t *devtmpfs_sb_info(struct vfs_super_block *sb) {
 static void devtmpfs_ensure_populated(struct vfs_super_block *sb);
 static vfs_node_t *devtmpfs_lookup_inode_path(const char *path,
                                               unsigned int flags);
-static void setup_console_symlinks(void);
+static void setup_consoles(void);
 
 static char ttydev_magic;
 static char consoledev_magic;
+static tty_t *ttydev_resolve(void *data);
+static pty_pair_t *ttydev_resolve_pty(void *data);
 
 static void ttydev_bind_path(tty_t *tty, const char *path) {
     if (!tty || !path)
@@ -191,10 +193,22 @@ static void ttydev_bind_file(struct vfs_file *file) {
         return;
 
     device = device_get(file->f_inode->i_rdev);
-    if (!device || device->subtype != DEV_TTY || !device->ptr)
+    if (!device || !device->ptr)
         return;
 
-    tty_bind_devnode((tty_t *)device->ptr, file->f_inode);
+    if (device->subtype == DEV_TTY) {
+        tty_bind_devnode((tty_t *)device->ptr, file->f_inode);
+    } else if (device->subtype == DEV_SYSDEV &&
+               (streq(device->name, "tty") || streq(device->name, "console"))) {
+        tty_t *tty = ttydev_resolve(device->ptr);
+        if (tty)
+            tty_bind_devnode(tty, file->f_inode);
+        else {
+            pty_pair_t *pair = ttydev_resolve_pty(device->ptr);
+            if (pair)
+                pty_session_bind_devnode(pair, file->f_inode);
+        }
+    }
 }
 
 static unsigned char devtmpfs_dtype(umode_t mode) {
@@ -929,6 +943,7 @@ static int devtmpfs_get_tree(struct vfs_fs_context *fc) {
         return -ENOMEM;
     }
 
+    sb->s_dev = (0UL << 8) | 4;
     sb->s_op = &devtmpfs_super_ops;
     sb->s_type = &devtmpfs_fs_type;
     sb->s_magic = DEVTMPFS_MAGIC;
@@ -1091,7 +1106,7 @@ static void devtmpfs_populate_nodes(void) {
 
     devfs_initialized = true;
     devfs_register_existing_devices();
-    setup_console_symlinks();
+    setup_consoles();
     ptmx_init();
     pts_init();
 
@@ -1426,7 +1441,7 @@ void devfs_register_device(device_t *device) {
     snprintf(path, sizeof(path), "/dev/%s", device->name);
     devfs_ensure_parent_dirs(path);
     vfs_mknodat(AT_FDCWD, path,
-                0600 | (device->type == DEV_BLOCK ? S_IFBLK : S_IFCHR),
+                device->mode | (device->type == DEV_BLOCK ? S_IFBLK : S_IFCHR),
                 device->dev, true);
 
     if (device->subtype == DEV_INPUT && device->ptr) {
@@ -1441,8 +1456,7 @@ void devfs_register_device(device_t *device) {
 
     if (device->subtype == DEV_TTY && device->ptr)
         ttydev_bind_path(device->ptr, path);
-    if (device->subtype == DEV_SYSDEV &&
-        (streq(device->name, "tty") || streq(device->name, "console")))
+    if (device->subtype == DEV_SYSDEV && streq(device->name, "console"))
         ttydev_bind_path(kernel_session, path);
 
     if (device->type == DEV_BLOCK && device->ptr) {
@@ -1580,47 +1594,58 @@ static tty_t *ttydev_resolve(void *data) {
     return tty_lookup_session_by_sid(current_task->sid);
 }
 
+static pty_pair_t *ttydev_resolve_pty(void *data) {
+    if (data == &consoledev_magic || !current_task)
+        return NULL;
+    return pty_lookup_session_by_sid(current_task->sid);
+}
+
 static ssize_t ttydev_open(void *data, void *arg) {
     (void)arg;
-    return ttydev_resolve(data) ? 0 : -ENXIO;
+    return (ttydev_resolve(data) || ttydev_resolve_pty(data)) ? 0 : -ENXIO;
 }
 
 static ssize_t ttydev_ioctl(void *data, ssize_t request, ssize_t arg,
                             fd_t *fd) {
     tty_t *tty = ttydev_resolve(data);
     (void)fd;
-    if (!tty)
-        return -ENXIO;
+    if (!tty) {
+        pty_pair_t *pair = ttydev_resolve_pty(data);
+        return pair ? pts_ioctl(pair, (uint64_t)request, (void *)arg) : -ENXIO;
+    }
     return tty_ioctl(tty, (int)request, (void *)arg);
 }
 
 static ssize_t ttydev_poll(void *data, int events, fd_t *fd) {
     tty_t *tty = ttydev_resolve(data);
-    if (!tty)
-        return -ENXIO;
+    if (!tty) {
+        pty_pair_t *pair = ttydev_resolve_pty(data);
+        return pair ? pty_session_poll(pair, NULL) : -ENXIO;
+    }
     return tty_poll(tty, events, fd);
 }
 
 static ssize_t ttydev_read(void *data, void *buf, uint64_t offset, uint64_t len,
                            fd_t *fd) {
     tty_t *tty = ttydev_resolve(data);
-    if (!tty)
-        return -ENXIO;
+    if (!tty) {
+        pty_pair_t *pair = ttydev_resolve_pty(data);
+        return pair ? pty_session_read(pair, fd, buf, len) : -ENXIO;
+    }
     return tty_read(tty, buf, offset, len, fd);
 }
 
 static ssize_t ttydev_write(void *data, void *buf, uint64_t offset,
                             uint64_t len, fd_t *fd) {
     tty_t *tty = ttydev_resolve(data);
-    if (!tty)
-        return -ENXIO;
+    if (!tty) {
+        pty_pair_t *pair = ttydev_resolve_pty(data);
+        return pair ? pty_session_write(pair, fd, buf, len) : -ENXIO;
+    }
     return tty_write(tty, buf, offset, len, fd);
 }
 
-void setup_console_symlinks() {
-    ttydev_bind_path(kernel_session, "/dev/tty");
-    ttydev_bind_path(kernel_session, "/dev/console");
-}
+void setup_consoles() { ttydev_bind_path(kernel_session, "/dev/console"); }
 
 ssize_t kmsg_read(void *data, void *buf, uint64_t offset, uint64_t len,
                   uint64_t flags) {
@@ -1734,16 +1759,16 @@ void devfs_nodes_init() {
                    urandom_ioctl, NULL, urandom_read, urandom_write, NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, kernel_session, "kmsg", 0, NULL, NULL,
                    kmsg_ioctl, kmsg_poll, kmsg_read, kmsg_write, NULL);
-    device_install(DEV_CHAR, DEV_SYSDEV, &ttydev_magic, "tty", 0, ttydev_open,
-                   NULL, ttydev_ioctl, ttydev_poll, ttydev_read, ttydev_write,
-                   NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, &consoledev_magic, "console", 0,
                    ttydev_open, NULL, ttydev_ioctl, ttydev_poll, ttydev_read,
                    ttydev_write, NULL);
+    device_install(DEV_CHAR, DEV_SYSDEV, &ttydev_magic, "tty", 0, ttydev_open,
+                   NULL, ttydev_ioctl, ttydev_poll, ttydev_read, ttydev_write,
+                   NULL);
     device_install(DEV_CHAR, DEV_SYSDEV, NULL, "rfkill", 0, NULL, NULL, NULL,
                    rfkill_poll, rfkill_read, NULL, NULL);
 
-    setup_console_symlinks();
+    setup_consoles();
 
     pty_init();
     ptmx_init();

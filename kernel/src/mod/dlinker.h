@@ -48,7 +48,10 @@ typedef struct symbol_lookup_result {
  * 加载一个内核模块
  * @param module 文件句柄
  */
-bool dlinker_load(module_t *module);
+bool dlinker_load_module(module_t *module);
+
+int dlinker_load(const char *name, const void *data, size_t size);
+int dlinker_unload(const char *name, unsigned int flags);
 
 bool dlinker_lookup_symbol_by_addr(uint64_t addr,
                                    symbol_lookup_result_t *result);

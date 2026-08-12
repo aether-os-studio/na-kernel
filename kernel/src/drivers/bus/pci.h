@@ -94,6 +94,8 @@ typedef struct pci_device {
     uint8_t irq_line;
     uint8_t irq_pin;
 
+    uint8_t claimed_bars;
+
     pci_device_op_t *op;
 
     void *desc;

@@ -14,9 +14,8 @@
     } while (0)
 
 #define MEM_ALIGNMENT 8
-#define MEM_LIBC_MALLOC 0
-#define MEMP_MEM_MALLOC 0
-#define MEM_SIZE (8 * 1024 * 1024)
+#define MEM_LIBC_MALLOC 1
+#define MEMP_MEM_MALLOC 1
 
 #define LWIP_NETCONN 1
 #define LWIP_SOCKET 0
@@ -37,7 +36,7 @@
 #define LWIP_RAW 1
 #define LWIP_UDP 1
 #define LWIP_TCP 1
-#define LWIP_DNS 1
+#define LWIP_DNS 0
 #define LWIP_DNS_ADDRTYPE_DEFAULT LWIP_DNS_ADDRTYPE_IPV4
 #define LWIP_DHCP 1
 #define DNS_MAX_SERVERS 2

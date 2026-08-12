@@ -5212,6 +5212,6 @@ uint32_t sys_personality(uint32_t personality) {
 }
 
 int sys_yield() {
-    schedule(SCHED_FLAG_YIELD);
+    schedule(0);
     return 0;
 }

@@ -42,6 +42,30 @@ pub struct Device<'a> {
     raw: Borrowed<'a, bindings::PciDevice>,
 }
 
+pub struct BarResource {
+    device: NonNull<bindings::PciDevice>,
+    index: u8,
+    bar: Bar,
+}
+
+impl BarResource {
+    pub const fn index(&self) -> u8 {
+        self.index
+    }
+
+    pub const fn bar(&self) -> Bar {
+        self.bar
+    }
+}
+
+impl Drop for BarResource {
+    fn drop(&mut self) {
+        unsafe { bindings::na_pci_bar_release(self.device.as_ptr(), self.index) };
+    }
+}
+
+unsafe impl Send for BarResource {}
+
 impl Device<'_> {
     const COMMAND_OFFSET: u16 = 0x04;
     const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
@@ -111,6 +135,16 @@ impl Device<'_> {
             return Err(Error::Io);
         }
         Ok(())
+    }
+
+    pub fn claim_bar(&self, index: u8) -> Result<BarResource> {
+        let bar = self.bar(index)?;
+        Error::from_status(unsafe { bindings::na_pci_bar_claim(self.raw.ptr.as_ptr(), index) })?;
+        Ok(BarResource {
+            device: self.raw.ptr,
+            index,
+            bar,
+        })
     }
 
     pub(crate) fn from_raw(raw: *mut bindings::PciDevice) -> Option<Self> {

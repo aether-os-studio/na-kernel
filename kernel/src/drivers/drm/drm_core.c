@@ -347,6 +347,7 @@ int drm_framebuffer_close(drm_device_t *dev, uint32_t id) {
     }
 
     drm_resource_manager_t *mgr = &dev->resource_mgr;
+    drm_framebuffer_t *release = NULL;
     spin_lock(&mgr->lock);
 
     for (uint32_t i = 0; i < DRM_MAX_FRAMEBUFFERS_PER_DEVICE; i++) {
@@ -357,11 +358,12 @@ int drm_framebuffer_close(drm_device_t *dev, uint32_t id) {
 
         fb->closed = true;
         if (!drm_framebuffer_is_bound_locked(dev, id) && fb->refcount <= 1) {
-            drm_framebuffer_release(dev, fb);
             mgr->framebuffers[i] = NULL;
+            release = fb;
         }
 
         spin_unlock(&mgr->lock);
+        drm_framebuffer_release(dev, release);
         return 0;
     }
 
@@ -375,6 +377,7 @@ int drm_framebuffer_remove(drm_device_t *dev, uint32_t id) {
     }
 
     drm_resource_manager_t *mgr = &dev->resource_mgr;
+    drm_framebuffer_t *release = NULL;
     spin_lock(&mgr->lock);
 
     for (uint32_t i = 0; i < DRM_MAX_FRAMEBUFFERS_PER_DEVICE; i++) {
@@ -385,11 +388,12 @@ int drm_framebuffer_remove(drm_device_t *dev, uint32_t id) {
 
         fb->closed = true;
         if (!drm_framebuffer_is_bound_locked(dev, id)) {
-            drm_framebuffer_release(dev, fb);
             mgr->framebuffers[i] = NULL;
+            release = fb;
         }
 
         spin_unlock(&mgr->lock);
+        drm_framebuffer_release(dev, release);
         return 0;
     }
 
@@ -403,6 +407,7 @@ void drm_framebuffer_cleanup_closed(drm_device_t *dev, uint32_t id) {
     }
 
     drm_resource_manager_t *mgr = &dev->resource_mgr;
+    drm_framebuffer_t *release = NULL;
     spin_lock(&mgr->lock);
 
     for (uint32_t i = 0; i < DRM_MAX_FRAMEBUFFERS_PER_DEVICE; i++) {
@@ -413,13 +418,14 @@ void drm_framebuffer_cleanup_closed(drm_device_t *dev, uint32_t id) {
 
         if (fb->closed && !drm_framebuffer_is_bound_locked(dev, id) &&
             fb->refcount <= 1) {
-            drm_framebuffer_release(dev, fb);
             mgr->framebuffers[i] = NULL;
+            release = fb;
         }
         break;
     }
 
     spin_unlock(&mgr->lock);
+    drm_framebuffer_release(dev, release);
 }
 
 // Plane management

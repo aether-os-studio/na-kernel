@@ -12,6 +12,75 @@
 #include <task/task_syscall.h>
 #include <drivers/rtc.h>
 #include <net/net_syscall.h>
+#include <mod/dlinker.h>
+#include <fs/vfs/vfs.h>
+
+static uint64_t sys_init_module(uint64_t image_user, uint64_t len,
+                                uint64_t args, uint64_t a4, uint64_t a5,
+                                uint64_t a6) {
+    (void)args;
+    (void)a4;
+    (void)a5;
+    (void)a6;
+    if (!image_user || !len || len > (64U * 1024U * 1024U))
+        return (uint64_t)-EINVAL;
+    void *image = malloc((size_t)len);
+    if (!image)
+        return (uint64_t)-ENOMEM;
+    if (copy_from_user(image, (const void *)image_user, (size_t)len)) {
+        free(image);
+        return (uint64_t)-EFAULT;
+    }
+    int ret = dlinker_load(NULL, image, (size_t)len);
+    free(image);
+    return (uint64_t)ret;
+}
+
+static uint64_t sys_finit_module(uint64_t fd, uint64_t params, uint64_t flags,
+                                 uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)params;
+    (void)flags;
+    (void)a4;
+    (void)a5;
+    (void)a6;
+    struct vfs_file *file = task_get_file(current_task, (int)fd);
+    if (!file || !file->f_inode)
+        return (uint64_t)-EBADF;
+    size_t size = file->f_inode->i_size;
+    if (!size || size > 64U * 1024U * 1024U) {
+        vfs_file_put(file);
+        return (uint64_t)-EINVAL;
+    }
+    void *image = malloc(size);
+    if (!image) {
+        vfs_file_put(file);
+        return (uint64_t)-ENOMEM;
+    }
+    loff_t pos = 0;
+    ssize_t got = vfs_read_kernel_file(file, image, size, &pos);
+    vfs_file_put(file);
+    if (got != (ssize_t)size) {
+        free(image);
+        return (uint64_t)-EIO;
+    }
+    int ret = dlinker_load(NULL, image, size);
+    free(image);
+    return (uint64_t)ret;
+}
+
+static uint64_t sys_delete_module(uint64_t name_user, uint64_t flags,
+                                  uint64_t a3, uint64_t a4, uint64_t a5,
+                                  uint64_t a6) {
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    (void)a6;
+    char name[64];
+    if (!name_user ||
+        copy_from_user_str(name, (const char *)name_user, sizeof(name)))
+        return (uint64_t)-EFAULT;
+    return (uint64_t)dlinker_unload(name, (unsigned int)flags);
+}
 
 static uint64_t copy_timespec_to_user(uint64_t user_addr, uint64_t sec,
                                       uint64_t nsec) {
@@ -614,10 +683,9 @@ void syscall_handler_init() {
     // (syscall_handle_t)sys_iopl); regist_syscall_handler(SYS_IOPERM,
     // (syscall_handle_t)sys_ioperm); regist_syscall_handler(SYS_CREATE_MODULE,
     // (syscall_handle_t)sys_create_module);
-    // regist_syscall_handler(SYS_INIT_MODULE,
-    // (syscall_handle_t)sys_init_module);
-    // regist_syscall_handler(SYS_DELETE_MODULE,
-    // (syscall_handle_t)sys_delete_module);
+    regist_syscall_handler(SYS_INIT_MODULE, (syscall_handle_t)sys_init_module);
+    regist_syscall_handler(SYS_DELETE_MODULE,
+                           (syscall_handle_t)sys_delete_module);
     // regist_syscall_handler(SYS_GET_KERNEL_SYMS,
     // (syscall_handle_t)sys_get_kernel_syms);
     // regist_syscall_handler(SYS_QUERY_MODULE,
@@ -819,8 +887,8 @@ void syscall_handler_init() {
     regist_syscall_handler(SYS_PROCESS_VM_WRITEV,
                            (syscall_handle_t)sys_process_vm_writev);
     regist_syscall_handler(SYS_KCMP, (syscall_handle_t)sys_kcmp);
-    // regist_syscall_handler(SYS_FINIT_MODULE,
-    // (syscall_handle_t)sys_finit_module);
+    regist_syscall_handler(SYS_FINIT_MODULE,
+                           (syscall_handle_t)sys_finit_module);
     regist_syscall_handler(SYS_SCHED_SETATTR,
                            (syscall_handle_t)dummy_syscall_handler);
     regist_syscall_handler(SYS_SCHED_GETATTR,

@@ -59,6 +59,8 @@ void arch_input_dev_init() {
         arch_enable_interrupt();
 }
 
+void arch_pause() { asm volatile("pause"); }
+
 void arch_shutdown() {
     while (1) {
         asm volatile("cli\n\thlt");

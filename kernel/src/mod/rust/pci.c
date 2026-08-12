@@ -117,6 +117,24 @@ int na_pci_config_write(pci_device_t *device, uint16_t offset, uint8_t width,
     return 0;
 }
 
+int na_pci_bar_claim(pci_device_t *device, uint8_t index) {
+    uint8_t mask;
+
+    if (!device || index >= 6 || !device->bars[index].size)
+        return -EINVAL;
+    mask = (uint8_t)(1U << index);
+    if (__atomic_fetch_or(&device->claimed_bars, mask, __ATOMIC_ACQ_REL) & mask)
+        return -EBUSY;
+    return 0;
+}
+
+void na_pci_bar_release(pci_device_t *device, uint8_t index) {
+    if (!device || index >= 6)
+        return;
+    __atomic_fetch_and(&device->claimed_bars, (uint8_t)~(1U << index),
+                       __ATOMIC_ACQ_REL);
+}
+
 int na_pci_driver_register(const char *name, uint32_t class_id, int flags,
                            const na_pci_driver_ops_t *ops) {
     if (!name || !ops || !ops->probe)

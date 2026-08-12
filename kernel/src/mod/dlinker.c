@@ -13,6 +13,20 @@ static dlfunc_t resolved_func;
 static module_symbol_t *loaded_module_symbols = NULL;
 static size_t loaded_module_symbol_count = 0;
 static size_t loaded_module_symbol_capacity = 0;
+static module_t **runtime_modules = NULL;
+static size_t runtime_module_count = 0;
+static size_t runtime_module_capacity = 0;
+
+static module_t *runtime_find_module(const char *name) {
+    if (!name)
+        return NULL;
+    for (size_t i = 0; i < runtime_module_count; i++) {
+        if (runtime_modules[i] &&
+            strcmp(runtime_modules[i]->module_name, name) == 0)
+            return runtime_modules[i];
+    }
+    return NULL;
+}
 
 static void *find_symbol_address(const char *symbol_name, Elf64_Ehdr *ehdr,
                                  uint64_t offset);
@@ -964,7 +978,6 @@ static void *find_symbol_address(const char *symbol_name, Elf64_Ehdr *ehdr,
         return (void *)(offset + sym->st_value);
     }
 
-    serial_fprintk("Cannot find symbol %s in ELF file.\n", symbol_name);
     return NULL;
 }
 
@@ -1024,16 +1037,34 @@ static dlinit_t load_dynamic(module_t *module, Elf64_Phdr *phdrs,
         return NULL;
     }
 
-    void *entry = find_symbol_address("dlmain", ehdr, offset);
+    void *entry = find_symbol_address("__naos_linux_init", ehdr, offset);
+    if (entry == NULL)
+        entry = find_symbol_address("dlmain", ehdr, offset);
     if (entry == NULL) {
-        serial_fprintk("Cannot find dlmain symbol.\n");
+        serial_fprintk("Cannot find linux module init or dlmain symbol.\n");
         return NULL;
     }
 
     return (dlinit_t)entry;
 }
 
-bool dlinker_load(module_t *module) {
+static void remove_module_symbols(const char *module_name) {
+    size_t out = 0;
+    for (size_t i = 0; i < loaded_module_symbol_count; i++) {
+        module_symbol_t *sym = &loaded_module_symbols[i];
+        if (sym->module_name && strcmp(sym->module_name, module_name) == 0) {
+            free(sym->module_name);
+            free(sym->name);
+            continue;
+        }
+        if (out != i)
+            loaded_module_symbols[out] = loaded_module_symbols[i];
+        out++;
+    }
+    loaded_module_symbol_count = out;
+}
+
+bool dlinker_load_module(module_t *module) {
     if (module == NULL || module->is_use) {
         return module != NULL;
     }
@@ -1072,6 +1103,9 @@ bool dlinker_load(module_t *module) {
         return false;
     }
 
+    module->exit = (void (*)(void))find_symbol_address("__naos_linux_exit",
+                                                       ehdr, module->load_base);
+
     int init_status = dlinit();
     if (init_status < 0) {
         serial_fprintk("Module %s initialization failed: %d\n",
@@ -1084,6 +1118,126 @@ bool dlinker_load(module_t *module) {
     serial_fprintk("Loaded module %s at %#018lx\n", module->module_name,
                    module->load_base);
     return true;
+}
+
+int dlinker_load(const char *name, const void *data, size_t size) {
+    if (!data || size < sizeof(Elf64_Ehdr))
+        return -EINVAL;
+    if (runtime_module_count >= runtime_module_capacity) {
+        size_t cap = runtime_module_capacity ? runtime_module_capacity * 2 : 8;
+        module_t **next = realloc(runtime_modules, cap * sizeof(*next));
+        if (!next)
+            return -ENOMEM;
+        runtime_modules = next;
+        runtime_module_capacity = cap;
+    }
+    module_t *module = calloc(1, sizeof(*module));
+    if (!module)
+        return -ENOMEM;
+    if (name)
+        snprintf(module->module_name, sizeof(module->module_name), "%s", name);
+    module->data = alloc_frames_bytes(size);
+    if (!module->data) {
+        free(module);
+        return -ENOMEM;
+    }
+    memcpy(module->data, data, size);
+    module->size = size;
+    module->syscall_owned = true;
+    if (!name) {
+        const char *meta = NULL;
+        size_t meta_size = 0;
+        if (!get_elf_section(module, MODULE_NAME_SECTION, &meta, &meta_size) ||
+            meta_size < 2 || strnlen(meta, meta_size) + 1 != meta_size) {
+            free_frames_bytes(module->data, module->size);
+            free(module);
+            return -EINVAL;
+        }
+        snprintf(module->module_name, sizeof(module->module_name), "%s", meta);
+    }
+    for (size_t i = 0; i < runtime_module_count; i++) {
+        if (runtime_modules[i] &&
+            strcmp(runtime_modules[i]->module_name, module->module_name) == 0) {
+            free_frames_bytes(module->data, module->size);
+            free(module);
+            return -EEXIST;
+        }
+    }
+    module_plan_t plan = {0};
+    if (!scan_module_metadata(module, &plan)) {
+        free_module_plan(&plan);
+        free_frames_bytes(module->data, module->size);
+        free(module);
+        return -ENOEXEC;
+    }
+    for (size_t i = 0; i < module->dependency_count; i++) {
+        if (!runtime_find_module(module->dependencies[i])) {
+            serial_fprintk("Module %s misses runtime dependency %s\n",
+                           module->module_name, module->dependencies[i]);
+            free_module_plan(&plan);
+            free_frames_bytes(module->data, module->size);
+            for (size_t j = 0; j < module->dependency_count; j++)
+                free(module->dependencies[j]);
+            free(module->dependencies);
+            free(module);
+            return -ENOENT;
+        }
+    }
+    free_module_plan(&plan);
+    if (!dlinker_load_module(module)) {
+        free_frames_bytes(module->data, module->size);
+        free(module);
+        return -ENOEXEC;
+    }
+    for (size_t i = 0; i < module->dependency_count; i++) {
+        module_t *provider = runtime_find_module(module->dependencies[i]);
+        if (provider)
+            __atomic_add_fetch(&provider->refcount, 1, __ATOMIC_ACQ_REL);
+    }
+    runtime_modules[runtime_module_count++] = module;
+    return 0;
+}
+
+int dlinker_unload(const char *name, unsigned int flags) {
+    (void)flags;
+    if (!name)
+        return -EINVAL;
+    for (size_t i = 0; i < runtime_module_count; i++) {
+        module_t *module = runtime_modules[i];
+        if (!module || strcmp(module->module_name, name) != 0)
+            continue;
+        if (__atomic_load_n(&module->refcount, __ATOMIC_ACQUIRE) != 0)
+            return -EBUSY;
+        for (size_t i = 0; i < runtime_module_count; i++) {
+            module_t *other = runtime_modules[i];
+            if (!other || other == module)
+                continue;
+            for (size_t j = 0; j < other->dependency_count; j++) {
+                if (strcmp(other->dependencies[j], name) == 0 && other->is_use)
+                    return -EBUSY;
+            }
+        }
+        if (module->exit)
+            module->exit();
+        for (size_t j = 0; j < module->dependency_count; j++) {
+            module_t *provider = runtime_find_module(module->dependencies[j]);
+            if (provider)
+                __atomic_sub_fetch(&provider->refcount, 1, __ATOMIC_ACQ_REL);
+        }
+        remove_module_symbols(module->module_name);
+        if (module->mapped)
+            unmap_page_range(get_current_page_dir(false), module->load_base,
+                             module->load_size);
+        free_frames_bytes(module->data, module->size);
+        for (size_t j = 0; j < module->dependency_count; j++)
+            free(module->dependencies[j]);
+        free(module->dependencies);
+        free(module->path);
+        free(module);
+        runtime_modules[i] = runtime_modules[--runtime_module_count];
+        return 0;
+    }
+    return -ENOENT;
 }
 
 static dlfunc_t *find_kernel_func(const char *name) {
@@ -1228,7 +1382,7 @@ void dlinker_init() {
                     continue;
                 }
 
-                if (dlinker_load(&modules[i])) {
+                if (dlinker_load_module(&modules[i])) {
                     loaded_flags[i] = true;
                 } else {
                     serial_fprintk(

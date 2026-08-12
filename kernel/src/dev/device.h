@@ -36,6 +36,7 @@ typedef struct device_t {
     uint64_t dev;    // 设备号
     uint64_t parent; // 父设备号
     void *ptr;       // 设备指针
+    umode_t mode;    // devtmpfs 节点权限
 
     ssize_t (*open)(void *dev, void *arg);
     ssize_t (*close)(void *dev, void *arg);
@@ -67,6 +68,10 @@ enum device_cmd_t {
 uint64_t device_install(int type, int subtype, void *ptr, char *name,
                         uint64_t parent, void *open, void *close, void *ioctl,
                         void *poll, void *read, void *write, void *map);
+uint64_t device_install_with_mode(int type, int subtype, void *ptr, char *name,
+                                  uint64_t parent, void *open, void *close,
+                                  void *ioctl, void *poll, void *read,
+                                  void *write, void *map, umode_t mode);
 uint64_t device_install_with_minor(int type, int subtype, void *ptr, char *name,
                                    uint64_t parent, void *open, void *close,
                                    void *ioctl, void *poll, void *read,

@@ -1,5 +1,4 @@
 #include "netserver_internal.h"
-#include <lwip/dns.h>
 
 typedef struct naos_lwip_link {
     netdev_t *netdev;
@@ -44,28 +43,6 @@ static void naos_lwip_publish_ipv4_state(netdev_t *netdev) {
     netdev_set_ipv4_info(netdev, &info);
 }
 
-static void naos_lwip_log_dns_servers(void) {
-    for (u8_t i = 0; i < DNS_MAX_SERVERS; i++) {
-        const ip_addr_t *server = dns_getserver(i);
-        if (server && !ip_addr_isany(server)) {
-            printk("netserver: dns[%u] = %s\n", i, ipaddr_ntoa(server));
-        }
-    }
-}
-
-static void naos_lwip_set_fallback_dns(void) {
-    const ip_addr_t *server0 = dns_getserver(0);
-
-    if (server0 && !ip_addr_isany(server0)) {
-        return;
-    }
-
-    ip_addr_t fallback;
-    IP_ADDR4(&fallback, 8, 8, 8, 8);
-    dns_setserver(0, &fallback);
-    printk("netserver: using fallback dns %s\n", ipaddr_ntoa(&fallback));
-}
-
 static void naos_lwip_status_callback(struct netif *netif) {
     char ipaddr_buf[IP4ADDR_STRLEN_MAX];
     char netmask_buf[IP4ADDR_STRLEN_MAX];
@@ -87,8 +64,6 @@ static void naos_lwip_status_callback(struct netif *netif) {
 #endif
 
     naos_lwip_publish_ipv4_state(naos_link.netdev);
-    naos_lwip_set_fallback_dns();
-    naos_lwip_log_dns_servers();
 }
 
 static void naos_lwip_apply_link_state(void *arg) {
@@ -147,7 +122,6 @@ static void naos_lwip_apply_link_state(void *arg) {
 #endif
 
     naos_lwip_publish_ipv4_state(naos_link.netdev);
-    naos_lwip_set_fallback_dns();
     free(event);
 }
 

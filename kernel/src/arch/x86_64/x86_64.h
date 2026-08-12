@@ -30,7 +30,7 @@ void arch_input_dev_init();
 
 __attribute__((noreturn)) void arch_shutdown();
 
-static inline void arch_pause() { asm volatile("pause"); }
+void arch_pause();
 
 void arch_before_wait_for_interrupt(void);
 
