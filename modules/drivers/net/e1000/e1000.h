@@ -150,6 +150,8 @@ typedef struct e1000_device {
 // Function prototypes
 int e1000_init(pci_device_t *pci_dev, void *mmio_base);
 int e1000_send(void *dev_desc, void *data, uint32_t len);
+int e1000_sendv(void *dev_desc, const netdev_iovec_t *iov, uint32_t iovcnt,
+                uint32_t total_len);
 int e1000_receive(void *dev_desc, void *buffer, uint32_t buffer_size);
 bool e1000_has_packets(void *dev_desc);
 void e1000_poll(void *dev_desc);

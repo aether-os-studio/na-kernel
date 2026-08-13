@@ -14,6 +14,7 @@ typedef struct virtio_cap_info_t {
 #define PCI_DEVICE_ID_NETWORK 0x1000
 #define PCI_DEVICE_ID_BLOCK 0x1001
 #define PCI_DEVICE_ID_OFFSET 0x1040
+#define VIRTIO_PCI_MAX_QUEUES 64
 
 typedef struct virtio_pci_common_cfg_t {
     uint32_t device_feature_select;
@@ -41,6 +42,7 @@ typedef struct virtio_pci_device {
     virtio_pci_common_cfg_t *common_cfg_bar;
     uint16_t *notify_regions;
     uint32_t notify_off_multiplier;
+    volatile uint16_t *notify_addr[VIRTIO_PCI_MAX_QUEUES];
     volatile uint8_t *isr_status;
     virtio_cap_info_t *device_cfg;
     uint64_t config_space_vaddr;

@@ -80,6 +80,13 @@
 
 #include <string.h>
 
+/* Max L4 payload packed into a single TSO segment when the netif supports it.
+ * Kept below 65535 - (Ethernet+IP+TCP headers) so the final frame fits lwIP's
+ * u16_t pbuf length. */
+#ifndef TCP_TSO_MAX_SIZE
+#define TCP_TSO_MAX_SIZE 61440
+#endif
+
 #ifdef LWIP_HOOK_FILENAME
 #include LWIP_HOOK_FILENAME
 #endif
@@ -432,6 +439,7 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len,
 #endif /* TCP_CHECKSUM_ON_COPY */
     err_t err;
     u16_t mss_local;
+    u16_t tso_max = 0;
 
     LWIP_ERROR("tcp_write: invalid pcb", pcb != NULL, return ERR_ARG);
 
@@ -634,10 +642,24 @@ err_t tcp_write(struct tcp_pcb *pcb, const void *arg, u16_t len,
      * The new segments are chained together in the local 'queue'
      * variable, ready to be appended to pcb->unsent.
      */
+    /* When the route supports segmentation offload (TSO), build segments up to
+     * TCP_TSO_MAX_SIZE and let the device split them on the wire.  Cap the
+     * segment size to the connection's current send window (cwnd and the peer's
+     * advertised window) so a large segment never has to wait for the window to
+     * grow — which would stall slow start via the persist timer. */
+    {
+        struct netif *tso_netif =
+            tcp_route(pcb, &pcb->local_ip, &pcb->remote_ip);
+        if (tso_netif != NULL && (tso_netif->flags & NETIF_FLAG_TSO)) {
+            u32_t wnd = LWIP_MIN((u32_t)pcb->cwnd, (u32_t)pcb->snd_wnd);
+            tso_max = (u16_t)LWIP_MIN((u32_t)TCP_TSO_MAX_SIZE, wnd);
+        }
+    }
+
     while (pos < len) {
         struct pbuf *p;
         u16_t left = len - pos;
-        u16_t max_len = mss_local - optlen;
+        u16_t max_len = (tso_max > mss_local ? tso_max : mss_local) - optlen;
         u16_t seglen = LWIP_MIN(left, max_len);
 #if TCP_CHECKSUM_ON_COPY
         u16_t chksum = 0;
@@ -1700,6 +1722,14 @@ static err_t tcp_output_segment(struct tcp_seg *seg, struct tcp_pcb *pcb,
     }
 #endif /* CHECKSUM_GEN_TCP */
     TCP_STATS_INC(tcp.xmit);
+
+    /* If the netif supports segmentation offload and this segment is larger
+     * than the link MTU, mark it as a TSO segment; the netif driver will pass
+     * the GSO parameters to the device instead of fragmenting in software. */
+    if ((netif->flags & NETIF_FLAG_TSO) && (seg->p->tot_len > netif->mtu)) {
+        seg->p->gso_type = NETIF_GSO_TCPV4;
+        seg->p->gso_size = pcb->mss ? pcb->mss : TCP_MSS;
+    }
 
     NETIF_SET_HINTS(netif, &(pcb->netif_hints));
     err = ip_output_if(seg->p, &pcb->local_ip, &pcb->remote_ip, pcb->ttl,

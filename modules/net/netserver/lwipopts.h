@@ -36,7 +36,7 @@
 #define LWIP_RAW 1
 #define LWIP_UDP 1
 #define LWIP_TCP 1
-#define LWIP_DNS 0
+#define LWIP_DNS 1
 #define LWIP_DNS_ADDRTYPE_DEFAULT LWIP_DNS_ADDRTYPE_IPV4
 #define LWIP_DHCP 1
 #define DNS_MAX_SERVERS 2
@@ -65,35 +65,46 @@
 
 #define TCPIP_THREAD_STACKSIZE 0
 #define TCPIP_THREAD_PRIO 0
-#define TCPIP_MBOX_SIZE 1024
-#define DEFAULT_UDP_RECVMBOX_SIZE 256
-#define DEFAULT_TCP_RECVMBOX_SIZE 256
+#define TCPIP_MBOX_SIZE 2048
+#define DEFAULT_UDP_RECVMBOX_SIZE 512
+#define DEFAULT_TCP_RECVMBOX_SIZE 512
 #define DEFAULT_ACCEPTMBOX_SIZE 64
 
 #define MEMP_NUM_TCPIP_MSG_API 256
-#define MEMP_NUM_TCPIP_MSG_INPKT 1024
+#define MEMP_NUM_TCPIP_MSG_INPKT 2048
 #define MEMP_NUM_NETCONN 256
 #define MEMP_NUM_TCP_PCB 256
 #define MEMP_NUM_TCP_PCB_LISTEN 32
-#define MEMP_NUM_TCP_SEG 2048
+#define MEMP_NUM_TCP_SEG 8192
 #define MEMP_NUM_UDP_PCB 128
 #define MEMP_NUM_RAW_PCB 16
 #define MEMP_NUM_NETBUF 256
-#define MEMP_NUM_PBUF 1024
-#define PBUF_POOL_SIZE 2048
+#define MEMP_NUM_PBUF 2048
+#define PBUF_POOL_SIZE 4096
 #define PBUF_POOL_BUFSIZE 1700
 
 #define TCP_MSS 1460
 #define LWIP_WND_SCALE 1
-#define TCP_RCV_SCALE 2
-#define TCP_WND (128 * TCP_MSS)
-#define TCP_SND_BUF (64 * TCP_MSS)
+#define TCP_RCV_SCALE 5
+#define TCP_WND (1024 * 1024)
+#define TCP_SND_BUF (1024 * 1024)
 #define TCP_SND_QUEUELEN ((4 * TCP_SND_BUF + TCP_MSS - 1) / TCP_MSS)
-#define TCP_OOSEQ_MAX_BYTES (64 * TCP_MSS)
-#define TCP_OOSEQ_MAX_PBUFS 64
+#define TCP_SNDLOWAT (TCP_MSS)
+#define TCP_OOSEQ_MAX_BYTES (256 * 1024)
+#define TCP_OOSEQ_MAX_PBUFS 256
 
-/* Keep packet ingestion out of application-thread core-lock contention. */
-#define LWIP_TCPIP_CORE_LOCKING_INPUT 0
+#define LWIP_TCPIP_CORE_LOCKING_INPUT 1
+
+#define LWIP_CHECKSUM_CTRL_PER_NETIF 1
+
+#define LWIP_PBUF_CUSTOM_DATA                                                  \
+    u16_t gso_size;                                                            \
+    u8_t gso_type;
+#define LWIP_PBUF_CUSTOM_DATA_INIT(p)                                          \
+    do {                                                                       \
+        (p)->gso_size = 0;                                                     \
+        (p)->gso_type = 0; /* NETIF_GSO_NONE */                                \
+    } while (0)
 
 #define LWIP_STATS 0
 #define LWIP_DEBUG 0

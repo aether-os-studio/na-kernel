@@ -1,7 +1,7 @@
 #pragma once
 
 #define ARCH_MAX_IRQ_NUM 256
-#define SCHED_HZ 250
+#define SCHED_HZ 1000
 
 #include "arch/x86_64/asm.h"
 #include "arch/x86_64/core/normal.h"

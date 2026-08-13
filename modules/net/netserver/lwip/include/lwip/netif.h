@@ -105,6 +105,15 @@ extern "C" {
 /** If set, the netif has MLD6 capability.
  * Set by the netif driver in its init function. */
 #define NETIF_FLAG_MLD6 0x40U
+/** If set, the netif can send TCP/UDP segments larger than the MTU and have
+ * the device segment them (TSO). Set by the netif driver in its init fn. */
+#define NETIF_FLAG_TSO 0x80U
+
+/* GSO type carried in a pbuf's gso_type field (see LWIP_PBUF_CUSTOM_DATA). */
+#define NETIF_GSO_NONE 0
+#define NETIF_GSO_TCPV4 1
+#define NETIF_GSO_TCPV6 2
+#define NETIF_GSO_UDP 3
 
 /**
  * @}

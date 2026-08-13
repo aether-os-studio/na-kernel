@@ -367,12 +367,22 @@ uint32_t virtio_pci_get_max_queue_size(void *data, uint16_t queue) {
 
 void virtio_pci_notify(void *data, uint16_t queue) {
     virtio_pci_device_t *pci = (virtio_pci_device_t *)data;
-    virtio_pci_write16(&pci->common_cfg_bar->queue_select, queue);
-    uint16_t notify_off =
-        virtio_pci_read16(&pci->common_cfg_bar->queue_notify_off);
-    uint64_t offset_bytes = (uint64_t)notify_off * pci->notify_off_multiplier;
-    volatile uint16_t *notify_addr =
-        (volatile uint16_t *)((uintptr_t)pci->notify_regions + offset_bytes);
+    volatile uint16_t *notify_addr = NULL;
+
+    if (queue < VIRTIO_PCI_MAX_QUEUES) {
+        notify_addr = pci->notify_addr[queue];
+    }
+
+    if (!notify_addr) {
+        virtio_pci_write16(&pci->common_cfg_bar->queue_select, queue);
+        uint16_t notify_off =
+            virtio_pci_read16(&pci->common_cfg_bar->queue_notify_off);
+        uint64_t offset_bytes =
+            (uint64_t)notify_off * pci->notify_off_multiplier;
+        notify_addr = (volatile uint16_t *)((uintptr_t)pci->notify_regions +
+                                            offset_bytes);
+    }
+
     write_barrier();
     *notify_addr = queue;
 }
@@ -393,6 +403,16 @@ void virtio_pci_queue_set(void *data, uint16_t queue, uint32_t size,
                           uint64_t device_area_paddr) {
     virtio_pci_device_t *pci = (virtio_pci_device_t *)data;
     virtio_pci_write16(&pci->common_cfg_bar->queue_select, queue);
+
+    if (queue < VIRTIO_PCI_MAX_QUEUES && pci->notify_regions) {
+        uint16_t notify_off =
+            virtio_pci_read16(&pci->common_cfg_bar->queue_notify_off);
+        pci->notify_addr[queue] =
+            (volatile uint16_t *)((uintptr_t)pci->notify_regions +
+                                  (uint64_t)notify_off *
+                                      pci->notify_off_multiplier);
+    }
+
     virtio_pci_write16(&pci->common_cfg_bar->queue_size, (uint16_t)size);
     virtio_pci_write64(&pci->common_cfg_bar->queue_desc, descriptors_paddr);
     virtio_pci_write64(&pci->common_cfg_bar->queue_driver, driver_area_paddr);

@@ -269,6 +269,7 @@ int e1000_init(pci_device_t *pci_dev, void *mmio_base) {
         free(dev);
         return -1;
     }
+    netdev_set_sendv(dev->netdev, e1000_sendv);
 
     if (pci_dev && msi_setup_irq(&dev->msi, pci_dev, 0, false,
                                  e1000_irq_handler, dev, "e1000_irq") == 0) {
@@ -288,10 +289,13 @@ int e1000_init(pci_device_t *pci_dev, void *mmio_base) {
 }
 
 // Send packet (polling mode)
-int e1000_send(void *dev_desc, void *data, uint32_t len) {
+int e1000_sendv(void *dev_desc, const netdev_iovec_t *iov, uint32_t iovcnt,
+                uint32_t total_len) {
     e1000_device_t *dev = (e1000_device_t *)dev_desc;
+    uint32_t copied = 0;
 
-    if (len == 0 || len > netdev_max_frame_len(E1000_MTU)) {
+    if (!dev || !iov || !iovcnt || !total_len ||
+        total_len > netdev_max_frame_len(E1000_MTU)) {
         return -1;
     }
 
@@ -302,27 +306,38 @@ int e1000_send(void *dev_desc, void *data, uint32_t len) {
     uint16_t next_tail = (dev->tx_tail + 1) % E1000_NUM_TX_DESC;
     if (next_tail == dev->tx_head) {
         spin_unlock(&dev->tx_lock);
-        return -1;
+        return -EAGAIN;
     }
     void *tx_buffer = dev->tx_buffers[dev->tx_tail];
     if (!tx_buffer) {
         spin_unlock(&dev->tx_lock);
-        return -1;
+        return -EAGAIN;
     }
 
-    memcpy(tx_buffer, data, len);
-    dma_sync_cpu_to_device(tx_buffer, len);
+    for (uint32_t i = 0; i < iovcnt; i++) {
+        if (!iov[i].data || iov[i].len > total_len - copied) {
+            spin_unlock(&dev->tx_lock);
+            return -1;
+        }
+        memcpy((uint8_t *)tx_buffer + copied, iov[i].data, iov[i].len);
+        copied += iov[i].len;
+    }
+    if (copied != total_len) {
+        spin_unlock(&dev->tx_lock);
+        return -1;
+    }
+    dma_sync_cpu_to_device(tx_buffer, total_len);
 
     // Setup TX descriptor
     struct e1000_tx_desc *desc = &dev->tx_descs[dev->tx_tail];
     desc->buffer_addr = (uint64_t)virt_to_phys(tx_buffer);
-    desc->length = len;
+    desc->length = total_len;
     desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
     desc->status = 0;
 
     // Store buffer pointer for later cleanup
     dev->tx_buffers[dev->tx_tail] = tx_buffer;
-    dev->tx_lengths[dev->tx_tail] = len;
+    dev->tx_lengths[dev->tx_tail] = total_len;
     dma_sync_cpu_to_device(desc, sizeof(*desc));
 
     // Update tail pointer
@@ -331,7 +346,13 @@ int e1000_send(void *dev_desc, void *data, uint32_t len) {
     e1000_write32(dev, E1000_TDT, dev->tx_tail);
     spin_unlock(&dev->tx_lock);
 
-    return len;
+    return total_len;
+}
+
+int e1000_send(void *dev_desc, void *data, uint32_t len) {
+    netdev_iovec_t iov = {.data = data, .len = len};
+
+    return e1000_sendv(dev_desc, &iov, 1, len);
 }
 
 // Receive packet (polling mode)
@@ -365,9 +386,10 @@ int e1000_receive(void *dev_desc, void *buffer, uint32_t buffer_size) {
         packet_len = buffer_size;
     }
 
-    // Copy packet data to user buffer
-    dma_sync_device_to_cpu(phys_to_virt(desc->buffer_addr), desc->length);
-    memcpy(buffer, phys_to_virt(desc->buffer_addr), packet_len);
+    // Copy packet data to user buffer, using the tracked kernel buffer
+    // pointer instead of re-resolving phys_to_virt each time.
+    dma_sync_device_to_cpu(dev->rx_buffers[next_rx], desc->length);
+    memcpy(buffer, dev->rx_buffers[next_rx], packet_len);
 
 cleanup:
     // Recycle the descriptor
@@ -378,7 +400,7 @@ cleanup:
     dev->rx_tail = next_rx;
     e1000_write32(dev, E1000_RDT, dev->rx_tail);
     spin_unlock(&dev->rx_lock);
-    return have_data ? packet_len : 0;
+    return have_data ? (int)packet_len : 0;
 }
 
 // Check if packets are available

@@ -411,6 +411,13 @@ static int rtnetlink_handle_setlink(struct netlink_sock *sender_sock,
     return 0;
 }
 
+static int rtnetlink_handle_state_update(struct netlink_sock *sender_sock,
+                                         const struct nlmsghdr *req) {
+    (void)sender_sock;
+    (void)req;
+    return 0;
+}
+
 static uint8_t rtnetlink_prefixlen_from_netmask(uint32_t netmask_be) {
     uint32_t mask = __builtin_bswap32(netmask_be);
     uint8_t prefix = 0;
@@ -811,6 +818,11 @@ static int rtnetlink_handle_request(struct netlink_sock *sender_sock,
         if (!ifi_req || ifi_req->ifi_index <= 0)
             return rtnetlink_handle_getlink(sender_sock, req, ifi_req);
         return rtnetlink_handle_setlink(sender_sock, req, ifi_req);
+    case RTM_NEWADDR:
+    case RTM_DELADDR:
+    case RTM_NEWROUTE:
+    case RTM_DELROUTE:
+        return rtnetlink_handle_state_update(sender_sock, req);
     default:
         printk("Unsupported req->nlmsg_type = %d\n", req->nlmsg_type);
         return -EOPNOTSUPP;

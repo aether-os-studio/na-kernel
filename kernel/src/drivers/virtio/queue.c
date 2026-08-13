@@ -140,13 +140,15 @@ void virt_queue_set_dev_notify(virtqueue_t *queue, bool enable) {
 }
 
 bool virt_queue_should_notify(virtqueue_t *queue) {
+    if (!queue) {
+        return true;
+    }
+
     dma_sync_device_to_cpu(queue->used, virt_queue_used_bytes(queue));
     if (queue->event_idx) {
-        uint16_t avail_event = queue->used->avail_event;
-        return queue->avail_idx >= avail_event;
-    } else {
-        return (queue->used->flags & 0x0001) == 0;
+        return true;
     }
+    return (queue->used->flags & 0x0001) == 0;
 }
 
 bool virt_queue_can_pop(virtqueue_t *queue) {
@@ -215,7 +217,7 @@ void virt_queue_free_desc(virtqueue_t *queue, uint16_t desc_idx) {
 uint16_t virt_queue_add_buf(virtqueue_t *queue, virtio_buffer_t *bufs,
                             uint16_t num_bufs, bool *device_writable) {
     if (num_bufs == 0 || queue->free_head == 0xFFFF ||
-        virt_queue_count_free_desc(queue) < num_bufs) {
+        (num_bufs > 1 && virt_queue_count_free_desc(queue) < num_bufs)) {
         return 0xFFFF;
     }
 
@@ -294,5 +296,9 @@ uint16_t virt_queue_size(const virtqueue_t *queue) {
 }
 
 void virt_queue_notify(virtio_driver_t *driver, virtqueue_t *queue) {
+    if (!driver || !queue) {
+        return;
+    }
+
     driver->op->notify(driver->data, queue->queue_idx);
 }

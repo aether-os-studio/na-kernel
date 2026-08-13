@@ -183,6 +183,7 @@ netdev_t *netdev_register_full(const char *name, uint32_t type, void *desc,
         dev->poll_rx = poll_rx;
         dev->lock = SPIN_INIT;
         dev->refcount = 1;
+        dev->rx_queue_count = 1;
         wait_queue_init(&dev->rx_wait);
 
         if (name && name[0] != '\0') {
@@ -348,6 +349,112 @@ int netdev_set_name(netdev_t *dev, const char *name) {
 
     netdev_notify(dev, NETDEV_EVENT_CONFIG_CHANGED);
     return 0;
+}
+
+int netdev_set_sendv(netdev_t *dev, netdev_sendv_t sendv) {
+    if (!dev)
+        return -EINVAL;
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->sendv = sendv;
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+int netdev_set_send_gso(netdev_t *dev, netdev_send_gso_t send_gso) {
+    if (!dev)
+        return -EINVAL;
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->send_gso = send_gso;
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+void netdev_set_caps(netdev_t *dev, uint32_t caps) {
+    if (!dev)
+        return;
+
+    spin_lock(&dev->lock);
+    if (!dev->unregistering) {
+        dev->capabilities = caps;
+    }
+    spin_unlock(&dev->lock);
+}
+
+uint32_t netdev_get_caps(netdev_t *dev) {
+    uint32_t caps = 0;
+
+    if (!dev)
+        return 0;
+
+    spin_lock(&dev->lock);
+    if (!dev->unregistering) {
+        caps = dev->capabilities;
+    }
+    spin_unlock(&dev->lock);
+    return caps;
+}
+
+int netdev_set_recv_q(netdev_t *dev, netdev_recv_q_t recv_q) {
+    if (!dev)
+        return -EINVAL;
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->recv_q = recv_q;
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+int netdev_set_poll_rx_q(netdev_t *dev, netdev_poll_rx_q_t poll_rx_q) {
+    if (!dev)
+        return -EINVAL;
+
+    spin_lock(&dev->lock);
+    if (dev->unregistering) {
+        spin_unlock(&dev->lock);
+        return -ENODEV;
+    }
+    dev->poll_rx_q = poll_rx_q;
+    spin_unlock(&dev->lock);
+    return 0;
+}
+
+void netdev_set_rx_queue_count(netdev_t *dev, uint16_t count) {
+    if (!dev || count == 0)
+        return;
+
+    spin_lock(&dev->lock);
+    if (!dev->unregistering) {
+        dev->rx_queue_count = count;
+    }
+    spin_unlock(&dev->lock);
+}
+
+uint16_t netdev_rx_queue_count(netdev_t *dev) {
+    uint16_t count = 1;
+
+    if (!dev)
+        return 1;
+
+    spin_lock(&dev->lock);
+    if (!dev->unregistering && dev->rx_queue_count > 0) {
+        count = dev->rx_queue_count;
+    }
+    spin_unlock(&dev->lock);
+    return count;
 }
 
 int netdev_set_trigger_scan(netdev_t *dev, netdev_trigger_scan_t trigger_scan) {
@@ -888,9 +995,10 @@ uint64_t netdev_rx_seq(netdev_t *dev) {
     return seq;
 }
 
-int netdev_wait_rx(netdev_t *dev, uint64_t observed_seq) {
+int netdev_wait_rx_q(netdev_t *dev, uint16_t qidx, uint64_t observed_seq) {
     wait_queue_entry_t wait;
     netdev_poll_rx_t poll_rx = NULL;
+    netdev_poll_rx_q_t poll_rx_q = NULL;
     void *desc = NULL;
     bool ready = false;
     bool gone = false;
@@ -907,11 +1015,16 @@ int netdev_wait_rx(netdev_t *dev, uint64_t observed_seq) {
     ready = dev->rx_seq != observed_seq;
     gone = dev->unregistering;
     poll_rx = dev->poll_rx;
+    poll_rx_q = dev->poll_rx_q;
     desc = dev->desc;
     spin_unlock(&dev->lock);
 
-    if (!ready && !gone && poll_rx && poll_rx(desc)) {
-        ready = true;
+    if (!ready && !gone) {
+        if (poll_rx_q && poll_rx_q(desc, qidx)) {
+            ready = true;
+        } else if (qidx == 0 && poll_rx && poll_rx(desc)) {
+            ready = true;
+        }
     }
 
     if (ready || gone) {
@@ -941,6 +1054,10 @@ int netdev_wait_rx(netdev_t *dev, uint64_t observed_seq) {
     return reason == EOK ? EOK : -EINTR;
 }
 
+int netdev_wait_rx(netdev_t *dev, uint64_t observed_seq) {
+    return netdev_wait_rx_q(dev, 0, observed_seq);
+}
+
 int netdev_send(netdev_t *dev, void *data, uint32_t len) {
     if (dev == NULL || data == NULL) {
         return -EINVAL;
@@ -955,6 +1072,90 @@ int netdev_send(netdev_t *dev, void *data, uint32_t len) {
     }
 
     int ret = dev->send(dev->desc, data, len);
+    netdev_put(dev);
+    return ret;
+}
+
+int netdev_sendv(netdev_t *dev, const netdev_iovec_t *iov, uint32_t iovcnt,
+                 uint32_t total_len) {
+    netdev_sendv_t sendv = NULL;
+    void *desc = NULL;
+    void *frame = NULL;
+    uint32_t copied = 0;
+    int ret = 0;
+
+    if (!dev || !iov || !iovcnt || !total_len ||
+        total_len > netdev_max_frame_len(dev->mtu)) {
+        return -EINVAL;
+    }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
+
+    spin_lock(&dev->lock);
+    sendv = dev->sendv;
+    desc = dev->desc;
+    spin_unlock(&dev->lock);
+
+    if (sendv) {
+        ret = sendv(desc, iov, iovcnt, total_len);
+        netdev_put(dev);
+        return ret;
+    }
+
+    frame = alloc_frames_bytes(total_len);
+    if (!frame) {
+        netdev_put(dev);
+        return -ENOMEM;
+    }
+    for (uint32_t i = 0; i < iovcnt; i++) {
+        if (!iov[i].data || iov[i].len > total_len - copied) {
+            free_frames_bytes(frame, total_len);
+            netdev_put(dev);
+            return -EINVAL;
+        }
+        memcpy((uint8_t *)frame + copied, iov[i].data, iov[i].len);
+        copied += iov[i].len;
+    }
+    if (copied != total_len) {
+        free_frames_bytes(frame, total_len);
+        netdev_put(dev);
+        return -EINVAL;
+    }
+
+    ret = dev->send(desc, frame, total_len);
+    free_frames_bytes(frame, total_len);
+    netdev_put(dev);
+    return ret;
+}
+
+int netdev_send_gso(netdev_t *dev, const netdev_iovec_t *iov, uint32_t iovcnt,
+                    uint32_t total_len, const netdev_gso_info_t *gso) {
+    netdev_send_gso_t send_gso = NULL;
+    void *desc = NULL;
+    int ret = 0;
+
+    if (!dev || !iov || !iovcnt || !total_len || !gso ||
+        gso->type == NETDEV_GSO_NONE) {
+        return -EINVAL;
+    }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
+
+    spin_lock(&dev->lock);
+    send_gso = dev->send_gso;
+    desc = dev->desc;
+    spin_unlock(&dev->lock);
+
+    if (send_gso) {
+        ret = send_gso(desc, iov, iovcnt, total_len, gso);
+        netdev_put(dev);
+        return ret;
+    }
+
+    /* Device has no segmentation offload; fall back to a normal send. */
+    ret = netdev_sendv(dev, iov, iovcnt, total_len);
     netdev_put(dev);
     return ret;
 }
@@ -976,4 +1177,63 @@ int netdev_recv(netdev_t *dev, void *data, uint32_t len) {
 
     netdev_put(dev);
     return ret;
+}
+
+int netdev_recv_q(netdev_t *dev, uint16_t qidx, void *data, uint32_t len) {
+    netdev_recv_q_t recv_q = NULL;
+    netdev_recv_t recv = NULL;
+    void *desc = NULL;
+    int ret = 0;
+
+    if (!dev || !data) {
+        return -EINVAL;
+    }
+    if (!netdev_get(dev)) {
+        return -ENODEV;
+    }
+
+    if (len == 0) {
+        netdev_put(dev);
+        return 0;
+    }
+
+    spin_lock(&dev->lock);
+    recv_q = dev->recv_q;
+    recv = dev->recv;
+    desc = dev->desc;
+    spin_unlock(&dev->lock);
+
+    if (recv_q) {
+        ret = recv_q(desc, qidx, data, len);
+    } else if (qidx == 0 && recv) {
+        ret = recv(desc, data, len);
+    } else {
+        ret = -EINVAL;
+    }
+
+    netdev_put(dev);
+    return ret;
+}
+
+bool netdev_poll_rx_q(netdev_t *dev, uint16_t qidx) {
+    netdev_poll_rx_q_t poll_rx_q = NULL;
+    netdev_poll_rx_t poll_rx = NULL;
+    void *desc = NULL;
+    bool ready = false;
+
+    if (!dev)
+        return false;
+
+    spin_lock(&dev->lock);
+    poll_rx_q = dev->poll_rx_q;
+    poll_rx = dev->poll_rx;
+    desc = dev->desc;
+    spin_unlock(&dev->lock);
+
+    if (poll_rx_q) {
+        ready = poll_rx_q(desc, qidx);
+    } else if (qidx == 0 && poll_rx) {
+        ready = poll_rx(desc);
+    }
+    return ready;
 }

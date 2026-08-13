@@ -1105,8 +1105,10 @@ err_t ip4_output_if_opt_src(struct pbuf *p, const ip4_addr_t *src,
 #endif /* LWIP_MULTICAST_TX_OPTIONS */
 #endif /* ENABLE_LOOPBACK */
 #if IP_FRAG
-    /* don't fragment if interface has mtu set to 0 [loopif] */
-    if (netif->mtu && (p->tot_len > netif->mtu)) {
+    /* don't fragment if interface has mtu set to 0 [loopif], or if this is a
+     * TSO/GSO segment (the device segments it, not the IP layer) */
+    if (netif->mtu && (p->tot_len > netif->mtu) &&
+        (p->gso_type == NETIF_GSO_NONE)) {
         return ip4_frag(p, netif, dest);
     }
 #endif /* IP_FRAG */

@@ -1639,16 +1639,21 @@ static int lwip_socket_fetch_datagram(lwip_socket_state_t *sock, int flags) {
 static ssize_t lwip_socket_copy_pbuf_to_iov(const struct pbuf *p,
                                             size_t pbuf_offset, size_t len,
                                             struct iovec *iov, size_t iovlen,
+                                            size_t iov_start_offset,
                                             size_t *copied_total) {
     const struct pbuf *q = p;
     size_t q_offset = pbuf_offset;
     size_t iov_index = 0;
-    size_t iov_offset = 0;
+    size_t iov_offset = iov_start_offset;
     size_t copied = 0;
 
     while (q && q_offset >= q->len) {
         q_offset -= q->len;
         q = q->next;
+    }
+    while (iov_index < iovlen && iov_offset >= iov[iov_index].len) {
+        iov_offset -= iov[iov_index].len;
+        iov_index++;
     }
 
     while (q && copied < len && iov_index < iovlen) {
@@ -1721,6 +1726,11 @@ static ssize_t lwip_socket_recvmsg_common(lwip_socket_state_t *sock, fd_t *fd,
     flags = lwip_socket_apply_fd_flags(fd, flags);
     msg->msg_flags = 0;
 
+    /* A zero-length read must never wait for network data. */
+    if (want == 0) {
+        return 0;
+    }
+
     if (flags & MSG_ERRQUEUE) {
         return -EAGAIN;
     }
@@ -1734,19 +1744,22 @@ static ssize_t lwip_socket_recvmsg_common(lwip_socket_state_t *sock, fd_t *fd,
             return 0;
         }
 
-        size_t avail = sock->rx_pbuf->tot_len - sock->rx_pbuf_offset;
-        size_t take = MIN(avail, want);
-        ssize_t copied = lwip_socket_copy_pbuf_to_iov(
-            sock->rx_pbuf, sock->rx_pbuf_offset, take, msg->msg_iov,
-            msg->msg_iovlen, &total);
-        if (copied < 0)
-            return copied;
+        do {
+            size_t avail = sock->rx_pbuf->tot_len - sock->rx_pbuf_offset;
+            size_t take = MIN(avail, want - total);
+            size_t part_total = 0;
+            ssize_t part = lwip_socket_copy_pbuf_to_iov(
+                sock->rx_pbuf, sock->rx_pbuf_offset, take, msg->msg_iov,
+                msg->msg_iovlen, total, &part_total);
+            if (part < 0)
+                return part;
+            total += part_total;
 
-        if (!(flags & MSG_PEEK)) {
-            sock->rx_pbuf_offset += total;
-            if (total > 0) {
-                netconn_tcp_recvd(sock->conn, total);
+            if (flags & MSG_PEEK) {
+                break;
             }
+
+            sock->rx_pbuf_offset += part_total;
             if (sock->rx_pbuf_offset >= sock->rx_pbuf->tot_len) {
                 pbuf_free(sock->rx_pbuf);
                 sock->rx_pbuf = NULL;
@@ -1754,6 +1767,30 @@ static ssize_t lwip_socket_recvmsg_common(lwip_socket_state_t *sock, fd_t *fd,
             }
             sock->rx_pbuf_announced = 0;
             lwip_socket_publish_rx_avail(sock);
+
+            /* Drain already queued TCP segments in the same syscall.  This
+             * preserves short-read semantics (never waits for more data) but
+             * avoids one syscall and core transition per MSS-sized pbuf. */
+            if (total < want && !sock->rx_pbuf) {
+                struct pbuf *next = NULL;
+                err_t next_err = netconn_recv_tcp_pbuf_flags(
+                    sock->conn, &next,
+                    NETCONN_DONTBLOCK | NETCONN_NOAUTORCVD | NETCONN_NOFIN);
+                if (next_err == ERR_OK && next) {
+                    sock->rx_pbuf = next;
+                    sock->rx_pbuf_offset = 0;
+                    lwip_socket_publish_rx_avail(sock);
+                } else {
+                    if (next_err == ERR_CLSD) {
+                        lwip_socket_mark_peer_closed(sock);
+                    }
+                    break;
+                }
+            }
+        } while (sock->rx_pbuf && total < want);
+
+        if (!(flags & MSG_PEEK) && total > 0) {
+            (void)netconn_tcp_recvd(sock->conn, total);
         }
 
         if (msg->msg_name && msg->msg_namelen > 0) {
@@ -1785,7 +1822,7 @@ static ssize_t lwip_socket_recvmsg_common(lwip_socket_state_t *sock, fd_t *fd,
         size_t take = MIN(avail, want);
         ssize_t copied = lwip_socket_copy_pbuf_to_iov(
             sock->rx_netbuf->p, sock->rx_netbuf_offset, take, msg->msg_iov,
-            msg->msg_iovlen, &total);
+            msg->msg_iovlen, 0, &total);
         if (copied < 0)
             return copied;
         if (avail > want) {
@@ -1823,6 +1860,10 @@ static ssize_t lwip_socket_sendmsg_common(lwip_socket_state_t *sock, fd_t *fd,
         void **bounce_buffers = NULL;
         u8_t write_flags = NETCONN_COPY;
         int ret = 0;
+
+        if (msg->msg_iovlen > 0xFFFFU) {
+            return -EMSGSIZE;
+        }
 
         ret = lwip_socket_build_bounce_iov(msg, &bounce_iov, &bounce_buffers);
         if (ret < 0) {

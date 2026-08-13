@@ -6,6 +6,48 @@
 typedef int (*netdev_send_t)(void *dev, void *data, uint32_t len);
 typedef int (*netdev_recv_t)(void *dev, void *data, uint32_t len);
 typedef bool (*netdev_poll_rx_t)(void *dev);
+/* Multiqueue receive: the same as recv/poll_rx but addressed to one RX queue.
+ */
+typedef int (*netdev_recv_q_t)(void *dev, uint16_t qidx, void *data,
+                               uint32_t len);
+typedef bool (*netdev_poll_rx_q_t)(void *dev, uint16_t qidx);
+typedef struct netdev_iovec {
+    const void *data;
+    uint32_t len;
+} netdev_iovec_t;
+typedef int (*netdev_sendv_t)(void *dev, const netdev_iovec_t *iov,
+                              uint32_t iovcnt, uint32_t total_len);
+
+/* Generic segmentation offload (TSO) info carried with a TX request.  The
+ * device is expected to split the single large frame into `mss`-sized
+ * segments on the wire.  `hdr_len` is the number of L2+L3+L4 header bytes at
+ * the front of the frame (0 lets the driver derive it by parsing the frame). */
+#define NETDEV_GSO_NONE 0
+#define NETDEV_GSO_TCPV4 1
+#define NETDEV_GSO_TCPV6 2
+#define NETDEV_GSO_UDP 3
+
+typedef struct netdev_gso_info {
+    uint16_t type;    /* one of NETDEV_GSO_* */
+    uint16_t mss;     /* segment size */
+    uint16_t hdr_len; /* L2+L3+L4 header bytes; 0 = derive in driver */
+} netdev_gso_info_t;
+
+typedef int (*netdev_send_gso_t)(void *dev, const netdev_iovec_t *iov,
+                                 uint32_t iovcnt, uint32_t total_len,
+                                 const netdev_gso_info_t *gso);
+
+/* Offload capabilities advertised by a netdev. */
+#define NETDEV_CAP_TX_CSUM (1u << 0) /* generate L4 checksums in HW */
+#define NETDEV_CAP_RX_CSUM (1u << 1) /* validate L4 checksums in HW */
+#define NETDEV_CAP_TSO4 (1u << 2)    /* segment TCPv4 in HW */
+#define NETDEV_CAP_TSO6 (1u << 3)    /* segment TCPv6 in HW */
+#define NETDEV_CAP_GRO (1u << 4)     /* coalesce RX in HW */
+
+/* Max L4 payload in a single TSO/GRO segment. Kept at 60 KiB so a full frame
+ * (payload + Ethernet/IP/TCP headers) still fits lwIP's u16_t pbuf length. */
+#define NETDEV_GSO_MAX_SIZE 61440
+
 struct netdev;
 typedef void (*netdev_event_cb_t)(struct netdev *dev, uint32_t events,
                                   void *ctx);
@@ -128,8 +170,14 @@ typedef struct netdev {
     bool unregistering;
     void *desc;
     netdev_send_t send;
+    netdev_sendv_t sendv;
+    netdev_send_gso_t send_gso;
     netdev_recv_t recv;
     netdev_poll_rx_t poll_rx;
+    netdev_recv_q_t recv_q;
+    netdev_poll_rx_q_t poll_rx_q;
+    uint16_t rx_queue_count;
+    uint32_t capabilities;
     netdev_trigger_scan_t trigger_scan;
     netdev_trigger_connect_t trigger_connect;
     netdev_trigger_disconnect_t trigger_disconnect;
@@ -158,6 +206,14 @@ netdev_t *netdev_get_by_index(uint32_t ifindex);
 size_t netdev_snapshot(netdev_t **out, size_t max);
 
 int netdev_set_name(netdev_t *dev, const char *name);
+int netdev_set_sendv(netdev_t *dev, netdev_sendv_t sendv);
+int netdev_set_send_gso(netdev_t *dev, netdev_send_gso_t send_gso);
+int netdev_set_recv_q(netdev_t *dev, netdev_recv_q_t recv_q);
+int netdev_set_poll_rx_q(netdev_t *dev, netdev_poll_rx_q_t poll_rx_q);
+void netdev_set_rx_queue_count(netdev_t *dev, uint16_t count);
+uint16_t netdev_rx_queue_count(netdev_t *dev);
+void netdev_set_caps(netdev_t *dev, uint32_t caps);
+uint32_t netdev_get_caps(netdev_t *dev);
 int netdev_set_trigger_scan(netdev_t *dev, netdev_trigger_scan_t trigger_scan);
 int netdev_set_trigger_connect(netdev_t *dev,
                                netdev_trigger_connect_t trigger_connect);
@@ -191,6 +247,39 @@ void netdev_notify(netdev_t *dev, uint32_t events);
 void netdev_notify_rx(netdev_t *dev);
 uint64_t netdev_rx_seq(netdev_t *dev);
 int netdev_wait_rx(netdev_t *dev, uint64_t observed_seq);
+int netdev_wait_rx_q(netdev_t *dev, uint16_t qidx, uint64_t observed_seq);
 
 int netdev_send(netdev_t *dev, void *data, uint32_t len);
+int netdev_sendv(netdev_t *dev, const netdev_iovec_t *iov, uint32_t iovcnt,
+                 uint32_t total_len);
+int netdev_send_gso(netdev_t *dev, const netdev_iovec_t *iov, uint32_t iovcnt,
+                    uint32_t total_len, const netdev_gso_info_t *gso);
 int netdev_recv(netdev_t *dev, void *data, uint32_t len);
+int netdev_recv_q(netdev_t *dev, uint16_t qidx, void *data, uint32_t len);
+bool netdev_poll_rx_q(netdev_t *dev, uint16_t qidx);
+
+static inline int netdev_recv_noref(netdev_t *dev, void *data, uint32_t len) {
+    if (!dev || !dev->recv || !data) {
+        return -EINVAL;
+    }
+    if (len == 0) {
+        return 0;
+    }
+    return dev->recv(dev->desc, data, len);
+}
+
+/* Queue-addressed receive, skipping the refcount pair (the caller holds a
+ * netdev reference for the duration of the RX loop). */
+static inline int netdev_recv_noref_q(netdev_t *dev, uint16_t qidx, void *data,
+                                      uint32_t len) {
+    if (!dev || !data || len == 0) {
+        return -EINVAL;
+    }
+    if (dev->recv_q) {
+        return dev->recv_q(dev->desc, qidx, data, len);
+    }
+    if (qidx == 0 && dev->recv) {
+        return dev->recv(dev->desc, data, len);
+    }
+    return -EINVAL;
+}
