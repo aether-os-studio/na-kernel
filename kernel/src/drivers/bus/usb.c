@@ -929,13 +929,18 @@ static void usb_unregister_devnode(usb_device_t *usbdev) {
     usbdev->usbfs_devnr = 0;
 }
 
-void regist_usb_driver(usb_driver_t *driver) {
+int regist_usb_driver(usb_driver_t *driver) {
+    if (!driver)
+        return -EINVAL;
+
     for (int i = 0; i < MAX_USBDEV_NUM; i++) {
         if (!usb_drivers[i]) {
             usb_drivers[i] = driver;
-            break;
+            return 0;
         }
     }
+
+    return -ENOSPC;
 }
 
 void unregist_usb_driver(usb_driver_t *driver) {

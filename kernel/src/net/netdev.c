@@ -7,6 +7,8 @@
 
 netdev_t *netdevs[MAX_NETDEV_NUM] = {NULL};
 static spinlock_t netdevs_lock = SPIN_INIT;
+static netdev_notifier_t netdev_notifiers[NETDEV_MAX_NOTIFIERS];
+static spinlock_t netdev_notifiers_lock = SPIN_INIT;
 
 #define NETDEV_RX_POLL_FALLBACK_NS (2ULL * 1000ULL * 1000ULL)
 
@@ -246,6 +248,15 @@ netdev_t *get_default_netdev() {
     }
     if (!dev) {
         dev = fallback;
+    }
+    if (dev) {
+        spin_lock(&dev->lock);
+        if (dev->unregistering) {
+            dev = NULL;
+        } else {
+            dev->refcount++;
+        }
+        spin_unlock(&dev->lock);
     }
     spin_unlock(&netdevs_lock);
 
@@ -952,8 +963,39 @@ void netdev_unregister_listener(netdev_t *dev, netdev_event_cb_t cb,
     spin_unlock(&dev->lock);
 }
 
+int netdev_register_notifier(netdev_event_cb_t cb, void *ctx) {
+    if (!cb)
+        return -EINVAL;
+
+    spin_lock(&netdev_notifiers_lock);
+    for (uint32_t i = 0; i < NETDEV_MAX_NOTIFIERS; i++) {
+        if (!netdev_notifiers[i].cb) {
+            netdev_notifiers[i] = (netdev_notifier_t){.cb = cb, .ctx = ctx};
+            spin_unlock(&netdev_notifiers_lock);
+            return 0;
+        }
+    }
+    spin_unlock(&netdev_notifiers_lock);
+    return -ENOSPC;
+}
+
+void netdev_unregister_notifier(netdev_event_cb_t cb, void *ctx) {
+    if (!cb)
+        return;
+
+    spin_lock(&netdev_notifiers_lock);
+    for (uint32_t i = 0; i < NETDEV_MAX_NOTIFIERS; i++) {
+        if (netdev_notifiers[i].cb == cb && netdev_notifiers[i].ctx == ctx) {
+            netdev_notifiers[i] = (netdev_notifier_t){0};
+            break;
+        }
+    }
+    spin_unlock(&netdev_notifiers_lock);
+}
+
 void netdev_notify(netdev_t *dev, uint32_t events) {
     netdev_listener_t listeners[NETDEV_MAX_EVENT_LISTENERS];
+    netdev_notifier_t notifiers[NETDEV_MAX_NOTIFIERS];
 
     if (!dev || !events) {
         return;
@@ -962,11 +1004,18 @@ void netdev_notify(netdev_t *dev, uint32_t events) {
     spin_lock(&dev->lock);
     memcpy(listeners, dev->listeners, sizeof(listeners));
     spin_unlock(&dev->lock);
+    spin_lock(&netdev_notifiers_lock);
+    memcpy(notifiers, netdev_notifiers, sizeof(notifiers));
+    spin_unlock(&netdev_notifiers_lock);
 
     for (uint32_t i = 0; i < NETDEV_MAX_EVENT_LISTENERS; i++) {
         if (listeners[i].cb) {
             listeners[i].cb(dev, events, listeners[i].ctx);
         }
+    }
+    for (uint32_t i = 0; i < NETDEV_MAX_NOTIFIERS; i++) {
+        if (notifiers[i].cb)
+            notifiers[i].cb(dev, events, notifiers[i].ctx);
     }
 
     netlink_publish_netdev_event(dev, events);

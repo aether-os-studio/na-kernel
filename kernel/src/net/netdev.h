@@ -57,6 +57,7 @@ typedef void (*netdev_event_cb_t)(struct netdev *dev, uint32_t events,
 #define NETDEV_NAME_LEN 16
 #define NETDEV_WIPHY_NAME_LEN 16
 #define NETDEV_MAX_EVENT_LISTENERS 8
+#define NETDEV_MAX_NOTIFIERS 8
 #define NETDEV_MAX_SCAN_SSIDS 4
 #define NETDEV_MAX_SCAN_RESULTS 64
 #define NETDEV_MAX_SCAN_IE_LEN 768
@@ -81,6 +82,7 @@ typedef struct netdev_listener {
     netdev_event_cb_t cb;
     void *ctx;
 } netdev_listener_t;
+typedef netdev_listener_t netdev_notifier_t;
 
 typedef struct netdev_wireless_info {
     bool present;
@@ -243,6 +245,8 @@ void netdev_put(netdev_t *dev);
 
 int netdev_register_listener(netdev_t *dev, netdev_event_cb_t cb, void *ctx);
 void netdev_unregister_listener(netdev_t *dev, netdev_event_cb_t cb, void *ctx);
+int netdev_register_notifier(netdev_event_cb_t cb, void *ctx);
+void netdev_unregister_notifier(netdev_event_cb_t cb, void *ctx);
 void netdev_notify(netdev_t *dev, uint32_t events);
 void netdev_notify_rx(netdev_t *dev);
 uint64_t netdev_rx_seq(netdev_t *dev);

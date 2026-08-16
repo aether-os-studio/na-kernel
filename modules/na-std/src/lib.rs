@@ -23,9 +23,11 @@ pub mod firmware;
 pub mod io;
 pub mod log;
 pub mod memory;
+pub mod net;
 pub mod pci;
 pub mod sync;
 pub mod time;
+pub mod usb;
 pub mod user;
 pub mod vfs;
 pub mod virtio;
@@ -49,9 +51,7 @@ macro_rules! module_entry {
 #[cfg(feature = "module-runtime")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    use alloc::ffi::CString;
-
-    KernelLog::write(CString::new(alloc::format!("{}", info)).unwrap().as_c_str());
+    KernelLog::write_fmt(format_args!("{}", info));
 
     loop {
         core::hint::spin_loop();

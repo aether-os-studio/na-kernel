@@ -206,6 +206,95 @@ void na_virtio_device_set_config_handler(na_virtio_device_t *device,
                                          void *context,
                                          void (*handler)(void *context));
 
+struct na_usb_device;
+typedef struct na_usb_device na_usb_device_t;
+struct na_usb_interface;
+typedef struct na_usb_interface na_usb_interface_t;
+struct na_usb_pipe;
+typedef struct na_usb_pipe na_usb_pipe_t;
+
+typedef struct na_usb_device_id {
+    uint16_t match_flags;
+    uint16_t vendor_id;
+    uint16_t product_id;
+    uint8_t interface_class;
+    uint8_t interface_subclass;
+    uint8_t interface_protocol;
+} na_usb_device_id_t;
+typedef na_usb_device_id_t UsbDeviceId;
+
+typedef struct na_usb_device_info {
+    uint16_t vendor_id;
+    uint16_t product_id;
+    uint8_t speed;
+    uint8_t bus_number;
+    uint8_t device_number;
+    uint8_t address;
+} na_usb_device_info_t;
+typedef na_usb_device_info_t UsbDeviceInfo;
+
+typedef struct na_usb_interface_info {
+    uint8_t number;
+    uint8_t alternate_setting;
+    uint8_t class_code;
+    uint8_t subclass;
+    uint8_t protocol;
+} na_usb_interface_info_t;
+typedef na_usb_interface_info_t UsbInterfaceInfo;
+
+typedef struct na_usb_driver_ops {
+    void *context;
+    int (*probe)(void *context, na_usb_device_t *device,
+                 na_usb_interface_t *interface, void **binding);
+    void (*remove)(void *context, void *binding);
+} na_usb_driver_ops_t;
+typedef na_usb_driver_ops_t UsbDriverOps;
+
+int na_usb_driver_register(const char *name, const na_usb_device_id_t *ids,
+                           size_t id_count, int priority,
+                           const na_usb_driver_ops_t *ops);
+int na_usb_device_info(const na_usb_device_t *device,
+                       na_usb_device_info_t *info);
+size_t na_usb_device_interface_count(const na_usb_device_t *device);
+na_usb_interface_t *na_usb_device_interface_at(const na_usb_device_t *device,
+                                               size_t index);
+int na_usb_interface_info(const na_usb_interface_t *interface,
+                          na_usb_interface_info_t *info);
+int na_usb_pipe_open(na_usb_interface_t *interface, uint8_t transfer_type,
+                     uint8_t direction, na_usb_pipe_t **pipe);
+void na_usb_pipe_close(na_usb_pipe_t *pipe);
+int na_usb_pipe_read(na_usb_pipe_t *pipe, void *data, size_t size,
+                     size_t *actual_size);
+int na_usb_pipe_write(na_usb_pipe_t *pipe, const void *data, size_t size,
+                      size_t *actual_size);
+int na_usb_control_transfer(na_usb_device_t *device, uint8_t request_type,
+                            uint8_t request, uint16_t value, uint16_t index,
+                            void *data, size_t size, size_t *actual_size);
+
+struct na_net_registration;
+typedef struct na_net_registration na_net_registration_t;
+
+typedef struct na_net_device_config {
+    const char *name;
+    uint32_t kind;
+    uint8_t mac[6];
+    uint32_t mtu;
+} na_net_device_config_t;
+typedef na_net_device_config_t NetDeviceConfig;
+
+typedef struct na_net_device_ops {
+    void *context;
+    int (*transmit)(void *context, const void *data, size_t size);
+    int (*receive)(void *context, void *data, size_t size);
+} na_net_device_ops_t;
+typedef na_net_device_ops_t NetDeviceOps;
+
+int na_net_device_register(const na_net_device_config_t *config,
+                           const na_net_device_ops_t *ops,
+                           na_net_registration_t **registration);
+int na_net_device_unregister(na_net_registration_t *registration);
+int na_net_device_set_link(na_net_registration_t *registration, bool link_up);
+
 struct drm_device;
 typedef struct drm_device drm_device_t;
 typedef struct drm_device DrmDevice;

@@ -19,6 +19,9 @@ The public interfaces include:
   bounded PIO regions; no PIO implementation leaks into common code.
 - `pci`: device snapshots, BAR resources, typed configuration-space access and
   trait-based driver registration.
+- `usb`: trait-based function-driver binding, typed interface discovery,
+  control requests and owned endpoint pipes.
+- `net`: trait-based Ethernet/Wi-Fi device registration with RAII teardown.
 - `fdt`: architecture-neutral FDT driver registration, validated properties
   and `reg` resources.
 - `acpi`: reference-counted ACPI table mappings released through RAII.

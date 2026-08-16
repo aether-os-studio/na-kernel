@@ -579,7 +579,7 @@ struct usb_driver {
  * Notes: like PCI registration, the driver descriptor must remain valid after
  * registration because future hotplug events may still match against it.
  */
-void regist_usb_driver(usb_driver_t *driver);
+int regist_usb_driver(usb_driver_t *driver);
 /**
  * Unregister a USB function driver.
  * Notes: this stops future matches, but callers should still think about
