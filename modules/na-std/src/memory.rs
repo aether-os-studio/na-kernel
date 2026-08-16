@@ -178,6 +178,22 @@ impl DmaBuffer {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.length) }
     }
 
+    /// Reads a naturally aligned DMA-coherent 64-bit location exactly once.
+    /// This is the safe equivalent of Linux's `READ_ONCE()` for device
+    /// writeback memory; callers do not need to expose raw pointers.
+    pub fn read_volatile_u64(&self, offset: usize) -> Result<u64> {
+        if offset % core::mem::align_of::<u64>() != 0
+            || offset
+                .checked_add(core::mem::size_of::<u64>())
+                .filter(|end| *end <= self.length)
+                .is_none()
+        {
+            return Err(Error::Range);
+        }
+        let pointer = self.ptr.as_ptr().wrapping_add(offset).cast::<u64>();
+        Ok(u64::from_le(unsafe { pointer.read_volatile() }))
+    }
+
     pub fn sync_for_device(&self) {
         unsafe { bindings::na_dma_sync_for_device(self.ptr.as_ptr().cast(), self.length) };
     }

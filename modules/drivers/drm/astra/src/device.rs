@@ -1,18 +1,18 @@
 //! Device adapter: PCI probe, BAR mapping and the init orchestration
 //! mirroring Linux `amdgpu_device_init`.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 
 use na_std::pci::{self, Bar, DeviceHandle, MsiIrq};
 use na_std::{Error, Result};
 
 use crate::atom::AtomBios;
-use crate::blocks;
+use crate::blocks::IpBlocks;
 use crate::dev_info;
 use crate::discovery::{self, GfxInfo};
-use crate::firmware::StagedFw;
-use crate::ip::{HWIP_COUNT, HwIp, IpBlock, MAX_INSTANCE};
+use crate::firmware::{FirmwareStore, StagedFw, UcodeId};
+use crate::ip::{CompletionFence, HWIP_COUNT, HwIp, MAX_INSTANCE, UserSubmission};
 use crate::irq::IhHandler;
 use crate::mem::{Bo, BoAllocator, Wb};
 use crate::regs::Regs;
@@ -94,18 +94,12 @@ pub struct Adapter {
     pub wb: Option<Wb>,
     /// Device scratch page (VRAM).
     pub mem_scratch: Option<Bo>,
-    /// Registered IP blocks in init order.
-    pub blocks: Vec<Box<dyn IpBlock>>,
     /// Long-lived PCI device handle (MSI setup, config space).
-    pub pci: Option<DeviceHandle>,
+    pub pci: DeviceHandle,
     /// MSI registration for the IH (keeps the handler alive).
     pub msi: Option<MsiIrq<IhHandler>>,
-    /// IRQ-context handler state.
-    pub ih_handler: Option<&'static IhHandler>,
-    /// Staged firmware images (PSP delivery).
-    pub fw: Vec<StagedFw>,
-    /// Contiguous GART buffer holding the staged firmware.
-    pub fw_staging: Option<Bo>,
+    /// PSP firmware metadata together with its staging BO.
+    firmware: Option<FirmwareStore>,
     /// RLC autoload + PSP-only firmware delivery (psp_early_init).
     pub psp_autoload: bool,
     /// SMU mailbox registers (published by the SMU block for VCN).
@@ -114,8 +108,68 @@ pub struct Adapter {
     _resources: Vec<pci::BarResource>,
 }
 
+/// Fully initialized GPU. Device state and executable IP blocks are separate
+/// owned fields so command dispatch can borrow both directly without moving
+/// either one out of its owner.
+pub struct Gpu {
+    adapter: Adapter,
+    blocks: IpBlocks,
+}
+
+impl Deref for Gpu {
+    type Target = Adapter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.adapter
+    }
+}
+
+impl DerefMut for Gpu {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.adapter
+    }
+}
+
+impl Gpu {
+    pub fn probe(device: pci::Device<'_>) -> Result<Self> {
+        Adapter::probe(device)?.initialize()
+    }
+
+    pub fn submit_user_ibs(&mut self, submission: UserSubmission<'_>) -> Result<CompletionFence> {
+        self.blocks.submit_user_ibs(&mut self.adapter, submission)
+    }
+
+    pub fn update_vm_table(
+        &mut self,
+        dst: u64,
+        addr: u64,
+        count: u32,
+        incr: u32,
+        flags: u64,
+    ) -> Result<()> {
+        self.blocks
+            .update_vm_table(&mut self.adapter, dst, addr, count, incr, flags)
+    }
+}
+
 impl Adapter {
-    pub fn probe(mut device: pci::Device<'_>) -> Result<Box<Self>> {
+    pub(crate) fn firmware(&self, id: UcodeId) -> Option<&StagedFw> {
+        self.firmware.as_ref()?.get(id)
+    }
+
+    pub(crate) fn firmware_mut(&mut self, id: UcodeId) -> Option<&mut StagedFw> {
+        self.firmware.as_mut()?.get_mut(id)
+    }
+
+    pub(crate) fn firmwares(&self) -> impl Iterator<Item = &StagedFw> {
+        self.firmware.iter().flat_map(FirmwareStore::iter)
+    }
+
+    pub(crate) fn install_firmware(&mut self, firmware: FirmwareStore) {
+        self.firmware = Some(firmware);
+    }
+
+    fn probe(mut device: pci::Device<'_>) -> Result<Self> {
         let info = device.info()?;
         dev_info!(
             "astra: probing {:04x}:{:02x}:{:02x}.{}",
@@ -144,14 +198,13 @@ impl Adapter {
                 range.start().get(),
                 range.length(),
             );
-            let region = range.map_mmio().map_err(|error| {
+            let region = range.map_mmio().inspect_err(|_error| {
                 dev_info!(
                     "astra: failed to map BAR {} (phys {:#x}, {:#x} bytes)",
                     index,
                     range.start().get(),
                     range.length(),
                 );
-                error
             })?;
             bars[index as usize] = Some(region);
             resources.push(resource);
@@ -163,7 +216,7 @@ impl Adapter {
             bars[BAR_DOORBELL as usize].take().ok_or(Error::NoDevice)?,
         );
 
-        Ok(Box::new(Self {
+        Ok(Self {
             info,
             regs,
             versions: [[0; MAX_INSTANCE]; HWIP_COUNT],
@@ -176,22 +229,19 @@ impl Adapter {
             scanout: None,
             wb: None,
             mem_scratch: None,
-            blocks: Vec::new(),
-            pci: Some(device.retain()),
+            pci: device.retain(),
             msi: None,
-            ih_handler: None,
-            fw: Vec::new(),
-            fw_staging: None,
+            firmware: None,
             psp_autoload: false,
             smu_mailbox: None,
             _resources: resources,
-        }))
+        })
     }
 
     /// Runs the amdgpu-style init chain (grows with each milestone):
     /// early_init → sw_init (COMMON/GMC hw inline) → [IH] → fw loading
     /// → remaining hw_init → late_init.
-    pub fn init(&mut self) -> Result<()> {
+    fn initialize(mut self) -> Result<Gpu> {
         let info = self.info;
         dev_info!(
             "astra {:#06x}:{:02x}:{:02x}.{}: {:04x}:{:04x} rev {:02x}",
@@ -205,7 +255,7 @@ impl Adapter {
         );
 
         // IP discovery (fills reg bases + versions).
-        let discovery = discovery::parse(&mut self.regs)?;
+        let discovery = discovery::Discovery::read(&mut self.regs)?;
         self.versions = discovery.ip_versions;
         self.gfx_info = discovery.gfx_info;
 
@@ -241,7 +291,7 @@ impl Adapter {
             // 3. PCI ROM BAR.
             if bios.is_none() {
                 dev_info!("astra: SMUIO ROM window failed, trying PCI ROM BAR");
-                match self.pci.as_ref().and_then(|p| p.as_device().rom_bar().ok()) {
+                match self.pci.as_device().rom_bar().ok() {
                     Some(bar) => bios = AtomBios::read_from_rom_bar(bar).ok(),
                     None => dev_info!("astra: no PCI ROM BAR available"),
                 }
@@ -281,80 +331,20 @@ impl Adapter {
             );
         }
 
-        let mut blocks = blocks::build(&self.versions);
+        let mut blocks = IpBlocks::discover(&self.versions);
+        blocks.initialize(&mut self)?;
 
-        // early_init across all blocks.
-        for block in &mut blocks {
-            if let Err(error) = block.early_init(self) {
-                dev_info!("astra: {} early_init failed: {:?}", block.name(), error);
-                return Err(error);
-            }
-        }
-
-        // Linux amdgpu_device_ip_init: walk blocks once, running sw_init and
-        // immediately running COMMON/GMC hw_init when those blocks are
-        // encountered. GMC must be live before later IPs bind their GTT BOs.
-        for block in &mut blocks {
-            if let Err(error) = block.sw_init(self) {
-                dev_info!("astra: {} sw_init failed: {:?}", block.name(), error);
-                return Err(error);
-            }
-            if matches!(block.hw_ip(), HwIp::Common | HwIp::Gmc) {
-                if let Err(error) = block.hw_init(self) {
-                    dev_info!("astra: {} hw_init failed: {:?}", block.name(), error);
-                    return Err(error);
-                }
-            }
-            // Linux's GTT bind path synchronizes each batch of new PTEs.
-            if let Err(error) = crate::blocks::flush_pending_gart(self) {
-                dev_info!("astra: GART bind flush failed: {:?}", error);
-                return Err(error);
-            }
-        }
-
-        // hw_init phase 1: IH (Linux amdgpu_device_ip_hw_init_phase1).
-        for block in &mut blocks {
-            if block.hw_ip() == HwIp::OssSys {
-                if let Err(error) = block.hw_init(self) {
-                    dev_info!("astra: {} hw_init failed: {:?}", block.name(), error);
-                    return Err(error);
-                }
-            }
-        }
-
-        // Firmware loading: PSP (Linux amdgpu_device_fw_loading).
-        for block in &mut blocks {
-            if block.hw_ip() == HwIp::Mp0 {
-                if let Err(error) = block.hw_init(self) {
-                    dev_info!("astra: {} hw_init failed: {:?}", block.name(), error);
-                    return Err(error);
-                }
-            }
-        }
-
-        // hw_init phase 2 in Linux order: SMU → [DM] → GC → SDMA →
-        // VCN → JPEG (Linux amdgpu_device_ip_hw_init_phase2).
-        for ip in [HwIp::Mp1, HwIp::Dm, HwIp::Gc, HwIp::Sdma0, HwIp::Uvd] {
-            for block in &mut blocks {
-                if block.hw_ip() == ip {
-                    if let Err(error) = block.hw_init(self) {
-                        dev_info!("astra: {} hw_init failed: {:?}", block.name(), error);
-                        return Err(error);
-                    }
-                }
-            }
-        }
-
-        // late_init across all blocks (Linux amdgpu_device_ip_late_init).
-        for block in &mut blocks {
-            if let Err(error) = block.late_init(self) {
-                dev_info!("astra: {} late_init failed: {:?}", block.name(), error);
-                return Err(error);
-            }
-        }
-
-        self.blocks = blocks;
         dev_info!("astra: init succeeded");
-        Ok(())
+        Ok(Gpu {
+            adapter: self,
+            blocks,
+        })
+    }
+
+    /// Linux `amdgpu_discovery_set_common_ip_blocks` selects
+    /// `nbio_v2_3_funcs` for NBIO 2.1.x, 2.3.x and 3.3.x.
+    pub(crate) fn uses_nbio_v2_3(&self) -> bool {
+        let version = crate::ip::IpVersion::from_full(self.versions[HwIp::Nbio.index()][0]);
+        matches!((version.major, version.minor), (2, 1) | (2, 3) | (3, 3))
     }
 }

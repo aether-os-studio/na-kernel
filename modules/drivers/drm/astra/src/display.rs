@@ -1,18 +1,18 @@
-use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use na_std::drm::{
     Connection, Connector, ConnectorList, ConnectorType, Crtc, CrtcList, CursorUpdate, DisplayInfo,
     Driver, DumbBuffer, DumbBufferMapping, DumbBufferRequest, Encoder, EncoderList, EncoderType,
     FileId, FramebufferFormat, FramebufferInfo, FramebufferRequest, Ioctl, MmapRequest, Mode,
-    PageFlip, Plane, PlaneList, PlaneType, PrimeBuffer,
+    OwnedDevice, OwnedDeviceBuilder, PageFlip, Plane, PlaneList, PlaneType, PrimeBuffer,
 };
 use na_std::memory::PhysicalAddress;
-use na_std::sync::Mutex;
+use na_std::sync::{Mutex, SpinLock};
 use na_std::{Error, Result};
 
 use crate::dev_info;
-use crate::device::Adapter;
+use crate::device::{Adapter, Gpu};
 
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
@@ -22,23 +22,30 @@ const DRM_MODE_CURSOR_BO: u32 = 0x1;
 const DRM_MODE_CURSOR_MOVE: u32 = 0x2;
 const DCN_CURSOR_SIZE: u32 = 256;
 static FORMATS: [u32; 2] = [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
+// Linux amdgpu_dm exposes only premultiplied-alpha ARGB8888 on the native
+// cursor plane. Keeping this separate from the primary formats lets wlroots
+// select the hardware cursor path instead of repainting the whole scene for
+// every pointer motion.
+static CURSOR_FORMATS: [u32; 1] = [DRM_FORMAT_ARGB8888];
 
-/// DRM device state. The `'static` adapter gives exclusive access to the
-/// VRAM allocator and register layer for dumb-buffer allocation.
+/// DRM device state. The owned GPU gives exclusive access to the VRAM
+/// allocator, IP engines and register layer.
 pub struct DisplayDevice {
-    adapter: Mutex<&'static mut Adapter>,
+    gpu: Mutex<Gpu>,
     framebuffer: na_std::boot::Framebuffer,
     vram_base: u64,
+    fb_start: u64,
     state: Mutex<DispState>,
     files: Mutex<Vec<crate::ioctl::FileState>>,
     prime: Mutex<crate::ioctl::PrimeState>,
     framebuffers: Mutex<crate::ioctl::FramebufferState>,
-    cursor: Mutex<CursorState>,
-    cursor_regs: Mutex<crate::regs::DcnCursorRegs>,
+    cursor: SpinLock<CursorState>,
     primary: Mutex<Option<crate::ioctl::ScanoutBuffer>>,
+    primary_handle: AtomicU32,
 }
 
 struct CursorState {
+    controller: crate::blocks::DcnCursor,
     buffer: Option<crate::ioctl::CursorBuffer>,
     x: i32,
     y: i32,
@@ -59,64 +66,67 @@ struct DispBuffer {
     size: usize,
 }
 
-/// Registers the simpledrm-like DRM device after GMC init has populated the
-/// VRAM allocator. Takes ownership of the `'static` adapter.
-pub fn register(adapter: &'static mut Adapter) -> Result<()> {
-    let scanout = adapter.scanout.ok_or(Error::NoDevice)?;
-    let mut framebuffer = na_std::boot::framebuffer()?;
-    let vram_base = adapter.vram_base;
-    framebuffer.physical_address = vram_base
-        .checked_add(scanout.vram_offset)
-        .ok_or(Error::InvalidArgument)?;
-    framebuffer.width = scanout.width as u64;
-    framebuffer.height = scanout.height as u64;
-    framebuffer.bpp = 32;
-    framebuffer.pitch = scanout.pitch as u64;
-    framebuffer.red_mask_size = 8;
-    framebuffer.red_mask_shift = 16;
-    framebuffer.green_mask_size = 8;
-    framebuffer.green_mask_shift = 8;
-    framebuffer.blue_mask_size = 8;
-    framebuffer.blue_mask_shift = 0;
+/// Registers the DRM device after GMC init and transfers the GPU into the
+/// registration's pinned callback owner.
+impl DisplayDevice {
+    pub fn register(gpu: Gpu) -> Result<OwnedDevice<Self>> {
+        let scanout = gpu.scanout.ok_or(Error::NoDevice)?;
+        let mut framebuffer = na_std::boot::framebuffer()?;
+        let vram_base = gpu.vram_base;
+        framebuffer.physical_address = vram_base
+            .checked_add(scanout.vram_offset)
+            .ok_or(Error::InvalidArgument)?;
+        framebuffer.width = scanout.width as u64;
+        framebuffer.height = scanout.height as u64;
+        framebuffer.bpp = 32;
+        framebuffer.pitch = scanout.pitch as u64;
+        framebuffer.red_mask_size = 8;
+        framebuffer.red_mask_shift = 16;
+        framebuffer.green_mask_size = 8;
+        framebuffer.green_mask_shift = 8;
+        framebuffer.blue_mask_size = 8;
+        framebuffer.blue_mask_shift = 0;
 
-    na_std::boot::rebind_framebuffer(framebuffer)?;
-    dev_info!(
-        "astra: TTY framebuffer rebound to BAR0 scanout at {:#x}",
-        framebuffer.physical_address,
-    );
-    let cursor_regs = adapter.regs.dcn_cursor_regs();
+        na_std::boot::rebind_framebuffer(framebuffer)?;
+        dev_info!(
+            "astra: TTY framebuffer rebound to BAR0 scanout at {:#x}",
+            framebuffer.physical_address,
+        );
+        let cursor = crate::blocks::DcnCursor::new(gpu.regs.dcn_cursor_regs());
+        let fb_start = gpu.gmc.fb_start;
+        let pci = gpu.pci.as_device().retain();
+        let pci_device = pci.as_device();
 
-    let device: &'static DisplayDevice = Box::leak(Box::new(DisplayDevice {
-        adapter: Mutex::new(adapter)?,
-        framebuffer,
-        vram_base,
-        state: Mutex::new(DispState {
-            next_handle: 1,
-            buffers: Vec::new(),
-        })?,
-        files: Mutex::new(Vec::new())?,
-        prime: Mutex::new(crate::ioctl::PrimeState::new())?,
-        framebuffers: Mutex::new(crate::ioctl::FramebufferState::new())?,
-        cursor: Mutex::new(CursorState {
-            buffer: None,
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-            visible: false,
-        })?,
-        cursor_regs: Mutex::new(cursor_regs)?,
-        primary: Mutex::new(None)?,
-    }));
+        let device = DisplayDevice {
+            gpu: Mutex::new(gpu)?,
+            framebuffer,
+            vram_base,
+            fb_start,
+            state: Mutex::new(DispState {
+                next_handle: 1,
+                buffers: Vec::new(),
+            })?,
+            files: Mutex::new(Vec::new())?,
+            prime: Mutex::new(crate::ioctl::PrimeState::new())?,
+            framebuffers: Mutex::new(crate::ioctl::FramebufferState::new())?,
+            cursor: SpinLock::new(CursorState {
+                controller: cursor,
+                buffer: None,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                visible: false,
+            }),
+            primary: Mutex::new(None)?,
+            primary_handle: AtomicU32::new(0),
+        };
 
-    // Keep the DRM device attached to the real PCI function so sysfs/udev
-    // expose both card and render nodes under 0000:03:00.0. The registration
-    // metadata keeps the kernel/sysfs name `astra` while exposing the
-    // upstream `amdgpu` UAPI name and version to libdrm/Mesa.
-    let drm = {
-        let adapter = device.adapter.lock();
-        let pci_device = adapter.pci.as_ref().map(|pci| pci.as_device());
-        na_std::drm::DeviceBuilder::new(
+        // Keep the DRM device attached to the real PCI function so sysfs/udev
+        // expose both card and render nodes under 0000:03:00.0. The registration
+        // metadata keeps the kernel/sysfs name `astra` while exposing the
+        // upstream `amdgpu` UAPI name and version to libdrm/Mesa.
+        let drm = OwnedDeviceBuilder::new(
             device,
             c"dri/card",
             na_std::drm::DriverInfo::new(
@@ -130,55 +140,53 @@ pub fn register(adapter: &'static mut Adapter) -> Result<()> {
             ),
         )
         .render_node(true)
-        .register(pci_device.as_ref())?
-    };
-    let _ = Box::leak(Box::new(drm));
+        .register(Some(&pci_device))?;
 
-    dev_info!(
-        "astra: DRM device registered ({}x{} bpp {} @ {:#x})",
-        framebuffer.width,
-        framebuffer.height,
-        framebuffer.bpp,
-        framebuffer.physical_address,
-    );
-    Ok(())
+        dev_info!(
+            "astra: DRM device registered ({}x{} bpp {} @ {:#x})",
+            framebuffer.width,
+            framebuffer.height,
+            framebuffer.bpp,
+            framebuffer.physical_address,
+        );
+        Ok(drm)
+    }
 }
 
 /// Mode exposed through DRM. The active ASTRA scanout is currently fixed to
 /// CEA-861 1920x1080p60, so report the exact timing programmed into DCN.
-fn mode(width: u64, height: u64) -> Result<Mode> {
-    let w = u16::try_from(width).map_err(|_| Error::InvalidArgument)?;
-    let h = u16::try_from(height).map_err(|_| Error::InvalidArgument)?;
-    if (width, height) != (1920, 1080) {
-        return Err(Error::Unsupported);
-    }
-    let mut m = Mode::new(w, h, 60);
-    m.clock = 148_500;
-    m.hsync_start = 2008;
-    m.hsync_end = 2052;
-    m.htotal = 2200;
-    m.vsync_start = 1084;
-    m.vsync_end = 1089;
-    m.vtotal = 1125;
-    m.mode_type = (1 << 3) | (1 << 6);
-    Ok(m)
-}
-
 impl DisplayDevice {
+    fn mode(&self) -> Result<Mode> {
+        let width = self.framebuffer.width;
+        let height = self.framebuffer.height;
+        let w = u16::try_from(width).map_err(|_| Error::InvalidArgument)?;
+        let h = u16::try_from(height).map_err(|_| Error::InvalidArgument)?;
+        if (width, height) != (1920, 1080) {
+            return Err(Error::Unsupported);
+        }
+        let mut m = Mode::new(w, h, 60);
+        m.clock = 148_500;
+        m.hsync_start = 2008;
+        m.hsync_end = 2052;
+        m.htotal = 2200;
+        m.vsync_start = 1084;
+        m.vsync_end = 1089;
+        m.vtotal = 1125;
+        m.mode_type = (1 << 3) | (1 << 6);
+        Ok(m)
+    }
+
     fn program_scanout(
         adapter: &mut Adapter,
         scanout: &crate::ioctl::ScanoutBuffer,
         geometry_changed: bool,
     ) -> Result<()> {
+        let mut pipe = crate::blocks::DcnDisplayPipe::new(&mut adapter.regs);
         if geometry_changed {
             // Linux updates DSCL RECOUT/MPC geometry when the plane is
             // enabled or its scaling/position changes, not on an ordinary
             // address-only page flip.
-            crate::blocks::program_primary_geometry(
-                &mut adapter.regs,
-                scanout.width,
-                scanout.height,
-            )?;
+            pipe.set_primary_geometry(scanout.width, scanout.height)?;
         }
         let config = crate::blocks::PrimarySurfaceConfig {
             address: scanout.gpu_address(),
@@ -195,13 +203,9 @@ impl DisplayDevice {
             dcc_independent_block: scanout.dcc_independent_block,
         };
         if geometry_changed {
-            crate::blocks::program_primary_surface(&mut adapter.regs, &config)
+            pipe.set_primary_surface(&config)
         } else {
-            crate::blocks::program_primary_address(
-                &mut adapter.regs,
-                config.address,
-                config.meta_address,
-            )
+            pipe.set_primary_address(config.address, config.meta_address)
         }
     }
 
@@ -218,7 +222,7 @@ impl Driver for DisplayDevice {
     fn open(&self, file: FileId) -> Result<()> {
         // Keep the global lock order used by ioctls/close: adapter, files.
         // Linux allocates the per-file VM root from VRAM during open.
-        let mut adapter = self.adapter.lock();
+        let mut adapter = self.gpu.lock();
         let mut files = self.files.lock();
         if files.iter().any(|state| state.belongs_to(file)) {
             return Err(Error::AlreadyExists);
@@ -235,7 +239,7 @@ impl Driver for DisplayDevice {
                     vmid,
                     error,
                 );
-                if let Err(retire_error) = crate::blocks::flush_pending_gart(&mut adapter) {
+                if let Err(retire_error) = adapter.flush_gart() {
                     dev_info!(
                         "astra: retiring BOs after failed DRM open failed: {:?}",
                         retire_error,
@@ -252,20 +256,18 @@ impl Driver for DisplayDevice {
         // Match the lock ordering used by private ioctls: adapter, then file
         // table. This also guarantees GART invalidation completes before BO
         // DMA allocations are dropped.
-        let mut adapter = self.adapter.lock();
+        let mut adapter = self.gpu.lock();
         let mut files = self.files.lock();
         let Some(index) = files.iter().position(|state| state.belongs_to(file)) else {
             return;
         };
-        let mut state = files.remove(index);
-        if let Err(error) = crate::ioctl::release_file(&mut adapter, &mut state) {
+        let state = files.remove(index);
+        if let Err(error) = state.close(&mut adapter) {
             dev_info!("astra: releasing AMDGPU file state failed: {:?}", error);
         }
-        // `FileState` owns its VM tables and remaining GEM references. Their
-        // Drop implementations enqueue retirement; perform the one required
-        // GART maintenance pass only after the whole ownership tree is gone.
-        drop(state);
-        if let Err(error) = crate::blocks::flush_pending_gart(&mut adapter) {
+        // Consuming `FileState` retires its VM tables and remaining GEM
+        // references; perform the one hardware maintenance pass afterwards.
+        if let Err(error) = adapter.flush_gart() {
             dev_info!("astra: retiring AMDGPU file BOs failed: {:?}", error);
         }
     }
@@ -274,7 +276,7 @@ impl Driver for DisplayDevice {
         let raw_command = ioctl.command;
         let argument_length = ioctl.arg.len();
         let file_number = ioctl.file.map(FileId::raw).unwrap_or(0);
-        let command = match crate::uapi::command(raw_command) {
+        let command = match crate::uapi::Command::from_ioctl(raw_command) {
             Some(command) => command,
             None => {
                 dev_info!(
@@ -290,53 +292,74 @@ impl Driver for DisplayDevice {
             if command == crate::uapi::Command::Info {
                 let request = crate::uapi::InfoRequest::parse(ioctl.arg)?;
                 let reply = {
-                    let adapter = self.adapter.lock();
-                    crate::ioctl::info(&adapter, &request)?
+                    let adapter = self.gpu.lock();
+                    adapter.query_info(&request)?
                 };
                 request.write_reply(&reply)?;
                 return Ok(0);
             }
 
-            let file_id = ioctl.file.ok_or(Error::InvalidArgument)?;
-            let mut adapter = self.adapter.lock();
-            let mut files = self.files.lock();
-            let file = files
-                .iter_mut()
-                .find(|state| state.belongs_to(file_id))
-                .ok_or(Error::NotFound)?;
             match command {
-                crate::uapi::Command::GemCreate => {
-                    let _ = crate::ioctl::gem_create(&mut adapter, file, ioctl.arg)?;
+                crate::uapi::Command::GemMmap
+                | crate::uapi::Command::Ctx
+                | crate::uapi::Command::BoList
+                | crate::uapi::Command::GemMetadata
+                | crate::uapi::Command::GemOp
+                | crate::uapi::Command::GemClose => {
+                    let file_id = ioctl.file.ok_or(Error::InvalidArgument)?;
+                    let mut files = self.files.lock();
+                    let file = files
+                        .iter_mut()
+                        .find(|state| state.belongs_to(file_id))
+                        .ok_or(Error::NotFound)?;
+                    match command {
+                        crate::uapi::Command::GemMmap => {
+                            let _ = file.mmap_offset(ioctl.arg)?;
+                        }
+                        crate::uapi::Command::Ctx => {
+                            let _ = file.manage_context(ioctl.arg)?;
+                        }
+                        crate::uapi::Command::BoList => {
+                            let _ = file.manage_bo_list(ioctl.arg)?;
+                        }
+                        crate::uapi::Command::GemMetadata => file.metadata(ioctl.arg)?,
+                        crate::uapi::Command::GemOp => file.operate_bo(ioctl.arg)?,
+                        crate::uapi::Command::GemClose => {
+                            let _ = file.close_bo(ioctl.arg)?;
+                        }
+                        _ => unreachable!(),
+                    }
                 }
-                crate::uapi::Command::GemMmap => {
-                    let _ = crate::ioctl::gem_mmap(file, ioctl.arg)?;
-                }
-                crate::uapi::Command::Ctx => {
-                    let _ = crate::ioctl::context(file, ioctl.arg)?;
-                }
-                crate::uapi::Command::BoList => {
-                    let _ = crate::ioctl::bo_list(&mut adapter, file, ioctl.arg)?;
-                }
-                crate::uapi::Command::Cs => {
-                    let _ = crate::ioctl::cs(&mut adapter, file, ioctl.arg)?;
-                }
-                crate::uapi::Command::GemMetadata => {
-                    crate::ioctl::gem_metadata(file, ioctl.arg)?;
-                }
-                crate::uapi::Command::GemWaitIdle => {
-                    crate::ioctl::gem_wait_idle(&mut adapter, file, ioctl.arg)?;
-                }
-                crate::uapi::Command::GemVa => {
-                    crate::ioctl::gem_va(&mut adapter, file, ioctl.arg)?;
-                }
-                crate::uapi::Command::WaitCs => {
-                    let _ = crate::ioctl::wait_cs(&mut adapter, file, ioctl.arg)?;
-                }
-                crate::uapi::Command::GemOp => {
-                    crate::ioctl::gem_op(file, ioctl.arg)?;
-                }
-                crate::uapi::Command::GemClose => {
-                    let _ = crate::ioctl::gem_close(&mut adapter, file, ioctl.arg)?;
+                crate::uapi::Command::GemCreate
+                | crate::uapi::Command::Cs
+                | crate::uapi::Command::GemWaitIdle
+                | crate::uapi::Command::GemVa
+                | crate::uapi::Command::WaitCs => {
+                    let file_id = ioctl.file.ok_or(Error::InvalidArgument)?;
+                    let mut adapter = self.gpu.lock();
+                    let mut files = self.files.lock();
+                    let file = files
+                        .iter_mut()
+                        .find(|state| state.belongs_to(file_id))
+                        .ok_or(Error::NotFound)?;
+                    match command {
+                        crate::uapi::Command::GemCreate => {
+                            let _ = file.create_bo(&mut adapter, ioctl.arg)?;
+                        }
+                        crate::uapi::Command::Cs => {
+                            let _ = file.submit(&mut adapter, ioctl.arg)?;
+                        }
+                        crate::uapi::Command::GemWaitIdle => {
+                            file.wait_bo(&mut adapter, ioctl.arg)?;
+                        }
+                        crate::uapi::Command::GemVa => {
+                            file.update_va(&mut adapter, ioctl.arg)?;
+                        }
+                        crate::uapi::Command::WaitCs => {
+                            let _ = file.wait_submission(&mut adapter, ioctl.arg)?;
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 crate::uapi::Command::Info => unreachable!(),
             }
@@ -375,34 +398,35 @@ impl Driver for DisplayDevice {
     }
 
     fn mmap(&self, request: MmapRequest) -> Result<PhysicalAddress> {
-        let adapter = self.adapter.lock();
+        let adapter = self.gpu.lock();
         let files = self.files.lock();
         let file = files
             .iter()
             .find(|state| state.belongs_to(request.file))
             .ok_or(Error::NotFound)?;
-        crate::ioctl::mmap_physical(&adapter, file, request.offset, request.length)
+        file.physical_mapping(&adapter, request.offset, request.length)
     }
 
     fn prime_export(&self, file: FileId, handle: u32) -> Result<PrimeBuffer> {
-        let adapter = self.adapter.lock();
+        let adapter = self.gpu.lock();
         let files = self.files.lock();
         let mut prime = self.prime.lock();
-        crate::ioctl::prime_export(&adapter, &files, &mut prime, file, handle)
+        prime.export(&adapter, &files, file, handle)
     }
 
     fn prime_import(&self, file: FileId, token: u64) -> Result<u32> {
-        // Serialize object reference changes with GEM_CLOSE/release_file.
-        let _adapter = self.adapter.lock();
+        // The file table owns handle serialization; importing an existing
+        // object does not touch VM page tables or device registers.
         let mut files = self.files.lock();
         let prime = self.prime.lock();
-        crate::ioctl::prime_import(&mut files, &prime, file, token)
+        prime.import(&mut files, file, token)
     }
 
     fn prime_release(&self, token: u64) -> Result<()> {
-        let mut adapter = self.adapter.lock();
+        let mut adapter = self.gpu.lock();
         let mut prime = self.prime.lock();
-        crate::ioctl::prime_release(&mut adapter, &mut prime, token)
+        prime.remove(token)?;
+        adapter.flush_gart()
     }
 
     fn capability(&self, capability: u64) -> Result<u64> {
@@ -424,7 +448,7 @@ impl Driver for DisplayDevice {
     }
 
     fn connectors(&self, resources: &mut ConnectorList<'_>) -> Result<()> {
-        let modes = [mode(self.framebuffer.width, self.framebuffer.height)?];
+        let modes = [self.mode()?];
         resources.push(Connector {
             connector_type: ConnectorType::Virtual,
             connection: Connection::Connected,
@@ -445,7 +469,7 @@ impl Driver for DisplayDevice {
             width: info.width,
             height: info.height,
             gamma_size: 0,
-            mode: Some(mode(self.framebuffer.width, self.framebuffer.height)?),
+            mode: Some(self.mode()?),
         })
     }
 
@@ -465,6 +489,13 @@ impl Driver for DisplayDevice {
             gamma_size: 0,
             plane_type: PlaneType::Primary,
             formats: &FORMATS,
+        })?;
+        resources.push(Plane {
+            crtc_index: Some(0),
+            possible_crtcs: 1,
+            gamma_size: 0,
+            plane_type: PlaneType::Cursor,
+            formats: &CURSOR_FORMATS,
         })
     }
 
@@ -478,8 +509,8 @@ impl Driver for DisplayDevice {
             .ok_or(Error::InvalidArgument)? as usize;
 
         let (offset, alloc_size) = {
-            let mut guard = self.adapter.lock();
-            let adapter: &mut Adapter = &mut **guard;
+            let mut guard = self.gpu.lock();
+            let adapter: &mut Adapter = &mut guard;
             let bo = adapter.mem.alloc_vram(&mut adapter.regs, size)?;
             (bo.gpu_addr, bo.size)
         };
@@ -547,24 +578,24 @@ impl Driver for DisplayDevice {
                     .ok_or(Error::InvalidArgument)?;
 
                 let pinned = {
-                    let _adapter = self.adapter.lock();
                     let files = self.files.lock();
                     let mut framebuffers = self.framebuffers.lock();
-                    crate::ioctl::framebuffer_pin(
+                    framebuffers.pin(
                         &files,
-                        &mut framebuffers,
                         file,
                         request.handles[0],
-                        minimum_size,
-                        request.width,
-                        request.height,
-                        request.pitches[0],
-                        request.offsets[0],
-                        request.pixel_format,
-                        request.flags,
-                        request.modifiers[0],
-                        request.pitches[1],
-                        request.offsets[1],
+                        crate::ioctl::FramebufferConfig {
+                            minimum_size,
+                            width: request.width,
+                            height: request.height,
+                            pitch: request.pitches[0],
+                            offset: request.offsets[0],
+                            format: request.pixel_format,
+                            flags: request.flags,
+                            modifier: request.modifiers[0],
+                            meta_pitch: request.pitches[1],
+                            meta_offset: request.offsets[1],
+                        },
                     )
                 };
                 match pinned {
@@ -599,11 +630,12 @@ impl Driver for DisplayDevice {
         if handle < 0x8000_0000 {
             return;
         }
-        let mut adapter = self.adapter.lock();
+        let mut adapter = self.gpu.lock();
         let mut framebuffers = self.framebuffers.lock();
-        if let Err(error) =
-            crate::ioctl::framebuffer_release(&mut adapter, &mut framebuffers, handle)
-        {
+        let result = framebuffers
+            .remove(handle)
+            .and_then(|()| adapter.flush_gart());
+        if let Err(error) = result {
             dev_info!(
                 "astra: releasing KMS framebuffer object {} failed: {:?}",
                 handle,
@@ -615,18 +647,17 @@ impl Driver for DisplayDevice {
     fn framebuffer_handle(&self, file: FileId, framebuffer_handle: u32) -> Result<u32> {
         let mut files = self.files.lock();
         let framebuffers = self.framebuffers.lock();
-        crate::ioctl::framebuffer_gem_handle(&mut files, &framebuffers, file, framebuffer_handle)
+        framebuffers.gem_handle(&mut files, file, framebuffer_handle)
     }
 
     fn set_crtc(&self, update: na_std::drm::CrtcUpdate<'_>) -> Result<()> {
         if update.framebuffer_handle == 0 {
             return Ok(());
         }
-        let mut adapter = self.adapter.lock();
+        let mut adapter = self.gpu.lock();
         let framebuffers = self.framebuffers.lock();
         let mut primary = self.primary.lock();
-        let scanout =
-            crate::ioctl::framebuffer_scanout(&adapter, &framebuffers, update.framebuffer_handle)?;
+        let scanout = framebuffers.scanout(&adapter, update.framebuffer_handle)?;
         if scanout.width != self.framebuffer.width as u32
             || scanout.height != self.framebuffer.height as u32
             || scanout.pitch != self.framebuffer.pitch as u32
@@ -636,15 +667,25 @@ impl Driver for DisplayDevice {
         }
         Self::program_scanout(&mut adapter, &scanout, true)?;
         *primary = Some(scanout);
+        self.primary_handle
+            .store(update.framebuffer_handle, Ordering::Release);
         Ok(())
     }
 
     fn page_flip(&self, flip: PageFlip) -> Result<()> {
-        let mut adapter = self.adapter.lock();
+        // A legacy cursor-only wlroots commit carries the current primary FB
+        // through DRM_MODE_PAGE_FLIP to obtain the next vblank event. Linux's
+        // atomic helpers leave an unchanged primary plane untouched, so avoid
+        // taking the device submission lock or rewriting HUBP in this case.
+        if flip.framebuffer_handle != 0
+            && self.primary_handle.load(Ordering::Acquire) == flip.framebuffer_handle
+        {
+            return Ok(());
+        }
+        let mut adapter = self.gpu.lock();
         let framebuffers = self.framebuffers.lock();
         let mut primary = self.primary.lock();
-        let scanout =
-            crate::ioctl::framebuffer_scanout(&adapter, &framebuffers, flip.framebuffer_handle)?;
+        let scanout = framebuffers.scanout(&adapter, flip.framebuffer_handle)?;
         if scanout.width != self.framebuffer.width as u32
             || scanout.height != self.framebuffer.height as u32
             || scanout.pitch != self.framebuffer.pitch as u32
@@ -660,6 +701,8 @@ impl Driver for DisplayDevice {
             .is_none_or(|current| !current.has_same_layout(&scanout));
         Self::program_scanout(&mut adapter, &scanout, layout_changed)?;
         *primary = Some(scanout);
+        self.primary_handle
+            .store(flip.framebuffer_handle, Ordering::Release);
         Ok(())
     }
 
@@ -668,9 +711,36 @@ impl Driver for DisplayDevice {
             return Err(Error::InvalidArgument);
         }
 
+        // GEM/framebuffer lookup takes sleeping locks, so resolve a new cursor
+        // surface before entering the short MMIO critical section.  MOVE-only
+        // updates consequently take only the cursor spinlock and perform the
+        // three direct register writes used by Linux's DCN position path.
+        let replacement = if update.flags & DRM_MODE_CURSOR_BO != 0 && update.handle != 0 {
+            if update.width == 0
+                || update.height == 0
+                || update.width > DCN_CURSOR_SIZE
+                || update.height > DCN_CURSOR_SIZE
+            {
+                return Err(Error::InvalidArgument);
+            }
+            let files = self.files.lock();
+            let framebuffers = self.framebuffers.lock();
+            Some(framebuffers.cursor_buffer(
+                self.fb_start,
+                &files,
+                update.file,
+                update.handle,
+                update.width,
+                update.height,
+            )?)
+        } else {
+            None
+        };
+
         // The single exposed CRTC is backed by DCN pipe 0. Linux serializes
         // cursor motion with display state, not the global amdgpu submission
         // lock, so MOVE uses the independent direct BAR5 cursor view.
+        let mut _retired_buffer = None;
         let mut cursor = self.cursor.lock();
 
         let x = if update.flags & DRM_MODE_CURSOR_MOVE != 0 {
@@ -686,9 +756,10 @@ impl Driver for DisplayDevice {
 
         if update.flags & DRM_MODE_CURSOR_BO != 0 {
             if update.handle == 0 {
-                let mut regs = self.cursor_regs.lock();
-                crate::blocks::disable_cursor(&mut regs)?;
-                cursor.buffer = None;
+                if cursor.buffer.is_some() || cursor.visible {
+                    cursor.controller.disable()?;
+                }
+                _retired_buffer = cursor.buffer.take();
                 cursor.width = 0;
                 cursor.height = 0;
                 cursor.x = x;
@@ -696,67 +767,58 @@ impl Driver for DisplayDevice {
                 cursor.visible = false;
                 return Ok(());
             }
-            if update.width == 0 || update.height == 0 || update.width > 256 || update.height > 256
-            {
-                return Err(Error::InvalidArgument);
-            }
-            // Object ownership has already been checked by the DRM core;
-            // GEM lookup still uses the originating drm_file, as Linux
-            // cursor_set2 does. Release these locks before touching DCN.
-            let buffer = {
-                let adapter = self.adapter.lock();
-                let files = self.files.lock();
-                let framebuffers = self.framebuffers.lock();
-                crate::ioctl::cursor_pin(
-                    &adapter,
-                    &files,
-                    &framebuffers,
-                    update.file,
-                    update.handle,
-                    update.width,
-                    update.height,
-                )?
-            };
+            let buffer = replacement.ok_or(Error::InvalidArgument)?;
             let pitch = buffer.pitch_pixels();
-            let mut regs = self.cursor_regs.lock();
-            crate::blocks::program_cursor_attributes(
-                &mut regs,
-                crate::blocks::CursorAttributes {
-                    address: buffer.gpu_address(),
-                    width: update.width,
-                    height: update.height,
-                    pitch,
-                },
-            )?;
-            cursor.visible = crate::blocks::program_cursor_position(
-                &mut regs,
-                crate::blocks::CursorPosition {
-                    x,
-                    y,
-                    width: update.width,
-                    height: update.height,
-                    viewport_width: self.framebuffer.width as u32,
-                    viewport_height: self.framebuffer.height as u32,
-                },
-                cursor.visible,
-            )?;
-            cursor.buffer = Some(buffer);
+            let surface_changed = cursor.buffer.as_ref().is_none_or(|current| {
+                !current.is_same_surface(&buffer)
+                    || cursor.width != update.width
+                    || cursor.height != update.height
+            });
+            if surface_changed {
+                cursor
+                    .controller
+                    .set_attributes(crate::blocks::CursorAttributes {
+                        address: buffer.gpu_address(),
+                        width: update.width,
+                        height: update.height,
+                        pitch,
+                    })?;
+            }
+            if surface_changed || x != cursor.x || y != cursor.y {
+                let was_visible = cursor.visible;
+                cursor.visible = cursor.controller.set_position(
+                    crate::blocks::CursorPosition {
+                        x,
+                        y,
+                        width: update.width,
+                        height: update.height,
+                        viewport_width: self.framebuffer.width as u32,
+                        viewport_height: self.framebuffer.height as u32,
+                    },
+                    was_visible,
+                )?;
+            }
+            if surface_changed {
+                _retired_buffer = cursor.buffer.replace(buffer);
+            }
             cursor.width = update.width;
             cursor.height = update.height;
-        } else if cursor.buffer.is_some() {
-            let mut regs = self.cursor_regs.lock();
-            cursor.visible = crate::blocks::program_cursor_position(
-                &mut regs,
+        } else if cursor.buffer.is_some() && (x != cursor.x || y != cursor.y) {
+            let was_visible = cursor.visible;
+            let width = cursor.width;
+            let height = cursor.height;
+            let visible = cursor.controller.set_position(
                 crate::blocks::CursorPosition {
                     x,
                     y,
-                    width: cursor.width,
-                    height: cursor.height,
+                    width,
+                    height,
                     viewport_width: self.framebuffer.width as u32,
                     viewport_height: self.framebuffer.height as u32,
                 },
-                cursor.visible,
+                was_visible,
             )?;
+            cursor.visible = visible;
         }
         cursor.x = x;
         cursor.y = y;

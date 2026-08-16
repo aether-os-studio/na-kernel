@@ -1,24 +1,20 @@
 //! PSP IP block (Linux `psp_v13_0.c` + `amdgpu_psp.c`): secure OS boot,
 //! ring creation, firmware delivery via `LOAD_IP_FW` and TA loading.
 
-use alloc::format;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use na_std::firmware::KernelFirmwareProvider;
 use na_std::time;
 use na_std::{Error, Result};
 
 use crate::atom::FIRMWARE_CAP_ENABLE_2STAGE_BIST_TRAINING;
 use crate::dev_info;
 use crate::device::Adapter;
-use crate::firmware::{self, UcodeId};
+use crate::firmware::{FirmwareCatalog, UcodeId};
 use crate::ip::{HwIp, IpBlock, IpVersion};
 use crate::mem::Bo;
 use crate::regs::Regs;
-use crate::regs::gc10_3_0 as gc;
 use crate::regs::hdp5_0_0 as hdp;
-use crate::regs::mmhub2_0_0 as mm;
 use crate::regs::mp13_0_2 as mp;
 use crate::ucode::*;
 
@@ -54,11 +50,10 @@ const MEM_TRAIN_SEND_MSG_TIMEOUT_US: u32 = 3_000_000;
 struct TaContext {
     desc: TaBinDesc,
     shared: Bo,
-    initialized: bool,
 }
 
-pub struct PspV13 {
-    pub version: IpVersion,
+pub struct PspBlock {
+    version: IpVersion,
     /// autoload_supported (psp_early_init): RLC autoload + PSP-only
     /// firmware delivery.
     autoload: bool,
@@ -92,7 +87,7 @@ pub struct PspV13 {
     c2pmsg81: u32,
 }
 
-impl PspV13 {
+impl PspBlock {
     pub fn new(version: IpVersion) -> Self {
         Self {
             version,
@@ -440,34 +435,6 @@ impl PspV13 {
             msg36,
             msg81,
         );
-
-        for (name, ip, status_reg, lo_reg, hi_reg) in [
-            (
-                "GFXHUB",
-                HwIp::Gc,
-                gc::mmGCVM_L2_PROTECTION_FAULT_STATUS,
-                gc::mmGCVM_L2_PROTECTION_FAULT_ADDR_LO32,
-                gc::mmGCVM_L2_PROTECTION_FAULT_ADDR_HI32,
-            ),
-            (
-                "MMHUB",
-                HwIp::Mmhub,
-                mm::mmMMVM_L2_PROTECTION_FAULT_STATUS,
-                mm::mmMMVM_L2_PROTECTION_FAULT_ADDR_LO32,
-                mm::mmMMVM_L2_PROTECTION_FAULT_ADDR_HI32,
-            ),
-        ] {
-            let status = dev.regs.read_ip(ip, 0, status_reg, 0).unwrap_or(u32::MAX);
-            let lo = dev.regs.read_ip(ip, 0, lo_reg, 0).unwrap_or(u32::MAX);
-            let hi = dev.regs.read_ip(ip, 0, hi_reg, 0).unwrap_or(u32::MAX);
-            dev_info!(
-                "astra: PSP {} VM fault snapshot: status=0x{:08X}, addr_hi=0x{:08X}, addr_lo=0x{:08X}",
-                name,
-                status,
-                hi,
-                lo,
-            );
-        }
     }
 
     /// Linux `psp_hw_start`: load packaged boot components, then the sOS.
@@ -518,17 +485,23 @@ impl PspV13 {
 
     /// Builds `psp_gfx_cmd_setup_tmr`. Linux prefers a naturally-aligned VRAM
     /// BO and supplies both its MC and VM-walker physical addresses.
+    fn put_u32(buffer: &mut [u8], offset: usize, value: u32) {
+        if let Some(destination) = buffer.get_mut(offset..offset + 4) {
+            destination.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
     fn build_setup_tmr_cmd(tmr_mc: u64, tmr_pa: u64, size: u32) -> [u8; PSP_CMD_RESP_SIZE] {
         let mut cmd = [0u8; PSP_CMD_RESP_SIZE];
-        put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
-        put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
-        put_u32(&mut cmd, 8, GFX_CMD_ID_SETUP_TMR);
-        put_u32(&mut cmd, 28, tmr_mc as u32);
-        put_u32(&mut cmd, 32, (tmr_mc >> 32) as u32);
-        put_u32(&mut cmd, 36, size);
-        put_u32(&mut cmd, 40, 1 << 1); // virt_phy_addr
-        put_u32(&mut cmd, 44, tmr_pa as u32);
-        put_u32(&mut cmd, 48, (tmr_pa >> 32) as u32);
+        Self::put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
+        Self::put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
+        Self::put_u32(&mut cmd, 8, GFX_CMD_ID_SETUP_TMR);
+        Self::put_u32(&mut cmd, 28, tmr_mc as u32);
+        Self::put_u32(&mut cmd, 32, (tmr_mc >> 32) as u32);
+        Self::put_u32(&mut cmd, 36, size);
+        Self::put_u32(&mut cmd, 40, 1 << 1); // virt_phy_addr
+        Self::put_u32(&mut cmd, 44, tmr_pa as u32);
+        Self::put_u32(&mut cmd, 48, (tmr_pa >> 32) as u32);
         cmd
     }
 
@@ -605,10 +578,8 @@ impl PspV13 {
     /// Linux `psp_load_smu_fw`: PMFW must precede TMR setup on Navi23.
     fn load_smu_fw(&mut self, dev: &mut Adapter) -> Result<()> {
         let (mc_addr, size) = dev
-            .fw
-            .iter()
-            .find(|fw| fw.id == UcodeId::Smc)
-            .map(|fw| (fw.mc_addr, fw.size))
+            .firmware(UcodeId::Smc)
+            .map(|firmware| (firmware.mc_addr, firmware.size))
             .ok_or(Error::NoDevice)?;
         let cmd = Self::build_load_ip_fw_cmd(mc_addr, size as u32, UcodeId::Smc.psp_fw_type());
         let (status, fw_addr_lo, fw_addr_hi, _) = self.cmd_submit(dev, &cmd)?;
@@ -624,8 +595,8 @@ impl PspV13 {
             dev_info!("astra: PMFW loaded via PSP");
         }
         let tmr_addr = ((fw_addr_hi as u64) << 32) | fw_addr_lo as u64;
-        if let Some(fw) = dev.fw.iter_mut().find(|fw| fw.id == UcodeId::Smc) {
-            fw.tmr_addr = Some(tmr_addr);
+        if let Some(firmware) = dev.firmware_mut(UcodeId::Smc) {
+            firmware.tmr_addr = Some(tmr_addr);
         }
         Ok(())
     }
@@ -633,24 +604,24 @@ impl PspV13 {
     /// Builds the 1024-byte command/response buffer for `LOAD_IP_FW`.
     fn build_load_ip_fw_cmd(fw_mc: u64, size: u32, fw_type: u32) -> [u8; PSP_CMD_RESP_SIZE] {
         let mut cmd = [0u8; PSP_CMD_RESP_SIZE];
-        put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
-        put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
-        put_u32(&mut cmd, 8, GFX_CMD_ID_LOAD_IP_FW);
-        put_u32(&mut cmd, 28, fw_mc as u32);
-        put_u32(&mut cmd, 32, (fw_mc >> 32) as u32);
-        put_u32(&mut cmd, 36, size);
-        put_u32(&mut cmd, 40, fw_type);
+        Self::put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
+        Self::put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
+        Self::put_u32(&mut cmd, 8, GFX_CMD_ID_LOAD_IP_FW);
+        Self::put_u32(&mut cmd, 28, fw_mc as u32);
+        Self::put_u32(&mut cmd, 32, (fw_mc >> 32) as u32);
+        Self::put_u32(&mut cmd, 36, size);
+        Self::put_u32(&mut cmd, 40, fw_type);
         cmd
     }
 
     fn build_load_toc_cmd(fw_pri_mc: u64, size: u32) -> [u8; PSP_CMD_RESP_SIZE] {
         let mut cmd = [0u8; PSP_CMD_RESP_SIZE];
-        put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
-        put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
-        put_u32(&mut cmd, 8, GFX_CMD_ID_LOAD_TOC);
-        put_u32(&mut cmd, 28, fw_pri_mc as u32);
-        put_u32(&mut cmd, 32, (fw_pri_mc >> 32) as u32);
-        put_u32(&mut cmd, 36, size);
+        Self::put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
+        Self::put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
+        Self::put_u32(&mut cmd, 8, GFX_CMD_ID_LOAD_TOC);
+        Self::put_u32(&mut cmd, 28, fw_pri_mc as u32);
+        Self::put_u32(&mut cmd, 32, (fw_pri_mc >> 32) as u32);
+        Self::put_u32(&mut cmd, 36, size);
         cmd
     }
 
@@ -710,15 +681,15 @@ impl PspV13 {
         shared_size: u32,
     ) -> [u8; PSP_CMD_RESP_SIZE] {
         let mut cmd = [0u8; PSP_CMD_RESP_SIZE];
-        put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
-        put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
-        put_u32(&mut cmd, 8, cmd_id);
-        put_u32(&mut cmd, 28, fw_pri_mc as u32);
-        put_u32(&mut cmd, 32, (fw_pri_mc >> 32) as u32);
-        put_u32(&mut cmd, 36, size);
-        put_u32(&mut cmd, 40, shared_mc as u32);
-        put_u32(&mut cmd, 44, (shared_mc >> 32) as u32);
-        put_u32(&mut cmd, 48, shared_size);
+        Self::put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
+        Self::put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
+        Self::put_u32(&mut cmd, 8, cmd_id);
+        Self::put_u32(&mut cmd, 28, fw_pri_mc as u32);
+        Self::put_u32(&mut cmd, 32, (fw_pri_mc >> 32) as u32);
+        Self::put_u32(&mut cmd, 36, size);
+        Self::put_u32(&mut cmd, 40, shared_mc as u32);
+        Self::put_u32(&mut cmd, 44, (shared_mc >> 32) as u32);
+        Self::put_u32(&mut cmd, 48, shared_size);
         cmd
     }
 
@@ -764,12 +735,12 @@ impl PspV13 {
                 .get_mut(frame_at..frame_at + 64)
                 .ok_or(Error::Range)?;
             frame.fill(0);
-            put_u32(frame, 0, cmd_mc as u32);
-            put_u32(frame, 4, (cmd_mc >> 32) as u32);
-            put_u32(frame, 8, PSP_CMD_RESP_SIZE as u32);
-            put_u32(frame, 12, fence_mc as u32);
-            put_u32(frame, 16, (fence_mc >> 32) as u32);
-            put_u32(frame, 20, index);
+            Self::put_u32(frame, 0, cmd_mc as u32);
+            Self::put_u32(frame, 4, (cmd_mc >> 32) as u32);
+            Self::put_u32(frame, 8, PSP_CMD_RESP_SIZE as u32);
+            Self::put_u32(frame, 12, fence_mc as u32);
+            Self::put_u32(frame, 16, (fence_mc >> 32) as u32);
+            Self::put_u32(frame, 20, index);
             ring_cpu.sync_for_device();
 
             self.ring_wptr = (self.ring_wptr + 16) % (KM_RING_SIZE as u32 / 4);
@@ -822,8 +793,7 @@ impl PspV13 {
     /// `LOAD_IP_FW` + optional RLC autoload (Linux `psp_load_non_psp_fw`).
     fn load_non_psp_fw(&mut self, dev: &mut Adapter) -> Result<()> {
         let staged: Vec<(UcodeId, u64, usize)> = dev
-            .fw
-            .iter()
+            .firmwares()
             .map(|fw| (fw.id, fw.mc_addr, fw.size))
             .collect();
 
@@ -849,10 +819,14 @@ impl PspV13 {
                 );
             }
             let tmr_addr = ((fw_addr_hi as u64) << 32) | fw_addr_lo as u64;
-            if let Some(fw) = dev.fw.iter_mut().find(|fw| fw.id == *id) {
-                fw.tmr_addr = Some(tmr_addr);
+            if let Some(firmware) = dev.firmware_mut(*id) {
+                firmware.tmr_addr = Some(tmr_addr);
             }
-            dev_info!("astra: firmware {} loaded via PSP", fw_name(dev, *id));
+            let name = dev
+                .firmware(*id)
+                .map(|firmware| firmware.name.as_str())
+                .unwrap_or("?");
+            dev_info!("astra: firmware {} loaded via PSP", name);
 
             if self.autoload && *id == UcodeId::RlcG {
                 let cmd = Self::build_simple_cmd(GFX_CMD_ID_AUTOLOAD_RLC);
@@ -872,9 +846,9 @@ impl PspV13 {
     /// Builds a command buffer carrying only the command id.
     fn build_simple_cmd(cmd_id: u32) -> [u8; PSP_CMD_RESP_SIZE] {
         let mut cmd = [0u8; PSP_CMD_RESP_SIZE];
-        put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
-        put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
-        put_u32(&mut cmd, 8, cmd_id);
+        Self::put_u32(&mut cmd, 0, PSP_CMD_RESP_SIZE as u32);
+        Self::put_u32(&mut cmd, 4, PSP_GFX_CMD_BUF_VERSION);
+        Self::put_u32(&mut cmd, 8, cmd_id);
         cmd
     }
 
@@ -914,7 +888,6 @@ impl PspV13 {
                 status
             );
         }
-        self.tas[index].initialized = true;
         Ok(())
     }
 
@@ -961,7 +934,6 @@ impl PspV13 {
                 status
             );
         }
-        self.tas[index].initialized = true;
         dev_info!("astra: ASD TA loaded");
         Ok(())
     }
@@ -984,7 +956,7 @@ impl PspV13 {
     }
 }
 
-impl IpBlock for PspV13 {
+impl IpBlock for PspBlock {
     fn hw_ip(&self) -> HwIp {
         HwIp::Mp0
     }
@@ -1004,10 +976,8 @@ impl IpBlock for PspV13 {
 
         // SOS + TA microcode (psp_v13_0_init_microcode). Firmware images
         // are named by chip codename, not IP version (Linux `chip_name`).
-        let provider = KernelFirmwareProvider;
-        let chip = firmware::chip_name(dev);
-        let sos_name = format!("amdgpu/{}_sos.bin", chip);
-        self.sos_data = firmware::request(&provider, &sos_name)?;
+        let firmware = FirmwareCatalog::for_adapter(dev);
+        self.sos_data = firmware.load_suffix("sos")?;
         let sos_header = SosHeader::parse(&self.sos_data).ok_or(Error::Io)?;
         self.sos_offset = sos_header.sos_offset_bytes as usize;
         self.sos_size = sos_header.sos_size_bytes as usize;
@@ -1028,8 +998,7 @@ impl IpBlock for PspV13 {
             self.boot_components.len()
         );
 
-        let ta_name = format!("amdgpu/{}_ta.bin", chip);
-        self.ta_data = firmware::request(&provider, &ta_name)?;
+        self.ta_data = firmware.load_suffix("ta")?;
         let ta_header = TaHeader::parse(&self.ta_data).ok_or(Error::Io)?;
         dev_info!(
             "astra: PSP TA header v{}.{}: {} binaries",
@@ -1060,14 +1029,9 @@ impl IpBlock for PspV13 {
         self.km_ring = Some(dev.mem.alloc_gart(&mut dev.regs, KM_RING_SIZE)?);
 
         // TA shared buffers.
-        let descs = core::mem::take(&mut self.ta_descs);
-        for desc in descs {
+        for desc in self.ta_descs.drain(..) {
             let shared = dev.mem.alloc_gart(&mut dev.regs, TA_SHARED_MEM_SIZE)?;
-            self.tas.push(TaContext {
-                desc,
-                shared,
-                initialized: false,
-            });
+            self.tas.push(TaContext { desc, shared });
         }
 
         dev.psp_autoload = self.autoload;
@@ -1078,18 +1042,18 @@ impl IpBlock for PspV13 {
     /// delivery, TA loading.
     fn hw_init(&mut self, dev: &mut Adapter) -> Result<()> {
         // Stage every firmware image (amdgpu_ucode_init_bo).
-        let staged = firmware::stage_all(dev)?;
+        let staged = FirmwareCatalog::for_adapter(dev).stage(dev)?;
         // The staging BO was just bound into the already-live GART. Linux's
         // BO bind path synchronizes this mapping before PSP can consume it.
-        super::flush_pending_gart(dev)?;
-        for fw in &staged {
+        dev.flush_gart()?;
+        for fw in staged.iter() {
             dev_info!(
                 "astra: staging firmware {} at 0x{:016x}",
                 fw.name,
                 fw.mc_addr
             );
         }
-        dev.fw = staged;
+        dev.install_firmware(staged);
 
         let (fw_pri_mc, fw_pri_pa) = {
             let fw_pri = self.fw_pri.as_ref().ok_or(Error::NoDevice)?;
@@ -1147,7 +1111,7 @@ impl IpBlock for PspV13 {
         self.asd_initialize(dev)?;
         let count = self.tas.len();
         for index in 0..count {
-            if self.tas[index].initialized || self.tas[index].desc.fw_type == TA_TYPE_ASD {
+            if self.tas[index].desc.fw_type == TA_TYPE_ASD {
                 continue;
             }
             match self.ta_load(dev, index) {
@@ -1162,18 +1126,4 @@ impl IpBlock for PspV13 {
         dev_info!("astra: PSP firmware loading complete");
         Ok(())
     }
-}
-
-fn put_u32(buf: &mut [u8], offset: usize, value: u32) {
-    if let Some(dst) = buf.get_mut(offset..offset + 4) {
-        dst.copy_from_slice(&value.to_le_bytes());
-    }
-}
-
-fn fw_name(dev: &Adapter, id: UcodeId) -> &str {
-    dev.fw
-        .iter()
-        .find(|fw| fw.id == id)
-        .map(|fw| fw.name.as_str())
-        .unwrap_or("?")
 }

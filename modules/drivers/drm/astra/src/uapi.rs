@@ -76,12 +76,6 @@ pub const AMDGPU_CTX_OP_QUERY_STATE2: u32 = 4;
 pub const AMDGPU_CTX_OP_GET_STABLE_PSTATE: u32 = 5;
 pub const AMDGPU_CTX_OP_SET_STABLE_PSTATE: u32 = 6;
 
-pub const AMDGPU_CTX_PRIORITY_VERY_LOW: i32 = -1023;
-pub const AMDGPU_CTX_PRIORITY_LOW: i32 = -512;
-pub const AMDGPU_CTX_PRIORITY_NORMAL: i32 = 0;
-pub const AMDGPU_CTX_PRIORITY_HIGH: i32 = 512;
-pub const AMDGPU_CTX_PRIORITY_VERY_HIGH: i32 = 1023;
-
 pub const AMDGPU_CTX_STABLE_PSTATE_FLAGS_MASK: u32 = 0xf;
 pub const AMDGPU_CTX_STABLE_PSTATE_NONE: u32 = 0;
 pub const AMDGPU_CTX_STABLE_PSTATE_PEAK: u32 = 4;
@@ -213,10 +207,6 @@ pub fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-fn ioctl_number(command: u32) -> Option<u32> {
-    (((command >> 8) & 0xff) == DRM_IOCTL_BASE).then_some(command & 0xff)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Command {
     GemCreate,
@@ -233,21 +223,24 @@ pub enum Command {
     GemClose,
 }
 
-pub fn command(command: u32) -> Option<Command> {
-    match ioctl_number(command)? {
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE => Some(Command::GemCreate),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP => Some(Command::GemMmap),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_CTX => Some(Command::Ctx),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_BO_LIST => Some(Command::BoList),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_CS => Some(Command::Cs),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_INFO => Some(Command::Info),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_METADATA => Some(Command::GemMetadata),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_WAIT_IDLE => Some(Command::GemWaitIdle),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA => Some(Command::GemVa),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_CS => Some(Command::WaitCs),
-        nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_OP => Some(Command::GemOp),
-        DRM_IOCTL_GEM_CLOSE_NR => Some(Command::GemClose),
-        _ => None,
+impl Command {
+    pub fn from_ioctl(command: u32) -> Option<Self> {
+        let number = (((command >> 8) & 0xff) == DRM_IOCTL_BASE).then_some(command & 0xff)?;
+        match number {
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE => Some(Self::GemCreate),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP => Some(Self::GemMmap),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_CTX => Some(Self::Ctx),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_BO_LIST => Some(Self::BoList),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_CS => Some(Self::Cs),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_INFO => Some(Self::Info),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_METADATA => Some(Self::GemMetadata),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_WAIT_IDLE => Some(Self::GemWaitIdle),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA => Some(Self::GemVa),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_WAIT_CS => Some(Self::WaitCs),
+            nr if nr == DRM_COMMAND_BASE + DRM_AMDGPU_GEM_OP => Some(Self::GemOp),
+            DRM_IOCTL_GEM_CLOSE_NR => Some(Self::GemClose),
+            _ => None,
+        }
     }
 }
 
@@ -378,7 +371,6 @@ pub struct ContextRequest {
     pub operation: u32,
     pub flags: u32,
     pub context_id: u32,
-    pub priority: i32,
 }
 
 impl ContextRequest {
@@ -386,11 +378,11 @@ impl ContextRequest {
         if bytes.len() != CTX_SIZE {
             return Err(Error::InvalidArgument);
         }
+        let _priority = read_u32(bytes, 12)? as i32;
         Ok(Self {
             operation: read_u32(bytes, 0)?,
             flags: read_u32(bytes, 4)?,
             context_id: read_u32(bytes, 8)?,
-            priority: read_u32(bytes, 12)? as i32,
         })
     }
 }

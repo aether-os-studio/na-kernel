@@ -1,9 +1,9 @@
 #include "hid.h"
 #include <boot/boot.h>
+#include <drivers/logger.h>
 #include <fs/dev.h>
 #include <fs/vfs/vfs.h>
 #include <libs/keys.h>
-#include <task/task.h>
 
 #define USB_DT_HID 0x21
 #define USB_DT_REPORT 0x22
@@ -98,7 +98,6 @@ typedef struct hid_device {
     usb_pipe_t *upipe;
     bus_device_t *bus_device;
     dev_input_event_t *input;
-    int xfer_status;
     uint16_t iface_num;
     size_t report_buf_len;
     bool has_report_id;
@@ -108,10 +107,10 @@ typedef struct hid_device {
     bool has_digitizer;
     uint32_t instance_id;
     uint8_t *report_desc;
+    uint8_t *report_buf;
     uint8_t *prev_reports;
     hid_field_t fields[HID_MAX_FIELDS];
     size_t field_count;
-    task_t *polling_task;
 } hid_device_t;
 
 static attribute_t hid_bus_subsystem_attr = {
@@ -755,16 +754,6 @@ static int hid_get_report_descriptor(usb_device_t *usbdev, uint16_t iface_num,
     return usb_send_default_control(usbdev->defpipe, &req, buf);
 }
 
-static bool hid_input_now(dev_input_event_t *event, struct timespec *now) {
-    if (!event || !now)
-        return false;
-
-    uint64_t nano = nano_time();
-    now->tv_sec = nano / 1000000000;
-    now->tv_nsec = nano % 1000000000;
-    return true;
-}
-
 static uint32_t hid_extract_bits(const uint8_t *report, size_t report_len,
                                  size_t bit_offset, uint8_t bit_size) {
     uint32_t value = 0;
@@ -840,7 +829,7 @@ static void hid_decode_hat(const hid_field_t *field, int32_t value, int32_t *x,
 
 static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
                               const uint8_t *report, const uint8_t *prev_report,
-                              struct timespec *now) {
+                              uint64_t sec, uint64_t usec) {
     switch (field->kind) {
     case HID_FIELD_KEYBOARD_ARRAY: {
         bool emitted = false;
@@ -875,8 +864,8 @@ static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
             if (!still_pressed) {
                 uint16_t code = hid_keyboard_usage_to_evdev(usage);
                 if (code) {
-                    input_generate_event(hid->input, EV_KEY, code, 0,
-                                         now->tv_sec, now->tv_nsec / 1000);
+                    input_generate_event(hid->input, EV_KEY, code, 0, sec,
+                                         usec);
                     emitted = true;
                 }
             }
@@ -898,8 +887,8 @@ static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
             if (!already_pressed) {
                 uint16_t code = hid_keyboard_usage_to_evdev(usage);
                 if (code) {
-                    input_generate_event(hid->input, EV_KEY, code, 1,
-                                         now->tv_sec, now->tv_nsec / 1000);
+                    input_generate_event(hid->input, EV_KEY, code, 1, sec,
+                                         usec);
                     emitted = true;
                 }
             }
@@ -919,8 +908,7 @@ static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
             return false;
 
         input_generate_event(hid->input, EV_KEY, field->code,
-                             new_pressed ? 1 : 0, now->tv_sec,
-                             now->tv_nsec / 1000);
+                             new_pressed ? 1 : 0, sec, usec);
         return true;
     }
     case HID_FIELD_REL: {
@@ -929,8 +917,7 @@ static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
         if (!value)
             return false;
 
-        input_generate_event(hid->input, EV_REL, field->code, value,
-                             now->tv_sec, now->tv_nsec / 1000);
+        input_generate_event(hid->input, EV_REL, field->code, value, sec, usec);
         return true;
     }
     case HID_FIELD_ABS: {
@@ -941,8 +928,8 @@ static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
         if (old_value == new_value)
             return false;
 
-        input_generate_event(hid->input, EV_ABS, field->code, new_value,
-                             now->tv_sec, now->tv_nsec / 1000);
+        input_generate_event(hid->input, EV_ABS, field->code, new_value, sec,
+                             usec);
         return true;
     }
     case HID_FIELD_HAT: {
@@ -957,13 +944,13 @@ static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
         hid_decode_hat(field, new_value, &new_x, &new_y);
 
         if (old_x != new_x) {
-            input_generate_event(hid->input, EV_ABS, ABS_HAT0X, new_x,
-                                 now->tv_sec, now->tv_nsec / 1000);
+            input_generate_event(hid->input, EV_ABS, ABS_HAT0X, new_x, sec,
+                                 usec);
             emitted = true;
         }
         if (old_y != new_y) {
-            input_generate_event(hid->input, EV_ABS, ABS_HAT0Y, new_y,
-                                 now->tv_sec, now->tv_nsec / 1000);
+            input_generate_event(hid->input, EV_ABS, ABS_HAT0Y, new_y, sec,
+                                 usec);
             emitted = true;
         }
         return emitted;
@@ -973,59 +960,50 @@ static bool hid_process_field(hid_device_t *hid, const hid_field_t *field,
     }
 }
 
-static void hid_cb(int status, int actual_length, void *user_data) {
-    (void)actual_length;
-    hid_device_t *hid = user_data;
-    hid->xfer_status = status;
-    if (hid->polling_task)
-        task_unblock(hid->polling_task, EOK);
+static void hid_report_complete(int status, int actual_length, void *user_data);
+
+static int hid_submit_report(hid_device_t *hid) {
+    if (!hid || !hid->report_buf || !hid->report_buf_len)
+        return -EINVAL;
+
+    memset(hid->report_buf, 0, hid->report_buf_len);
+    return usb_send_intr_pipe(hid->upipe, hid->report_buf, hid->report_buf_len,
+                              hid_report_complete, hid);
 }
 
-static void usb_hid_poll(hid_device_t *hid) {
-    uint8_t *report = malloc(hid->report_buf_len);
-    if (!report)
+static void hid_report_complete(int status, int actual_length,
+                                void *user_data) {
+    hid_device_t *hid = user_data;
+    if (!hid)
         return;
 
-    for (;;) {
-        memset(report, 0, hid->report_buf_len);
-        hid->xfer_status = EVENT_ERROR;
-
-        int ret = usb_send_intr_pipe(hid->upipe, report, hid->report_buf_len,
-                                     hid_cb, hid);
-        if (ret)
-            break;
-
-        task_block(current_task, TASK_BLOCKING, -1, "hid_waiting_events");
-
-        if (hid->xfer_status != EVENT_SUCCESS &&
-            hid->xfer_status != EVENT_SHORT_PACKET)
-            break;
-
+    if ((status == EVENT_SUCCESS || status == EVENT_SHORT_PACKET) &&
+        actual_length > 0) {
+        uint8_t *report = hid->report_buf;
         uint8_t report_id = hid->has_report_id ? report[0] : 0;
         uint8_t *prev = hid_prev_report(hid, report_id);
-        struct timespec now;
+        uint64_t now = nano_time();
+        uint64_t sec = now / 1000000000;
+        uint64_t usec = (now % 1000000000) / 1000;
         bool emitted = false;
-
-        if (!hid_input_now(hid->input, &now))
-            break;
 
         for (size_t i = 0; i < hid->field_count; i++) {
             hid_field_t *field = &hid->fields[i];
             if (field->report_id != report_id)
                 continue;
-            if (hid_process_field(hid, field, report, prev, &now))
+            if (hid_process_field(hid, field, report, prev, sec, usec))
                 emitted = true;
         }
 
         if (emitted) {
-            input_generate_event(hid->input, EV_SYN, SYN_REPORT, 0, now.tv_sec,
-                                 now.tv_nsec / 1000);
+            input_generate_event(hid->input, EV_SYN, SYN_REPORT, 0, sec, usec);
         }
 
         memcpy(prev, report, hid->report_buf_len);
     }
 
-    free(report);
+    if (status == EVENT_SUCCESS || status == EVENT_SHORT_PACKET)
+        (void)hid_submit_report(hid);
 }
 
 static int usb_hid_setup(usb_device_t *usbdev, usb_device_interface_t *iface) {
@@ -1125,12 +1103,18 @@ static int usb_hid_setup(usb_device_t *usbdev, usb_device_interface_t *iface) {
         free(hid);
         return -1;
     }
+    hid->report_buf = calloc(1, hid->report_buf_len);
+    if (!hid->report_buf) {
+        free(hid->prev_reports);
+        free(hid->report_desc);
+        free(hid);
+        return -1;
+    }
 
     printk("Setting up USB HID report device: %s\n", name);
 
-    hid->polling_task =
-        task_create("usb_hid_poll", (void (*)(uint64_t))usb_hid_poll,
-                    (uint64_t)hid, KTHREAD_PRIORITY);
+    if (hid_submit_report(hid) != 0)
+        return -1;
 
     return 0;
 }

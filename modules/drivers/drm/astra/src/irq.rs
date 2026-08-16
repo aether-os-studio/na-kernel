@@ -40,30 +40,31 @@ struct IhHandlerState {
     irq_count: u32,
 }
 
+pub struct IhConfig {
+    pub bar5: MmioRegion,
+    pub bar2: MmioRegion,
+    pub wb: Bo,
+    pub ih_rb_rptr: u32,
+    pub ih_rb_wptr1: u32,
+    pub ih_rb_rptr1: u32,
+    pub doorbell: u32,
+    pub doorbell1: u32,
+    pub ring_size_dw: u32,
+}
+
 impl IhHandler {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        bar5: MmioRegion,
-        bar2: MmioRegion,
-        wb: Bo,
-        ih_rb_rptr: u32,
-        ih_rb_wptr1: u32,
-        ih_rb_rptr1: u32,
-        doorbell: u32,
-        doorbell1: u32,
-        ring_size_dw: u32,
-    ) -> Self {
+    pub fn new(config: IhConfig) -> Self {
         Self {
             state: SpinLock::new(IhHandlerState {
-                bar5,
-                bar2,
-                wb,
-                ih_rb_rptr,
-                ih_rb_wptr1,
-                ih_rb_rptr1,
-                doorbell,
-                doorbell1,
-                ptr_mask: ring_size_dw - 1,
+                bar5: config.bar5,
+                bar2: config.bar2,
+                wb: config.wb,
+                ih_rb_rptr: config.ih_rb_rptr,
+                ih_rb_wptr1: config.ih_rb_wptr1,
+                ih_rb_rptr1: config.ih_rb_rptr1,
+                doorbell: config.doorbell,
+                doorbell1: config.doorbell1,
+                ptr_mask: config.ring_size_dw - 1,
                 rptr: 0,
                 rptr1: 0,
                 irq_count: 0,

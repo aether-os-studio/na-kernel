@@ -9,12 +9,11 @@
 use alloc::vec::Vec;
 
 use na_std::arch::fence;
-use na_std::firmware::KernelFirmwareProvider;
 use na_std::{Error, Result};
 
 use crate::dev_info;
 use crate::device::Adapter;
-use crate::firmware::{self, UcodeId};
+use crate::firmware::{FirmwareCatalog, UcodeId};
 use crate::ip::HwIp;
 use crate::mem::Bo;
 use crate::regs::dcn3_0_2 as dcn;
@@ -79,6 +78,62 @@ struct MetaInfo {
     shared_state_size: u32,
 }
 
+#[derive(Clone, Copy)]
+struct CacheWindowRegisters {
+    offset: u32,
+    offset_high: u32,
+    base: u32,
+    top: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CacheWindow {
+    offset: u64,
+    base: u32,
+    top: u32,
+}
+
+impl CacheWindow {
+    const fn new(offset: u64, base: u32, size: u32) -> Self {
+        Self {
+            offset,
+            base,
+            top: base + size,
+        }
+    }
+}
+
+const CW2_REGISTERS: CacheWindowRegisters = CacheWindowRegisters {
+    offset: dcn::mmDMCUB_REGION3_CW2_OFFSET,
+    offset_high: dcn::mmDMCUB_REGION3_CW2_OFFSET_HIGH,
+    base: dcn::mmDMCUB_REGION3_CW2_BASE_ADDRESS,
+    top: dcn::mmDMCUB_REGION3_CW2_TOP_ADDRESS,
+};
+const CW3_REGISTERS: CacheWindowRegisters = CacheWindowRegisters {
+    offset: dcn::mmDMCUB_REGION3_CW3_OFFSET,
+    offset_high: dcn::mmDMCUB_REGION3_CW3_OFFSET_HIGH,
+    base: dcn::mmDMCUB_REGION3_CW3_BASE_ADDRESS,
+    top: dcn::mmDMCUB_REGION3_CW3_TOP_ADDRESS,
+};
+const CW4_REGISTERS: CacheWindowRegisters = CacheWindowRegisters {
+    offset: dcn::mmDMCUB_REGION3_CW4_OFFSET,
+    offset_high: dcn::mmDMCUB_REGION3_CW4_OFFSET_HIGH,
+    base: dcn::mmDMCUB_REGION3_CW4_BASE_ADDRESS,
+    top: dcn::mmDMCUB_REGION3_CW4_TOP_ADDRESS,
+};
+const CW5_REGISTERS: CacheWindowRegisters = CacheWindowRegisters {
+    offset: dcn::mmDMCUB_REGION3_CW5_OFFSET,
+    offset_high: dcn::mmDMCUB_REGION3_CW5_OFFSET_HIGH,
+    base: dcn::mmDMCUB_REGION3_CW5_BASE_ADDRESS,
+    top: dcn::mmDMCUB_REGION3_CW5_TOP_ADDRESS,
+};
+const CW6_REGISTERS: CacheWindowRegisters = CacheWindowRegisters {
+    offset: dcn::mmDMCUB_REGION3_CW6_OFFSET,
+    offset_high: dcn::mmDMCUB_REGION3_CW6_OFFSET_HIGH,
+    base: dcn::mmDMCUB_REGION3_CW6_BASE_ADDRESS,
+    top: dcn::mmDMCUB_REGION3_CW6_TOP_ADDRESS,
+};
+
 pub struct Dmub {
     fw: Vec<u8>,
     payload_offset: usize,
@@ -108,10 +163,12 @@ impl Dmub {
 
     /// Linux `dm_dmub_sw_init`: request and parse the DMCUB firmware,
     /// calculate the region layout, then allocate one VRAM BO for all FB
-    /// windows. The PSP staging copy is made later by `firmware::stage_all`.
+    /// windows. The PSP staging copy is made later by
+    /// [`FirmwareCatalog::stage`].
     pub fn sw_init(&mut self, dev: &mut Adapter) -> Result<()> {
-        let name = firmware::firmware_name(dev, UcodeId::Dmcub)?;
-        self.fw = firmware::request(&KernelFirmwareProvider, &name)?;
+        let firmware = FirmwareCatalog::for_adapter(dev);
+        let name = firmware.name(UcodeId::Dmcub);
+        self.fw = firmware.load(UcodeId::Dmcub)?;
         let header = CommonFirmwareHeader::parse(&self.fw).ok_or(Error::Io)?;
         if header.header_version_major != 1 || self.fw.len() < 40 {
             return Err(Error::Unsupported);
@@ -214,11 +271,7 @@ impl Dmub {
             return Err(Error::Unsupported);
         }
 
-        let staged = dev
-            .fw
-            .iter()
-            .find(|fw| fw.id == UcodeId::Dmcub)
-            .ok_or(Error::NoDevice)?;
+        let staged = dev.firmware(UcodeId::Dmcub).ok_or(Error::NoDevice)?;
         dev_info!(
             "astra: DMCUB PSP image staged at {:#x}, TMR {:#x}",
             staged.mc_addr,
@@ -304,8 +357,8 @@ impl Dmub {
             .and_then(|value| value.checked_add(self.inbox_wptr as u64))
             .ok_or(Error::Range)?;
         let mut dwords = [0u32; 16];
-        for (word, bytes) in dwords.iter_mut().zip(command.chunks_exact(4)) {
-            *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        for (word, bytes) in dwords.iter_mut().zip(command.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
         }
         regs.vram_write_dwords(pos, &dwords)?;
         fence::sfence();
@@ -438,13 +491,12 @@ impl Dmub {
         self.program_cw2(&mut dev.regs, gpu(WINDOW_BSS_DATA)?, cw2_base)?;
         Self::program_cw(
             &mut dev.regs,
-            dcn::mmDMCUB_REGION3_CW3_OFFSET,
-            dcn::mmDMCUB_REGION3_CW3_OFFSET_HIGH,
-            dcn::mmDMCUB_REGION3_CW3_BASE_ADDRESS,
-            dcn::mmDMCUB_REGION3_CW3_TOP_ADDRESS,
-            gpu(WINDOW_VBIOS)?,
-            DMUB_CW3_BASE,
-            DMUB_CW3_BASE + self.regions[WINDOW_VBIOS].size,
+            CW3_REGISTERS,
+            CacheWindow::new(
+                gpu(WINDOW_VBIOS)?,
+                DMUB_CW3_BASE,
+                self.regions[WINDOW_VBIOS].size,
+            ),
         )?;
 
         let cached_inbox = !(self.fw_version >= Self::fw_version(1, 0, 0)
@@ -452,13 +504,12 @@ impl Dmub {
         if cached_inbox {
             Self::program_cw(
                 &mut dev.regs,
-                dcn::mmDMCUB_REGION3_CW4_OFFSET,
-                dcn::mmDMCUB_REGION3_CW4_OFFSET_HIGH,
-                dcn::mmDMCUB_REGION3_CW4_BASE_ADDRESS,
-                dcn::mmDMCUB_REGION3_CW4_TOP_ADDRESS,
-                gpu(WINDOW_MAILBOX)?,
-                DMUB_CW4_BASE,
-                DMUB_CW4_BASE + self.regions[WINDOW_MAILBOX].size,
+                CW4_REGISTERS,
+                CacheWindow::new(
+                    gpu(WINDOW_MAILBOX)?,
+                    DMUB_CW4_BASE,
+                    self.regions[WINDOW_MAILBOX].size,
+                ),
             )?;
         } else {
             let offset = gpu(WINDOW_MAILBOX)?;
@@ -491,13 +542,12 @@ impl Dmub {
 
         Self::program_cw(
             &mut dev.regs,
-            dcn::mmDMCUB_REGION3_CW5_OFFSET,
-            dcn::mmDMCUB_REGION3_CW5_OFFSET_HIGH,
-            dcn::mmDMCUB_REGION3_CW5_BASE_ADDRESS,
-            dcn::mmDMCUB_REGION3_CW5_TOP_ADDRESS,
-            gpu(WINDOW_TRACE)?,
-            DMUB_CW5_BASE,
-            DMUB_CW5_BASE + self.regions[WINDOW_TRACE].size,
+            CW5_REGISTERS,
+            CacheWindow::new(
+                gpu(WINDOW_TRACE)?,
+                DMUB_CW5_BASE,
+                self.regions[WINDOW_TRACE].size,
+            ),
         )?;
         let trace_offset = gpu(WINDOW_TRACE)?;
         dev.regs.write_dcn(
@@ -528,13 +578,12 @@ impl Dmub {
 
         Self::program_cw(
             &mut dev.regs,
-            dcn::mmDMCUB_REGION3_CW6_OFFSET,
-            dcn::mmDMCUB_REGION3_CW6_OFFSET_HIGH,
-            dcn::mmDMCUB_REGION3_CW6_BASE_ADDRESS,
-            dcn::mmDMCUB_REGION3_CW6_TOP_ADDRESS,
-            gpu(WINDOW_FW_STATE)?,
-            DMUB_CW6_BASE,
-            DMUB_CW6_BASE + self.regions[WINDOW_FW_STATE].size,
+            CW6_REGISTERS,
+            CacheWindow::new(
+                gpu(WINDOW_FW_STATE)?,
+                DMUB_CW6_BASE,
+                self.regions[WINDOW_FW_STATE].size,
+            ),
         )?;
 
         let inbox_base = if cached_inbox {
@@ -616,32 +665,22 @@ impl Dmub {
         }
         Self::program_cw(
             regs,
-            dcn::mmDMCUB_REGION3_CW2_OFFSET,
-            dcn::mmDMCUB_REGION3_CW2_OFFSET_HIGH,
-            dcn::mmDMCUB_REGION3_CW2_BASE_ADDRESS,
-            dcn::mmDMCUB_REGION3_CW2_TOP_ADDRESS,
-            offset,
-            base,
-            base + self.regions[WINDOW_BSS_DATA].size,
+            CW2_REGISTERS,
+            CacheWindow::new(offset, base, self.regions[WINDOW_BSS_DATA].size),
         )
     }
 
     fn program_cw(
         regs: &mut Regs,
-        offset_reg: u32,
-        offset_high_reg: u32,
-        base_reg: u32,
-        top_reg: u32,
-        offset: u64,
-        base: u32,
-        top: u32,
+        registers: CacheWindowRegisters,
+        window: CacheWindow,
     ) -> Result<()> {
         let idx = dcn::mmDMCUB_REGION3_CW2_OFFSET_BASE_IDX as usize;
-        regs.write_dcn(offset_reg, idx, offset as u32)?;
-        regs.write_dcn(offset_high_reg, idx, (offset >> 32) as u32)?;
-        regs.write_dcn(base_reg, idx, base)?;
+        regs.write_dcn(registers.offset, idx, window.offset as u32)?;
+        regs.write_dcn(registers.offset_high, idx, (window.offset >> 32) as u32)?;
+        regs.write_dcn(registers.base, idx, window.base)?;
         // All CWx top-address registers share the DCN3 bit layout.
-        regs.write_dcn(top_reg, idx, (top & 0x1fff_ffff) | 0x8000_0000)
+        regs.write_dcn(registers.top, idx, (window.top & 0x1fff_ffff) | 0x8000_0000)
     }
 
     fn release_reset(&self, regs: &mut Regs, psp_version: u32) -> Result<()> {

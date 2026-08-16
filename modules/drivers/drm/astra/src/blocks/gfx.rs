@@ -10,7 +10,7 @@ use na_std::{Error, Result};
 use crate::dev_info;
 use crate::device::Adapter;
 use crate::doorbell;
-use crate::ip::{HwIp, IpBlock, IpVersion, UserFence, UserIb};
+use crate::ip::{HwIp, IpBlock, IpVersion, UserSubmission};
 use crate::mem::Bo;
 use crate::regs::gc10_3_0 as gc;
 use crate::regs::hdp5_0_0 as hdp;
@@ -18,47 +18,44 @@ use crate::regs::nbio4_3_0 as nbio;
 use crate::regs::{get_field, set_field};
 use crate::ridx;
 use crate::ring::{
-    PACKET3, PACKET3_BASE_INDEX_CE_PARTITION, PACKET3_CLEAR_STATE, PACKET3_CONTEXT_CONTROL,
+    PACKET3_BASE_INDEX_CE_PARTITION, PACKET3_CLEAR_STATE, PACKET3_CONTEXT_CONTROL,
     PACKET3_MAP_QUEUES, PACKET3_PREAMBLE_BEGIN_CLEAR_STATE, PACKET3_PREAMBLE_CNTL,
     PACKET3_PREAMBLE_END_CLEAR_STATE, PACKET3_SET_BASE, PACKET3_SET_CONTEXT_REG,
-    PACKET3_SET_CONTEXT_REG_START, PACKET3_SET_RESOURCES, Ring, RingKind,
-    map_queues_doorbell_offset, map_queues_dw1,
+    PACKET3_SET_CONTEXT_REG_START, PACKET3_SET_RESOURCES, Ring, RingConfig, RingKind,
+    map_queues_doorbell_offset, map_queues_dw1, packet3,
 };
 
 /// Register aliases defined locally by Linux gfx_v10_0.c (not present in
 /// the generated gc_10_3_0 headers).
 mod local_regs {
-    #![allow(non_upper_case_globals)]
-    pub const mmCGTT_SPI_CS_CLK_CTRL: u32 = 0x507c;
-    pub const mmCGTT_SPI_RA0_CLK_CTRL: u32 = 0x507a;
-    pub const mmCGTT_SPI_RA1_CLK_CTRL: u32 = 0x507b;
-    pub const mmGCR_GENERAL_CNTL_Sienna_Cichlid: u32 = 0x1580;
-    pub const mmGL2C_CTRL3: u32 = 0x2e0c;
-    pub const mmTA_CNTL_AUX: u32 = 0x12e2;
-    pub const mmCP_MEC_CNTL_Sienna_Cichlid: u32 = 0x0f55;
-    pub const mmRLC_CP_SCHEDULERS_Sienna_Cichlid: u32 = 0x4ca1;
-    pub const mmSPI_CONFIG_CNTL_Sienna_Cichlid: u32 = 0x11ec;
-    pub const mmVGT_ESGS_RING_SIZE_Sienna_Cichlid: u32 = 0x0fc1;
-    pub const mmVGT_GSVS_RING_SIZE_Sienna_Cichlid: u32 = 0x0fc2;
-    pub const mmVGT_TF_RING_SIZE_Sienna_Cichlid: u32 = 0x0fc3;
-    pub const mmVGT_HS_OFFCHIP_PARAM_Sienna_Cichlid: u32 = 0x0fc4;
-    pub const mmVGT_TF_MEMORY_BASE_Sienna_Cichlid: u32 = 0x0fc5;
-    pub const mmVGT_TF_MEMORY_BASE_HI_Sienna_Cichlid: u32 = 0x0fc6;
+    pub const CGTT_SPI_CS_CLK_CTRL: u32 = 0x507c;
+    pub const CGTT_SPI_RA0_CLK_CTRL: u32 = 0x507a;
+    pub const CGTT_SPI_RA1_CLK_CTRL: u32 = 0x507b;
+    pub const GCR_GENERAL_CNTL_SIENNA_CICHLID: u32 = 0x1580;
+    pub const GL2C_CTRL3: u32 = 0x2e0c;
+    pub const TA_CNTL_AUX: u32 = 0x12e2;
+    pub const CP_MEC_CNTL_SIENNA_CICHLID: u32 = 0x0f55;
+    pub const RLC_CP_SCHEDULERS_SIENNA_CICHLID: u32 = 0x4ca1;
+    pub const SPI_CONFIG_CNTL_SIENNA_CICHLID: u32 = 0x11ec;
+    pub const VGT_ESGS_RING_SIZE_SIENNA_CICHLID: u32 = 0x0fc1;
+    pub const VGT_GSVS_RING_SIZE_SIENNA_CICHLID: u32 = 0x0fc2;
+    pub const VGT_TF_RING_SIZE_SIENNA_CICHLID: u32 = 0x0fc3;
+    pub const VGT_HS_OFFCHIP_PARAM_SIENNA_CICHLID: u32 = 0x0fc4;
+    pub const VGT_TF_MEMORY_BASE_SIENNA_CICHLID: u32 = 0x0fc5;
+    pub const VGT_TF_MEMORY_BASE_HI_SIENNA_CICHLID: u32 = 0x0fc6;
     /// Base address index of the RLC/CP window (BASE_IDX 1).
     pub const BASE_RLC: usize = 1;
-    pub const CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid__SHIFT: u64 = 0x2;
-    pub const CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid_MASK: u64 =
-        0x0000_0FFC;
-    pub const CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_Sienna_Cichlid_MASK: u64 =
-        0x0000_0FFC;
+    pub const CP_RB_DOORBELL_RANGE_LOWER_SHIFT: u64 = 0x2;
+    pub const CP_RB_DOORBELL_RANGE_LOWER_MASK: u64 = 0x0000_0FFC;
+    pub const CP_RB_DOORBELL_RANGE_UPPER_MASK: u64 = 0x0000_0FFC;
 
     pub fn base_idx(name: &str) -> usize {
         match name {
-            "mmCGTT_SPI_CS_CLK_CTRL" => BASE_RLC,
-            "mmCGTT_SPI_RA0_CLK_CTRL" => BASE_RLC,
-            "mmCGTT_SPI_RA1_CLK_CTRL" => BASE_RLC,
-            "mmGL2C_CTRL3" => BASE_RLC,
-            "mmRLC_CP_SCHEDULERS_Sienna_Cichlid" => BASE_RLC,
+            "CGTT_SPI_CS_CLK_CTRL" => BASE_RLC,
+            "CGTT_SPI_RA0_CLK_CTRL" => BASE_RLC,
+            "CGTT_SPI_RA1_CLK_CTRL" => BASE_RLC,
+            "GL2C_CTRL3" => BASE_RLC,
+            "RLC_CP_SCHEDULERS_SIENNA_CICHLID" => BASE_RLC,
             _ => 0,
         }
     }
@@ -85,19 +82,19 @@ const NUM_COMPUTE_RINGS: usize = 8;
 /// `(reg, base_idx, and_mask, or_mask)`.
 const GOLDEN_GC_10_3_4: &[(u32, u32, u32, u32)] = &[
     (
-        local_regs::mmCGTT_SPI_CS_CLK_CTRL,
+        local_regs::CGTT_SPI_CS_CLK_CTRL,
         local_regs::BASE_RLC as u32,
         0x7800_0000,
         0x7800_0100,
     ),
     (
-        local_regs::mmCGTT_SPI_RA0_CLK_CTRL,
+        local_regs::CGTT_SPI_RA0_CLK_CTRL,
         local_regs::BASE_RLC as u32,
         0x3000_0000,
         0x3000_0100,
     ),
     (
-        local_regs::mmCGTT_SPI_RA1_CLK_CTRL,
+        local_regs::CGTT_SPI_RA1_CLK_CTRL,
         local_regs::BASE_RLC as u32,
         0x7e00_0000,
         0x7e00_0100,
@@ -106,7 +103,7 @@ const GOLDEN_GC_10_3_4: &[(u32, u32, u32, u32)] = &[
     (gc::mmDB_DEBUG3, 0, 0x0000_0280, 0x0000_0280),
     (gc::mmDB_DEBUG4, 0, 0x0780_0000, 0x0080_0000),
     (
-        local_regs::mmGCR_GENERAL_CNTL_Sienna_Cichlid,
+        local_regs::GCR_GENERAL_CNTL_SIENNA_CICHLID,
         0,
         0x0000_1d00,
         0x0000_0500,
@@ -116,7 +113,7 @@ const GOLDEN_GC_10_3_4: &[(u32, u32, u32, u32)] = &[
     (gc::mmGL2C_ADDR_MATCH_MASK, 0, 0xffff_ffff, 0xffff_ffcf),
     (gc::mmGL2C_CM_CTRL1, 0, 0x4000_0000, 0x580f_1008),
     (
-        local_regs::mmGL2C_CTRL3,
+        local_regs::GL2C_CTRL3,
         local_regs::BASE_RLC as u32,
         0x0004_0000,
         0x00f8_0988,
@@ -131,7 +128,7 @@ const GOLDEN_GC_10_3_4: &[(u32, u32, u32, u32)] = &[
     (gc::mmPA_SC_ENHANCE_2, 0, 0x0000_0800, 0x0000_0820),
     (gc::mmSQ_CONFIG, 0, 0x0000_001f, 0x0018_0070),
     (gc::mmSX_DEBUG_1, 0, 0x0001_0000, 0x0001_0020),
-    (local_regs::mmTA_CNTL_AUX, 0, 0x0103_0000, 0x0103_0000),
+    (local_regs::TA_CNTL_AUX, 0, 0x0103_0000, 0x0103_0000),
     (gc::mmUTCL1_CTRL, 0, 0x03a0_0000, 0x00a0_0000),
     (gc::mmLDS_CONFIG, 0, 0x0000_0020, 0x0000_0020),
 ];
@@ -174,31 +171,31 @@ const MQD_PQ_WPTR_HI: usize = 183;
 const CAM_PAIRS: &[(u32, u32)] = &[
     (
         gc::mmVGT_TF_RING_SIZE_UMD,
-        local_regs::mmVGT_TF_RING_SIZE_Sienna_Cichlid,
+        local_regs::VGT_TF_RING_SIZE_SIENNA_CICHLID,
     ),
     (
         gc::mmVGT_TF_MEMORY_BASE_UMD,
-        local_regs::mmVGT_TF_MEMORY_BASE_Sienna_Cichlid,
+        local_regs::VGT_TF_MEMORY_BASE_SIENNA_CICHLID,
     ),
     (
         gc::mmVGT_TF_MEMORY_BASE_HI_UMD,
-        local_regs::mmVGT_TF_MEMORY_BASE_HI_Sienna_Cichlid,
+        local_regs::VGT_TF_MEMORY_BASE_HI_SIENNA_CICHLID,
     ),
     (
         gc::mmVGT_HS_OFFCHIP_PARAM_UMD,
-        local_regs::mmVGT_HS_OFFCHIP_PARAM_Sienna_Cichlid,
+        local_regs::VGT_HS_OFFCHIP_PARAM_SIENNA_CICHLID,
     ),
     (
         gc::mmVGT_ESGS_RING_SIZE_UMD,
-        local_regs::mmVGT_ESGS_RING_SIZE_Sienna_Cichlid,
+        local_regs::VGT_ESGS_RING_SIZE_SIENNA_CICHLID,
     ),
     (
         gc::mmVGT_GSVS_RING_SIZE_UMD,
-        local_regs::mmVGT_GSVS_RING_SIZE_Sienna_Cichlid,
+        local_regs::VGT_GSVS_RING_SIZE_SIENNA_CICHLID,
     ),
     (
         gc::mmSPI_CONFIG_CNTL_REMAP,
-        local_regs::mmSPI_CONFIG_CNTL_Sienna_Cichlid,
+        local_regs::SPI_CONFIG_CNTL_SIENNA_CICHLID,
     ),
 ];
 
@@ -218,6 +215,30 @@ pub struct GfxV10 {
     num_pipe_per_me: u32,
     pa_sc_tile_steering_override: u32,
     max_hw_contexts: u32,
+}
+
+#[derive(Clone, Copy)]
+struct WaitRegMem {
+    engine: u32,
+    memory_space: u32,
+    operation: u32,
+    address0: u32,
+    address1: u32,
+    reference: u32,
+    mask: u32,
+    interval: u32,
+}
+
+#[derive(Clone, Copy)]
+struct MqdConfig {
+    is_kiq: bool,
+    mqd_gpu_addr: u64,
+    ring_gpu_addr: u64,
+    doorbell_index: u32,
+    rptr_wb: u64,
+    wptr_wb: u64,
+    queue_size: usize,
+    eop_base: u64,
 }
 
 impl GfxV10 {
@@ -256,7 +277,7 @@ impl GfxV10 {
             | (3 << 25)
             | CACHE_FLUSH_AND_INV_TS_EVENT
             | (5 << 8);
-        ring.write(PACKET3(PACKET3_RELEASE_MEM, 6))?;
+        ring.write(packet3(PACKET3_RELEASE_MEM, 6))?;
         ring.write(event)?;
         // Linux gfx_v10_0_ring_emit_fence(): INT_SEL=2 requests a completion
         // interrupt, DATA_SEL=2 writes the full 64-bit sequence.
@@ -269,25 +290,15 @@ impl GfxV10 {
     }
 
     /// Linux `gfx_v10_0_wait_reg_mem`.
-    fn emit_wait_reg_mem(
-        ring: &mut Ring,
-        engine: u32,
-        mem_space: u32,
-        operation: u32,
-        addr0: u32,
-        addr1: u32,
-        reference: u32,
-        mask: u32,
-        interval: u32,
-    ) -> Result<()> {
+    fn emit_wait_reg_mem(ring: &mut Ring, wait: WaitRegMem) -> Result<()> {
         const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
-        ring.write(PACKET3(PACKET3_WAIT_REG_MEM, 5))?;
-        ring.write((mem_space << 4) | (operation << 6) | 3 | (engine << 8))?;
-        ring.write(addr0)?;
-        ring.write(addr1)?;
-        ring.write(reference)?;
-        ring.write(mask)?;
-        ring.write(interval)
+        ring.write(packet3(PACKET3_WAIT_REG_MEM, 5))?;
+        ring.write((wait.memory_space << 4) | (wait.operation << 6) | 3 | (wait.engine << 8))?;
+        ring.write(wait.address0)?;
+        ring.write(wait.address1)?;
+        ring.write(wait.reference)?;
+        ring.write(wait.mask)?;
+        ring.write(wait.interval)
     }
 
     /// Linux `gfx_v10_0_ring_emit_wreg`. Register addresses passed to PM4
@@ -300,7 +311,7 @@ impl GfxV10 {
         } else {
             (1 << 30) | WR_CONFIRM
         };
-        ring.write(PACKET3(PACKET3_WRITE_DATA, 3))?;
+        ring.write(packet3(PACKET3_WRITE_DATA, 3))?;
         ring.write(command)?;
         ring.write(reg)?;
         ring.write(0)?;
@@ -308,7 +319,19 @@ impl GfxV10 {
     }
 
     fn emit_reg_wait(ring: &mut Ring, reg: u32, value: u32, mask: u32) -> Result<()> {
-        Self::emit_wait_reg_mem(ring, 0, 0, 0, reg, 0, value, mask, 0x20)
+        Self::emit_wait_reg_mem(
+            ring,
+            WaitRegMem {
+                engine: 0,
+                memory_space: 0,
+                operation: 0,
+                address0: reg,
+                address1: 0,
+                reference: value,
+                mask,
+                interval: 0x20,
+            },
+        )
     }
 
     /// Linux's fallback `amdgpu_ring_emit_reg_write_reg_wait_helper`.
@@ -407,7 +430,7 @@ impl GfxV10 {
 
         // Compute rings do not have a PFP.
         if !compute {
-            ring.write(PACKET3(PACKET3_PFP_SYNC_ME, 0))?;
+            ring.write(packet3(PACKET3_PFP_SYNC_ME, 0))?;
             ring.write(0)?;
         }
         Ok(())
@@ -416,14 +439,16 @@ impl GfxV10 {
     fn emit_pipeline_sync(ring: &mut Ring, compute: bool) -> Result<()> {
         Self::emit_wait_reg_mem(
             ring,
-            if compute { 0 } else { 1 },
-            1,
-            0,
-            ring.fence_wb as u32,
-            (ring.fence_wb >> 32) as u32,
-            ring.fence_seq as u32,
-            u32::MAX,
-            4,
+            WaitRegMem {
+                engine: if compute { 0 } else { 1 },
+                memory_space: 1,
+                operation: 0,
+                address0: ring.fence_wb as u32,
+                address1: (ring.fence_wb >> 32) as u32,
+                reference: ring.fence_seq as u32,
+                mask: u32::MAX,
+                interval: 4,
+            },
         )
     }
 
@@ -448,14 +473,16 @@ impl GfxV10 {
         };
         Self::emit_wait_reg_mem(
             ring,
-            if compute { 0 } else { 1 },
-            0,
-            1,
-            request,
-            done,
-            mask,
-            mask,
-            0x20,
+            WaitRegMem {
+                engine: if compute { 0 } else { 1 },
+                memory_space: 0,
+                operation: 1,
+                address0: request,
+                address1: done,
+                reference: mask,
+                mask,
+                interval: 0x20,
+            },
         )
     }
 
@@ -474,7 +501,7 @@ impl GfxV10 {
         // gfx_v10_0_emit_mem_sync GCR_CNTL: GL2 INV/WB, GLM INV/WB and
         // GL1/GLV/GLK/GLI invalidation.
         const GCR_CNTL: u32 = 0x0000_c3b1;
-        ring.write(PACKET3(PACKET3_ACQUIRE_MEM, 6))?;
+        ring.write(packet3(PACKET3_ACQUIRE_MEM, 6))?;
         ring.write(0)?;
         ring.write(u32::MAX)?;
         ring.write(0x00ff_ffff)?;
@@ -495,14 +522,14 @@ impl GfxV10 {
                 load |= 0x1000_0000;
             }
         }
-        ring.write(PACKET3(PACKET3_CONTEXT_CONTROL, 1))?;
+        ring.write(packet3(PACKET3_CONTEXT_CONTROL, 1))?;
         ring.write(load)?;
         ring.write(0)
     }
 
     fn emit_switch_buffer(ring: &mut Ring) -> Result<()> {
         const PACKET3_SWITCH_BUFFER: u32 = 0x8b;
-        ring.write(PACKET3(PACKET3_SWITCH_BUFFER, 0))?;
+        ring.write(packet3(PACKET3_SWITCH_BUFFER, 0))?;
         ring.write(0)
     }
 
@@ -510,11 +537,7 @@ impl GfxV10 {
         ring: &mut Ring,
         dev: &mut Adapter,
         compute: bool,
-        vmid: u32,
-        root_pde: u64,
-        context_key: u64,
-        ibs: &[UserIb],
-        user_fence: Option<UserFence>,
+        submission: UserSubmission<'_>,
     ) -> Result<(u64, u64)> {
         const PACKET3_INDIRECT_BUFFER_CNST: u32 = 0x33;
         const PACKET3_INDIRECT_BUFFER: u32 = 0x3f;
@@ -528,22 +551,23 @@ impl GfxV10 {
         // never overwrite an in-flight ring segment.
         let reserve = 512u32
             .checked_add(
-                u32::try_from(ibs.len())
+                u32::try_from(submission.ibs.len())
                     .map_err(|_| Error::Range)?
                     .checked_mul(4)
                     .ok_or(Error::Range)?,
             )
             .ok_or(Error::Range)?;
         ring.wait_for_space(dev, reserve, 1_000_000)?;
+        let context_key = ((submission.vmid as u64) << 32) | submission.context_id as u64;
         let need_context_switch = ring.current_ctx != Some(context_key);
         if ring.fence_seq == 0 {
             dev_info!(
                 "astra: first Linux-style CS frame on {} ring pipe {}: VMID {} inv_eng {} root {:#018x} fence {:#018x}",
                 if compute { "compute" } else { "gfx" },
                 ring.pipe,
-                vmid,
+                submission.vmid,
                 ring.vm_inv_eng,
-                root_pde,
+                submission.root_pde,
                 ring.fence_wb,
             );
         }
@@ -553,7 +577,7 @@ impl GfxV10 {
 
         // VM sequence from amdgpu_vm_flush(): ring-side PTB programming,
         // invalidate, VM fence, and the non-conditional double switch.
-        Self::emit_vm_flush(ring, dev, compute, vmid, root_pde)?;
+        Self::emit_vm_flush(ring, dev, compute, submission.vmid, submission.root_pde)?;
         let vm_fence = ring.fence_seq.checked_add(1).ok_or(Error::Range)?;
         Self::emit_release_mem(ring, ring.fence_wb, vm_fence, false)?;
         if !compute {
@@ -562,34 +586,35 @@ impl GfxV10 {
         }
 
         // IB sequence from amdgpu_ib_schedule().
-        if ibs[0].flags & crate::uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0 {
+        if submission.ibs[0].flags & crate::uapi::AMDGPU_IB_FLAG_EMIT_MEM_SYNC != 0 {
             Self::emit_mem_sync(ring)?;
         }
         Self::emit_hdp_flush(ring, dev, compute)?;
         if !compute {
-            let preamble = ibs
+            let preamble = submission
+                .ibs
                 .iter()
                 .any(|ib| ib.flags & crate::uapi::AMDGPU_IB_FLAG_PREAMBLE != 0);
             Self::emit_context_control(ring, need_context_switch, preamble)?;
         }
 
-        for ib in ibs {
+        for ib in submission.ibs {
             let opcode = if !compute && ib.flags & crate::uapi::AMDGPU_IB_FLAG_CE != 0 {
                 PACKET3_INDIRECT_BUFFER_CNST
             } else {
                 PACKET3_INDIRECT_BUFFER
             };
-            let mut control = ib.length_dw | (vmid << 24);
+            let mut control = ib.length_dw | (submission.vmid << 24);
             if compute {
                 control |= INDIRECT_BUFFER_VALID;
             }
-            ring.write(PACKET3(opcode, 2))?;
+            ring.write(packet3(opcode, 2))?;
             ring.write(ib.va_start as u32)?;
             ring.write((ib.va_start >> 32) as u32)?;
             ring.write(control)?;
         }
         Self::emit_hdp_invalidate(ring, dev, compute)?;
-        if let Some(fence) = user_fence {
+        if let Some(fence) = submission.user_fence {
             Self::emit_release_mem(ring, fence.gpu_addr, fence.sequence, false)?;
         }
         let completion_value = vm_fence.checked_add(1).ok_or(Error::Range)?;
@@ -781,7 +806,7 @@ impl GfxV10 {
                     hw | user,
                     gc::CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS__SHIFT,
                     gc::CC_GC_SHADER_ARRAY_CONFIG__INACTIVE_WGPS_MASK,
-                ) as u32;
+                );
                 let active_wgps = !inactive & valid_wgps;
                 let mut cu_bitmap = 0u32;
                 for wgp in 0..max_wgps.min(16) {
@@ -878,13 +903,13 @@ impl GfxV10 {
         let data = dev.regs.read_ip(
             HwIp::Gc,
             0,
-            local_regs::mmVGT_ESGS_RING_SIZE_Sienna_Cichlid,
+            local_regs::VGT_ESGS_RING_SIZE_SIENNA_CICHLID,
             0,
         )?;
         dev.regs.write_ip(
             HwIp::Gc,
             0,
-            local_regs::mmVGT_ESGS_RING_SIZE_Sienna_Cichlid,
+            local_regs::VGT_ESGS_RING_SIZE_SIENNA_CICHLID,
             0,
             0,
         )?;
@@ -898,13 +923,13 @@ impl GfxV10 {
         let remapped = dev.regs.read_ip(
             HwIp::Gc,
             0,
-            local_regs::mmVGT_ESGS_RING_SIZE_Sienna_Cichlid,
+            local_regs::VGT_ESGS_RING_SIZE_SIENNA_CICHLID,
             0,
         )? == pattern;
         dev.regs.write_ip(
             HwIp::Gc,
             0,
-            local_regs::mmVGT_ESGS_RING_SIZE_Sienna_Cichlid,
+            local_regs::VGT_ESGS_RING_SIZE_SIENNA_CICHLID,
             0,
             data,
         )?;
@@ -1324,8 +1349,8 @@ impl GfxV10 {
         let value = dev.regs.read_ip(
             HwIp::Gc,
             0,
-            local_regs::mmRLC_CP_SCHEDULERS_Sienna_Cichlid,
-            ridx!(local_regs::mmRLC_CP_SCHEDULERS_Sienna_Cichlid),
+            local_regs::RLC_CP_SCHEDULERS_SIENNA_CICHLID,
+            ridx!(local_regs::RLC_CP_SCHEDULERS_SIENNA_CICHLID),
         )?;
         let pipe = self.kiq.as_ref().ok_or(Error::NoDevice)?.pipe;
         let queue = self.kiq.as_ref().ok_or(Error::NoDevice)?.queue;
@@ -1333,8 +1358,8 @@ impl GfxV10 {
         dev.regs.write_ip(
             HwIp::Gc,
             0,
-            local_regs::mmRLC_CP_SCHEDULERS_Sienna_Cichlid,
-            ridx!(local_regs::mmRLC_CP_SCHEDULERS_Sienna_Cichlid),
+            local_regs::RLC_CP_SCHEDULERS_SIENNA_CICHLID,
+            ridx!(local_regs::RLC_CP_SCHEDULERS_SIENNA_CICHLID),
             value,
         )?;
 
@@ -1376,14 +1401,16 @@ impl GfxV10 {
             );
             self.fill_mqd_buffer(
                 dev,
-                true,
-                mqd_gpu_addr,
-                gpu_addr,
-                doorbell_index,
-                rptr_wb,
-                wptr_wb,
-                queue_size,
-                eop_base,
+                MqdConfig {
+                    is_kiq: true,
+                    mqd_gpu_addr,
+                    ring_gpu_addr: gpu_addr,
+                    doorbell_index,
+                    rptr_wb,
+                    wptr_wb,
+                    queue_size,
+                    eop_base,
+                },
             )
         } else {
             let ring_idx = index - 1;
@@ -1402,230 +1429,235 @@ impl GfxV10 {
             );
             self.fill_mqd_buffer(
                 dev,
-                false,
-                mqd_gpu_addr,
-                gpu_addr,
-                doorbell_index,
-                rptr_wb,
-                wptr_wb,
-                queue_size,
-                eop_base,
+                MqdConfig {
+                    is_kiq: false,
+                    mqd_gpu_addr,
+                    ring_gpu_addr: gpu_addr,
+                    doorbell_index,
+                    rptr_wb,
+                    wptr_wb,
+                    queue_size,
+                    eop_base,
+                },
             )
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn fill_mqd_buffer(
-        &mut self,
-        dev: &mut Adapter,
-        is_kiq: bool,
-        mqd_gpu_addr: u64,
-        ring_gpu_addr: u64,
-        doorbell_index: u32,
-        rptr_wb: u64,
-        wptr_wb: u64,
-        queue_size: usize,
-        eop_base: u64,
-    ) -> Result<()> {
+    fn fill_mqd_buffer(&mut self, dev: &mut Adapter, config: MqdConfig) -> Result<()> {
         // Locate the MQD CPU buffer by its GPU address.
-        let mqd_bo = self.find_mqd_bo(mqd_gpu_addr).ok_or(Error::NoDevice)?;
+        let mqd_bo = self
+            .find_mqd_bo(config.mqd_gpu_addr)
+            .ok_or(Error::NoDevice)?;
         let cpu = mqd_bo.cpu.as_mut().ok_or(Error::NoDevice)?;
-        let slice = cpu.as_mut_slice();
-        slice.fill(0);
-        let mut put = |offset: usize, value: u32| -> Result<()> {
-            let at = offset * 4;
-            let dst = slice.get_mut(at..at + 4).ok_or(Error::Range)?;
-            dst.copy_from_slice(&value.to_le_bytes());
-            Ok(())
-        };
+        {
+            let slice = cpu.as_mut_slice();
+            slice.fill(0);
+            let mut put = |offset: usize, value: u32| -> Result<()> {
+                let at = offset * 4;
+                let dst = slice.get_mut(at..at + 4).ok_or(Error::Range)?;
+                dst.copy_from_slice(&value.to_le_bytes());
+                Ok(())
+            };
 
-        put(MQD_HEADER, 0xC031_0800)?;
-        put(MQD_PIPELINESTAT_ENABLE, 1)?;
-        for offset in [
-            MQD_STATIC_THREAD_MGMT_SE0,
-            MQD_STATIC_THREAD_MGMT_SE1,
-            MQD_STATIC_THREAD_MGMT_SE2,
-            MQD_STATIC_THREAD_MGMT_SE3,
-        ] {
-            put(offset, 0xffff_ffff)?;
-        }
-        put(MQD_MISC_RESERVED, 3)?;
+            put(MQD_HEADER, 0xC031_0800)?;
+            put(MQD_PIPELINESTAT_ENABLE, 1)?;
+            for offset in [
+                MQD_STATIC_THREAD_MGMT_SE0,
+                MQD_STATIC_THREAD_MGMT_SE1,
+                MQD_STATIC_THREAD_MGMT_SE2,
+                MQD_STATIC_THREAD_MGMT_SE3,
+            ] {
+                put(offset, 0xffff_ffff)?;
+            }
+            put(MQD_MISC_RESERVED, 3)?;
 
-        let eop_base = eop_base >> 8;
-        put(MQD_EOP_BASE_ADDR_LO, eop_base as u32)?;
-        put(MQD_EOP_BASE_ADDR_HI, (eop_base >> 32) as u32)?;
-        let eop_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_EOP_CONTROL, 0)?;
-        put(
-            MQD_EOP_CONTROL,
-            set_field(
-                eop_control,
-                gc::CP_HQD_EOP_CONTROL__EOP_SIZE__SHIFT,
-                gc::CP_HQD_EOP_CONTROL__EOP_SIZE_MASK,
-                8,
-            ),
-        )?;
+            let eop_base = config.eop_base >> 8;
+            put(MQD_EOP_BASE_ADDR_LO, eop_base as u32)?;
+            put(MQD_EOP_BASE_ADDR_HI, (eop_base >> 32) as u32)?;
+            let eop_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_EOP_CONTROL, 0)?;
+            put(
+                MQD_EOP_CONTROL,
+                set_field(
+                    eop_control,
+                    gc::CP_HQD_EOP_CONTROL__EOP_SIZE__SHIFT,
+                    gc::CP_HQD_EOP_CONTROL__EOP_SIZE_MASK,
+                    8,
+                ),
+            )?;
 
-        let doorbell_control =
-            dev.regs
-                .read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PQ_DOORBELL_CONTROL, 0)?;
-        let mut doorbell_control = set_field(
-            doorbell_control,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK,
-            doorbell_index as u64,
-        );
-        doorbell_control = set_field(
-            doorbell_control,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN__SHIFT,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN_MASK,
-            1,
-        );
-        doorbell_control = set_field(
-            doorbell_control,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_SOURCE__SHIFT,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_SOURCE_MASK,
-            0,
-        );
-        doorbell_control = set_field(
-            doorbell_control,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_HIT__SHIFT,
-            gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_HIT_MASK,
-            0,
-        );
-        put(MQD_PQ_DOORBELL_CONTROL, doorbell_control)?;
-
-        put(MQD_DEQUEUE_REQUEST, 0)?;
-        put(MQD_PQ_RPTR, 0)?;
-        put(MQD_PQ_WPTR_LO, 0)?;
-        put(MQD_PQ_WPTR_HI, 0)?;
-        put(MQD_MQD_BASE_ADDR_LO, (mqd_gpu_addr as u32) & 0xffff_fffc)?;
-        put(MQD_MQD_BASE_ADDR_HI, (mqd_gpu_addr >> 32) as u32)?;
-
-        let mqd_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_MQD_CONTROL, 0)?;
-        put(
-            MQD_MQD_CONTROL,
-            set_field(
-                mqd_control,
-                gc::CP_MQD_CONTROL__VMID__SHIFT,
-                gc::CP_MQD_CONTROL__VMID_MASK,
+            let doorbell_control =
+                dev.regs
+                    .read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PQ_DOORBELL_CONTROL, 0)?;
+            let mut doorbell_control = set_field(
+                doorbell_control,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK,
+                config.doorbell_index as u64,
+            );
+            doorbell_control = set_field(
+                doorbell_control,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN__SHIFT,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN_MASK,
+                1,
+            );
+            doorbell_control = set_field(
+                doorbell_control,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_SOURCE__SHIFT,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_SOURCE_MASK,
                 0,
-            ),
-        )?;
+            );
+            doorbell_control = set_field(
+                doorbell_control,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_HIT__SHIFT,
+                gc::CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_HIT_MASK,
+                0,
+            );
+            put(MQD_PQ_DOORBELL_CONTROL, doorbell_control)?;
 
-        let hqd_base = ring_gpu_addr >> 8;
-        put(MQD_PQ_BASE_LO, hqd_base as u32)?;
-        put(MQD_PQ_BASE_HI, (hqd_base >> 32) as u32)?;
+            put(MQD_DEQUEUE_REQUEST, 0)?;
+            put(MQD_PQ_RPTR, 0)?;
+            put(MQD_PQ_WPTR_LO, 0)?;
+            put(MQD_PQ_WPTR_HI, 0)?;
+            put(
+                MQD_MQD_BASE_ADDR_LO,
+                (config.mqd_gpu_addr as u32) & 0xffff_fffc,
+            )?;
+            put(MQD_MQD_BASE_ADDR_HI, (config.mqd_gpu_addr >> 32) as u32)?;
 
-        let pq_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PQ_CONTROL, 0)?;
-        let mut pq_control = set_field(
-            pq_control,
-            gc::CP_HQD_PQ_CONTROL__QUEUE_SIZE__SHIFT,
-            gc::CP_HQD_PQ_CONTROL__QUEUE_SIZE_MASK,
-            (queue_size / 4).trailing_zeros() as u64 - 1,
-        );
-        pq_control = set_field(
-            pq_control,
-            gc::CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT,
-            gc::CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK,
-            9,
-        );
-        pq_control = set_field(
-            pq_control,
-            gc::CP_HQD_PQ_CONTROL__UNORD_DISPATCH__SHIFT,
-            gc::CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK,
-            1,
-        );
-        pq_control = set_field(
-            pq_control,
-            gc::CP_HQD_PQ_CONTROL__TUNNEL_DISPATCH__SHIFT,
-            gc::CP_HQD_PQ_CONTROL__TUNNEL_DISPATCH_MASK,
-            0,
-        );
-        pq_control = set_field(
-            pq_control,
-            gc::CP_HQD_PQ_CONTROL__PRIV_STATE__SHIFT,
-            gc::CP_HQD_PQ_CONTROL__PRIV_STATE_MASK,
-            1,
-        );
-        pq_control = set_field(
-            pq_control,
-            gc::CP_HQD_PQ_CONTROL__KMD_QUEUE__SHIFT,
-            gc::CP_HQD_PQ_CONTROL__KMD_QUEUE_MASK,
-            1,
-        );
-        put(MQD_PQ_CONTROL, pq_control)?;
+            let mqd_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_MQD_CONTROL, 0)?;
+            put(
+                MQD_MQD_CONTROL,
+                set_field(
+                    mqd_control,
+                    gc::CP_MQD_CONTROL__VMID__SHIFT,
+                    gc::CP_MQD_CONTROL__VMID_MASK,
+                    0,
+                ),
+            )?;
 
-        put(MQD_PQ_RPTR_REPORT_ADDR_LO, (rptr_wb as u32) & 0xffff_fffc)?;
-        put(
-            MQD_PQ_RPTR_REPORT_ADDR_HI,
-            ((rptr_wb >> 32) as u32) & 0xffff,
-        )?;
-        put(MQD_PQ_WPTR_POLL_ADDR_LO, (wptr_wb as u32) & 0xffff_fffc)?;
-        put(MQD_PQ_WPTR_POLL_ADDR_HI, ((wptr_wb >> 32) as u32) & 0xffff)?;
+            let hqd_base = config.ring_gpu_addr >> 8;
+            put(MQD_PQ_BASE_LO, hqd_base as u32)?;
+            put(MQD_PQ_BASE_HI, (hqd_base >> 32) as u32)?;
 
-        put(
-            MQD_PQ_RPTR,
-            dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PQ_RPTR, 0)?,
-        )?;
-        put(MQD_VMID, 0)?;
+            let pq_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PQ_CONTROL, 0)?;
+            let mut pq_control = set_field(
+                pq_control,
+                gc::CP_HQD_PQ_CONTROL__QUEUE_SIZE__SHIFT,
+                gc::CP_HQD_PQ_CONTROL__QUEUE_SIZE_MASK,
+                (config.queue_size / 4).trailing_zeros() as u64 - 1,
+            );
+            pq_control = set_field(
+                pq_control,
+                gc::CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE__SHIFT,
+                gc::CP_HQD_PQ_CONTROL__RPTR_BLOCK_SIZE_MASK,
+                9,
+            );
+            pq_control = set_field(
+                pq_control,
+                gc::CP_HQD_PQ_CONTROL__UNORD_DISPATCH__SHIFT,
+                gc::CP_HQD_PQ_CONTROL__UNORD_DISPATCH_MASK,
+                1,
+            );
+            pq_control = set_field(
+                pq_control,
+                gc::CP_HQD_PQ_CONTROL__TUNNEL_DISPATCH__SHIFT,
+                gc::CP_HQD_PQ_CONTROL__TUNNEL_DISPATCH_MASK,
+                0,
+            );
+            pq_control = set_field(
+                pq_control,
+                gc::CP_HQD_PQ_CONTROL__PRIV_STATE__SHIFT,
+                gc::CP_HQD_PQ_CONTROL__PRIV_STATE_MASK,
+                1,
+            );
+            pq_control = set_field(
+                pq_control,
+                gc::CP_HQD_PQ_CONTROL__KMD_QUEUE__SHIFT,
+                gc::CP_HQD_PQ_CONTROL__KMD_QUEUE_MASK,
+                1,
+            );
+            put(MQD_PQ_CONTROL, pq_control)?;
 
-        let persistent = dev
-            .regs
-            .read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PERSISTENT_STATE, 0)?;
-        put(
-            MQD_PERSISTENT_STATE,
-            set_field(
-                persistent,
-                gc::CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT,
-                gc::CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE_MASK,
-                0x53,
-            ),
-        )?;
+            put(
+                MQD_PQ_RPTR_REPORT_ADDR_LO,
+                (config.rptr_wb as u32) & 0xffff_fffc,
+            )?;
+            put(
+                MQD_PQ_RPTR_REPORT_ADDR_HI,
+                ((config.rptr_wb >> 32) as u32) & 0xffff,
+            )?;
+            put(
+                MQD_PQ_WPTR_POLL_ADDR_LO,
+                (config.wptr_wb as u32) & 0xffff_fffc,
+            )?;
+            put(
+                MQD_PQ_WPTR_POLL_ADDR_HI,
+                ((config.wptr_wb >> 32) as u32) & 0xffff,
+            )?;
 
-        let ib_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_IB_CONTROL, 0)?;
-        put(
-            MQD_IB_CONTROL,
-            set_field(
-                ib_control,
-                gc::CP_HQD_IB_CONTROL__MIN_IB_AVAIL_SIZE__SHIFT,
-                gc::CP_HQD_IB_CONTROL__MIN_IB_AVAIL_SIZE_MASK,
-                3,
-            ),
-        )?;
+            put(
+                MQD_PQ_RPTR,
+                dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PQ_RPTR, 0)?,
+            )?;
+            put(MQD_VMID, 0)?;
 
-        let quantum = set_field(
-            0,
-            gc::CP_HQD_QUANTUM__QUANTUM_EN__SHIFT,
-            gc::CP_HQD_QUANTUM__QUANTUM_EN_MASK,
-            1,
-        ) | set_field(
-            0,
-            gc::CP_HQD_QUANTUM__QUANTUM_SCALE__SHIFT,
-            gc::CP_HQD_QUANTUM__QUANTUM_SCALE_MASK,
-            1,
-        ) | set_field(
-            0,
-            gc::CP_HQD_QUANTUM__QUANTUM_DURATION__SHIFT,
-            gc::CP_HQD_QUANTUM__QUANTUM_DURATION_MASK,
-            1,
-        );
-        put(MQD_QUANTUM, quantum)?;
-        // amdgpu_ring_to_mqd_prop: normal KGD queues use the zero/default
-        // priorities, and MAP_QUEUES activates compute queues. Only the KIQ
-        // is activated while its HQD registers are programmed directly.
-        put(MQD_PIPE_PRIORITY, 0)?;
-        put(MQD_QUEUE_PRIORITY, 0)?;
-        put(MQD_ACTIVE, is_kiq as u32)?;
-        drop(put);
+            let persistent = dev
+                .regs
+                .read_ip(HwIp::Gc, 0, gc::mmCP_HQD_PERSISTENT_STATE, 0)?;
+            put(
+                MQD_PERSISTENT_STATE,
+                set_field(
+                    persistent,
+                    gc::CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE__SHIFT,
+                    gc::CP_HQD_PERSISTENT_STATE__PRELOAD_SIZE_MASK,
+                    0x53,
+                ),
+            )?;
+
+            let ib_control = dev.regs.read_ip(HwIp::Gc, 0, gc::mmCP_HQD_IB_CONTROL, 0)?;
+            put(
+                MQD_IB_CONTROL,
+                set_field(
+                    ib_control,
+                    gc::CP_HQD_IB_CONTROL__MIN_IB_AVAIL_SIZE__SHIFT,
+                    gc::CP_HQD_IB_CONTROL__MIN_IB_AVAIL_SIZE_MASK,
+                    3,
+                ),
+            )?;
+
+            let quantum = set_field(
+                0,
+                gc::CP_HQD_QUANTUM__QUANTUM_EN__SHIFT,
+                gc::CP_HQD_QUANTUM__QUANTUM_EN_MASK,
+                1,
+            ) | set_field(
+                0,
+                gc::CP_HQD_QUANTUM__QUANTUM_SCALE__SHIFT,
+                gc::CP_HQD_QUANTUM__QUANTUM_SCALE_MASK,
+                1,
+            ) | set_field(
+                0,
+                gc::CP_HQD_QUANTUM__QUANTUM_DURATION__SHIFT,
+                gc::CP_HQD_QUANTUM__QUANTUM_DURATION_MASK,
+                1,
+            );
+            put(MQD_QUANTUM, quantum)?;
+            // amdgpu_ring_to_mqd_prop: normal KGD queues use the zero/default
+            // priorities, and MAP_QUEUES activates compute queues. Only the KIQ
+            // is activated while its HQD registers are programmed directly.
+            put(MQD_PIPE_PRIORITY, 0)?;
+            put(MQD_QUEUE_PRIORITY, 0)?;
+            put(MQD_ACTIVE, config.is_kiq as u32)?;
+        }
         cpu.sync_for_device();
         Ok(())
     }
 
     fn find_mqd_bo(&mut self, gpu_addr: u64) -> Option<&mut Bo> {
-        if let Some(kiq) = self.kiq.as_mut() {
-            if kiq.mqd.as_ref().map(|m| m.gpu_addr) == Some(gpu_addr) {
-                return kiq.mqd.as_mut();
-            }
+        if let Some(kiq) = self.kiq.as_mut()
+            && kiq.mqd.as_ref().map(|m| m.gpu_addr) == Some(gpu_addr)
+        {
+            return kiq.mqd.as_mut();
         }
         self.compute_rings
             .iter_mut()
@@ -1680,8 +1712,8 @@ impl GfxV10 {
         // Doorbell range (10.3.x sienna field names).
         let lower = set_field(
             0,
-            local_regs::CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid__SHIFT,
-            local_regs::CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_Sienna_Cichlid_MASK,
+            local_regs::CP_RB_DOORBELL_RANGE_LOWER_SHIFT,
+            local_regs::CP_RB_DOORBELL_RANGE_LOWER_MASK,
             doorbell_index as u64,
         );
         dev.regs.write_ip(
@@ -1696,7 +1728,7 @@ impl GfxV10 {
             0,
             gc::mmCP_RB_DOORBELL_RANGE_UPPER,
             ridx!(gc::mmCP_RB_DOORBELL_RANGE_UPPER),
-            local_regs::CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_Sienna_Cichlid_MASK as u32,
+            local_regs::CP_RB_DOORBELL_RANGE_UPPER_MASK as u32,
         )?;
         Ok(())
     }
@@ -1754,14 +1786,14 @@ impl GfxV10 {
         self.cp_gfx_enable(dev, true)?;
 
         let ring = &mut self.gfx_rings[0];
-        ring.write(PACKET3(PACKET3_PREAMBLE_CNTL, 0))?;
+        ring.write(packet3(PACKET3_PREAMBLE_CNTL, 0))?;
         ring.write(PACKET3_PREAMBLE_BEGIN_CLEAR_STATE)?;
-        ring.write(PACKET3(PACKET3_CONTEXT_CONTROL, 1))?;
+        ring.write(packet3(PACKET3_CONTEXT_CONTROL, 1))?;
         ring.write(0x8000_0000)?;
         ring.write(0x8000_0000)?;
 
-        for (extent, reg_index) in csb_extents() {
-            ring.write(PACKET3(PACKET3_SET_CONTEXT_REG, extent.len() as u32))?;
+        for (extent, reg_index) in Self::csb_extents() {
+            ring.write(packet3(PACKET3_SET_CONTEXT_REG, extent.len() as u32))?;
             ring.write(reg_index - PACKET3_SET_CONTEXT_REG_START)?;
             for value in extent {
                 ring.write(*value)?;
@@ -1774,15 +1806,15 @@ impl GfxV10 {
             .regs
             .base_u32(HwIp::Gc, 0, ridx!(gc::mmPA_SC_TILE_STEERING_OVERRIDE))?
             + gc::mmPA_SC_TILE_STEERING_OVERRIDE;
-        ring.write(PACKET3(PACKET3_SET_CONTEXT_REG, 1))?;
+        ring.write(packet3(PACKET3_SET_CONTEXT_REG, 1))?;
         ring.write(tile_reg - PACKET3_SET_CONTEXT_REG_START)?;
         ring.write(self.pa_sc_tile_steering_override)?;
 
-        ring.write(PACKET3(PACKET3_PREAMBLE_CNTL, 0))?;
+        ring.write(packet3(PACKET3_PREAMBLE_CNTL, 0))?;
         ring.write(PACKET3_PREAMBLE_END_CLEAR_STATE)?;
-        ring.write(PACKET3(PACKET3_CLEAR_STATE, 0))?;
+        ring.write(packet3(PACKET3_CLEAR_STATE, 0))?;
         ring.write(0)?;
-        ring.write(PACKET3(PACKET3_SET_BASE, 2))?;
+        ring.write(packet3(PACKET3_SET_BASE, 2))?;
         ring.write(PACKET3_BASE_INDEX_CE_PARTITION)?;
         ring.write(0x8000)?;
         ring.write(0x8000)?;
@@ -1792,7 +1824,7 @@ impl GfxV10 {
         // it copies state 0 into its next available state as well.
         if self.gfx_rings.len() > 1 {
             let ring = &mut self.gfx_rings[1];
-            ring.write(PACKET3(PACKET3_CLEAR_STATE, 0))?;
+            ring.write(packet3(PACKET3_CLEAR_STATE, 0))?;
             ring.write(0)?;
             ring.commit(dev)?;
         }
@@ -1867,13 +1899,8 @@ impl GfxV10 {
             dev.regs.write_ip(HwIp::Gc, 0, wptr_hi, 0, 0)?;
             dev.regs
                 .write_ip(HwIp::Gc, 0, rptr_addr, 0, rptr_wb as u32)?;
-            dev.regs.write_ip(
-                HwIp::Gc,
-                0,
-                rptr_addr_hi,
-                0,
-                ((rptr_wb >> 32) as u32) & 0xffff_ffff,
-            )?;
+            dev.regs
+                .write_ip(HwIp::Gc, 0, rptr_addr_hi, 0, (rptr_wb >> 32) as u32)?;
             dev.regs.write_ip(
                 HwIp::Gc,
                 0,
@@ -1909,8 +1936,8 @@ impl GfxV10 {
         dev.regs.write_ip(
             HwIp::Gc,
             0,
-            local_regs::mmCP_MEC_CNTL_Sienna_Cichlid,
-            ridx!(local_regs::mmCP_MEC_CNTL_Sienna_Cichlid),
+            local_regs::CP_MEC_CNTL_SIENNA_CICHLID,
+            ridx!(local_regs::CP_MEC_CNTL_SIENNA_CICHLID),
             0,
         )?;
         time::delay(Duration::from_micros(50));
@@ -1945,7 +1972,7 @@ impl GfxV10 {
         {
             let kiq = self.kiq.as_mut().ok_or(Error::NoDevice)?;
             let shader_mc_addr = cleaner >> 8;
-            kiq.write(PACKET3(PACKET3_SET_RESOURCES, 6))?;
+            kiq.write(packet3(PACKET3_SET_RESOURCES, 6))?;
             kiq.write(0)?; // vmid_mask 0, queue_type 0 (KIQ)
             kiq.write(queue_mask as u32)?;
             kiq.write((queue_mask >> 32) as u32)?;
@@ -1962,7 +1989,7 @@ impl GfxV10 {
             let (queue, pipe, me, doorbell_index) = (ring.queue, ring.pipe, ring.me, ring.doorbell);
             {
                 let kiq = self.kiq.as_mut().ok_or(Error::NoDevice)?;
-                kiq.write(PACKET3(PACKET3_MAP_QUEUES, 5))?;
+                kiq.write(packet3(PACKET3_MAP_QUEUES, 5))?;
                 kiq.write(map_queues_dw1(queue, pipe, if me == 1 { 0 } else { 1 }))?;
                 kiq.write(map_queues_doorbell_offset(doorbell_index))?;
                 kiq.write(mqd_addr as u32)?;
@@ -1992,155 +2019,6 @@ impl GfxV10 {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn log_user_submission_timeout(
-        &mut self,
-        dev: &mut Adapter,
-        compute: bool,
-        ring_index: u32,
-        vmid: u32,
-        root_pde: u64,
-        ibs: &[UserIb],
-        completion_addr: u64,
-        completion_value: u64,
-    ) -> Result<()> {
-        let observed = dev
-            .wb
-            .as_mut()
-            .ok_or(Error::NoDevice)?
-            .read_u64(completion_addr)?;
-        dev_info!(
-            "astra: CS completion timeout: IP={} ring={} VMID={} fence={:#018x} expected={} observed={}",
-            if compute { "compute" } else { "gfx" },
-            ring_index,
-            vmid,
-            completion_addr,
-            completion_value,
-            observed,
-        );
-        for (index, ib) in ibs.iter().enumerate() {
-            dev_info!(
-                "astra: CS timeout IB {}: va={:#018x} length_dw={} flags={:#010x}",
-                index,
-                ib.va_start,
-                ib.length_dw,
-                ib.flags,
-            );
-        }
-
-        let context_distance = gc::mmGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32
-            - gc::mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32;
-        let context_offset = context_distance * vmid;
-        let ptb_lo = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 + context_offset,
-            ridx!(gc::mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32),
-        )?;
-        let ptb_hi = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32 + context_offset,
-            ridx!(gc::mmGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32),
-        )?;
-        let context_cntl_distance = gc::mmGCVM_CONTEXT1_CNTL - gc::mmGCVM_CONTEXT0_CNTL;
-        let context_cntl = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_CONTEXT0_CNTL + context_cntl_distance * vmid,
-            ridx!(gc::mmGCVM_CONTEXT0_CNTL),
-        )?;
-        let start_lo = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 + context_offset,
-            ridx!(gc::mmGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32),
-        )?;
-        let start_hi = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32 + context_offset,
-            ridx!(gc::mmGCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32),
-        )?;
-        let end_lo = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32 + context_offset,
-            ridx!(gc::mmGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32),
-        )?;
-        let end_hi = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32 + context_offset,
-            ridx!(gc::mmGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32),
-        )?;
-        dev_info!(
-            "astra: CS VM context snapshot: cntl={:#010x} root={:#010x}:{:#010x} start={:#010x}:{:#010x} end={:#010x}:{:#010x}",
-            context_cntl,
-            ptb_hi,
-            ptb_lo,
-            start_hi,
-            start_lo,
-            end_hi,
-            end_lo,
-        );
-        let fault_status = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_L2_PROTECTION_FAULT_STATUS,
-            ridx!(gc::mmGCVM_L2_PROTECTION_FAULT_STATUS),
-        )?;
-        let fault_lo = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_L2_PROTECTION_FAULT_ADDR_LO32,
-            ridx!(gc::mmGCVM_L2_PROTECTION_FAULT_ADDR_LO32),
-        )?;
-        let fault_hi = dev.regs.read_ip(
-            HwIp::Gc,
-            0,
-            gc::mmGCVM_L2_PROTECTION_FAULT_ADDR_HI32,
-            ridx!(gc::mmGCVM_L2_PROTECTION_FAULT_ADDR_HI32),
-        )?;
-
-        let vm_inv_eng = if compute {
-            self.compute_rings.get(ring_index as usize)
-        } else {
-            self.gfx_rings.get(ring_index as usize)
-        }
-        .map(|ring| ring.vm_inv_eng)
-        .ok_or(Error::InvalidArgument)?;
-        {
-            let engine_distance = gc::mmGCVM_INVALIDATE_ENG1_REQ - gc::mmGCVM_INVALIDATE_ENG0_REQ;
-            let engine_offset = engine_distance * vm_inv_eng;
-            let request = dev.regs.read_ip(
-                HwIp::Gc,
-                0,
-                gc::mmGCVM_INVALIDATE_ENG0_REQ + engine_offset,
-                ridx!(gc::mmGCVM_INVALIDATE_ENG0_REQ),
-            )?;
-            let acknowledge = dev.regs.read_ip(
-                HwIp::Gc,
-                0,
-                gc::mmGCVM_INVALIDATE_ENG0_ACK + engine_offset,
-                ridx!(gc::mmGCVM_INVALIDATE_ENG0_ACK),
-            )?;
-            dev_info!(
-                "astra: CS GFXHUB snapshot: root expected={:#018x} readback={:#010x}:{:#010x} inv_eng={} req={:#010x} ack={:#010x} fault={:#010x} addr={:#010x}:{:#010x}",
-                root_pde,
-                ptb_hi,
-                ptb_lo,
-                vm_inv_eng,
-                request,
-                acknowledge,
-                fault_status,
-                fault_hi,
-                fault_lo,
-            );
-        }
-        Ok(())
-    }
-
     /// Linux amdgpu_device_flush_hdp(NULL) through the native NBIO window.
     fn flush_hdp(dev: &mut Adapter) -> Result<()> {
         dev.regs.write_ip(
@@ -2158,57 +2036,58 @@ impl GfxV10 {
         )?;
         Ok(())
     }
-}
 
-/// The gfx10 clear-state extents (clearstate_gfx10.h:961). The register
-/// count is derived from the generated array length, never hardcoded.
-fn csb_extents() -> [(&'static [u32], u32); 8] {
-    [
-        (&clearstate::gfx10_SECT_CONTEXT_def_1, 0x0000_a000),
-        (&clearstate::gfx10_SECT_CONTEXT_def_2, 0x0000_a0d8),
-        (&clearstate::gfx10_SECT_CONTEXT_def_3, 0x0000_a1f5),
-        (&clearstate::gfx10_SECT_CONTEXT_def_4, 0x0000_a1ff),
-        (&clearstate::gfx10_SECT_CONTEXT_def_5, 0x0000_a2a0),
-        (&clearstate::gfx10_SECT_CONTEXT_def_6, 0x0000_a2a3),
-        (&clearstate::gfx10_SECT_CONTEXT_def_7, 0x0000_a2a5),
-        (&clearstate::gfx10_SECT_CONTEXT_def_8, 0x0000_a2f5),
-    ]
-}
-
-/// Clear-state buffer size in dwords (gfx_v10_0_get_csb_size).
-fn csb_size_dwords() -> usize {
-    2 + 3
-        + csb_extents()
-            .iter()
-            .map(|(extent, _)| 2 + extent.len())
-            .sum::<usize>()
-        + 3
-        + 2
-        + 2
-}
-
-/// Builds the clear-state buffer contents (Linux
-/// amdgpu_gfx_csb_preamble_start/data_parser/end + clear state).
-fn build_csb(tile_reg: u32, tile_steering: u32) -> Result<Vec<u32>> {
-    let mut buffer = Vec::new();
-    buffer.push(PACKET3(PACKET3_PREAMBLE_CNTL, 0));
-    buffer.push(PACKET3_PREAMBLE_BEGIN_CLEAR_STATE);
-    buffer.push(PACKET3(PACKET3_CONTEXT_CONTROL, 1));
-    buffer.push(0x8000_0000);
-    buffer.push(0x8000_0000);
-    for (extent, reg_index) in csb_extents() {
-        buffer.push(PACKET3(PACKET3_SET_CONTEXT_REG, extent.len() as u32));
-        buffer.push(reg_index - PACKET3_SET_CONTEXT_REG_START);
-        buffer.extend_from_slice(extent);
+    /// The gfx10 clear-state extents (clearstate_gfx10.h:961). The register
+    /// count is derived from the generated array length, never hardcoded.
+    fn csb_extents() -> [(&'static [u32], u32); 8] {
+        [
+            (&clearstate::gfx10_SECT_CONTEXT_def_1, 0x0000_a000),
+            (&clearstate::gfx10_SECT_CONTEXT_def_2, 0x0000_a0d8),
+            (&clearstate::gfx10_SECT_CONTEXT_def_3, 0x0000_a1f5),
+            (&clearstate::gfx10_SECT_CONTEXT_def_4, 0x0000_a1ff),
+            (&clearstate::gfx10_SECT_CONTEXT_def_5, 0x0000_a2a0),
+            (&clearstate::gfx10_SECT_CONTEXT_def_6, 0x0000_a2a3),
+            (&clearstate::gfx10_SECT_CONTEXT_def_7, 0x0000_a2a5),
+            (&clearstate::gfx10_SECT_CONTEXT_def_8, 0x0000_a2f5),
+        ]
     }
-    buffer.push(PACKET3(PACKET3_SET_CONTEXT_REG, 1));
-    buffer.push(tile_reg - PACKET3_SET_CONTEXT_REG_START);
-    buffer.push(tile_steering);
-    buffer.push(PACKET3(PACKET3_PREAMBLE_CNTL, 0));
-    buffer.push(PACKET3_PREAMBLE_END_CLEAR_STATE);
-    buffer.push(PACKET3(PACKET3_CLEAR_STATE, 0));
-    buffer.push(0);
-    Ok(buffer)
+
+    /// Clear-state buffer size in dwords (gfx_v10_0_get_csb_size).
+    fn csb_size_dwords() -> usize {
+        2 + 3
+            + Self::csb_extents()
+                .iter()
+                .map(|(extent, _)| 2 + extent.len())
+                .sum::<usize>()
+            + 3
+            + 2
+            + 2
+    }
+
+    /// Builds the clear-state buffer contents (Linux
+    /// amdgpu_gfx_csb_preamble_start/data_parser/end + clear state).
+    fn build_csb(tile_reg: u32, tile_steering: u32) -> Result<Vec<u32>> {
+        let mut buffer = alloc::vec![
+            packet3(PACKET3_PREAMBLE_CNTL, 0),
+            PACKET3_PREAMBLE_BEGIN_CLEAR_STATE,
+            packet3(PACKET3_CONTEXT_CONTROL, 1),
+            0x8000_0000,
+            0x8000_0000,
+        ];
+        for (extent, reg_index) in Self::csb_extents() {
+            buffer.push(packet3(PACKET3_SET_CONTEXT_REG, extent.len() as u32));
+            buffer.push(reg_index - PACKET3_SET_CONTEXT_REG_START);
+            buffer.extend_from_slice(extent);
+        }
+        buffer.push(packet3(PACKET3_SET_CONTEXT_REG, 1));
+        buffer.push(tile_reg - PACKET3_SET_CONTEXT_REG_START);
+        buffer.push(tile_steering);
+        buffer.push(packet3(PACKET3_PREAMBLE_CNTL, 0));
+        buffer.push(PACKET3_PREAMBLE_END_CLEAR_STATE);
+        buffer.push(packet3(PACKET3_CLEAR_STATE, 0));
+        buffer.push(0);
+        Ok(buffer)
+    }
 }
 
 impl IpBlock for GfxV10 {
@@ -2245,13 +2124,13 @@ impl IpBlock for GfxV10 {
         );
 
         // RLC clear-state buffer + cleaner shader.
-        self.csb_dwords = csb_size_dwords();
+        self.csb_dwords = Self::csb_size_dwords();
         let csb = dev.mem.alloc_gart(&mut dev.regs, self.csb_dwords * 4)?;
         let tile_reg = dev
             .regs
             .base_u32(HwIp::Gc, 0, ridx!(gc::mmPA_SC_TILE_STEERING_OVERRIDE))?
             + gc::mmPA_SC_TILE_STEERING_OVERRIDE;
-        let buffer = build_csb(tile_reg, self.pa_sc_tile_steering_override)?;
+        let buffer = Self::build_csb(tile_reg, self.pa_sc_tile_steering_override)?;
         if buffer.len() != self.csb_dwords {
             return Err(Error::Range);
         }
@@ -2297,13 +2176,15 @@ impl IpBlock for GfxV10 {
             };
             let mut ring = Ring::new(
                 bo,
-                doorbell::ring_doorbell(assigned),
-                rptr_wb,
-                wptr_wb,
-                0,
-                i,
-                0,
-                RingKind::Gfx,
+                RingConfig {
+                    doorbell: doorbell::ring_doorbell(assigned),
+                    rptr_wb,
+                    wptr_wb,
+                    me: 0,
+                    pipe: i,
+                    queue: 0,
+                    kind: RingKind::Gfx,
+                },
             );
             ring.vm_inv_eng = i;
             ring.fence_wb = self.wb_slot(dev)?;
@@ -2315,13 +2196,15 @@ impl IpBlock for GfxV10 {
             let wptr_wb = self.wb_slot(dev)?;
             let mut kiq = Ring::new(
                 bo,
-                doorbell::ring_doorbell(doorbell::DOORBELL_KIQ),
-                rptr_wb,
-                wptr_wb,
-                2,
-                1,
-                0,
-                RingKind::Gfx,
+                RingConfig {
+                    doorbell: doorbell::ring_doorbell(doorbell::DOORBELL_KIQ),
+                    rptr_wb,
+                    wptr_wb,
+                    me: 2,
+                    pipe: 1,
+                    queue: 0,
+                    kind: RingKind::Gfx,
+                },
             );
             // GFX and compute rings consume engines 0, 1, 4..11 in Linux's
             // registration order; KIQ follows them on engine 12.
@@ -2337,13 +2220,15 @@ impl IpBlock for GfxV10 {
             let assigned = doorbell::DOORBELL_MEC_RING0 + i as u32;
             let mut ring = Ring::new(
                 bo,
-                doorbell::ring_doorbell(assigned),
-                rptr_wb,
-                wptr_wb,
-                1,
-                i as u32 % 4,
-                i as u32 / 4,
-                RingKind::Gfx,
+                RingConfig {
+                    doorbell: doorbell::ring_doorbell(assigned),
+                    rptr_wb,
+                    wptr_wb,
+                    me: 1,
+                    pipe: i as u32 % 4,
+                    queue: i as u32 / 4,
+                    kind: RingKind::Gfx,
+                },
             );
             ring.vm_inv_eng = 4 + i as u32;
             ring.fence_wb = self.wb_slot(dev)?;
@@ -2404,15 +2289,12 @@ impl IpBlock for GfxV10 {
         // Linux gfx_v10_0_cp_resume tests gfx rings first, then compute.
         let scratch =
             dev.regs.base_u32(HwIp::Gc, 0, ridx!(gc::mmSCRATCH_REG0))? + gc::mmSCRATCH_REG0;
-        let mut gfx = core::mem::take(&mut self.gfx_rings);
-        for (i, ring) in gfx.iter_mut().enumerate() {
+        for (i, ring) in self.gfx_rings.iter_mut().enumerate() {
             dev_info!("astra: testing gfx_0.{}.0", i);
             ring.scratch_test(dev, scratch, 1_000_000)?;
             dev_info!("astra: ring test on gfx_0.{}.0 succeeded", i);
         }
-        self.gfx_rings = gfx;
-        let mut compute = core::mem::take(&mut self.compute_rings);
-        for ring in &mut compute {
+        for ring in &mut self.compute_rings {
             dev_info!(
                 "astra: testing comp_{}.{}.{}",
                 ring.me,
@@ -2427,25 +2309,23 @@ impl IpBlock for GfxV10 {
                 ring.queue,
             );
         }
-        self.compute_rings = compute;
         Ok(())
     }
 
     fn submit_user_ibs(
         &mut self,
         dev: &mut Adapter,
-        ip_type: u32,
-        ring_index: u32,
-        vmid: u32,
-        root_pde: u64,
-        context_id: u32,
-        ibs: &[UserIb],
-        user_fence: Option<UserFence>,
+        submission: UserSubmission<'_>,
     ) -> Result<crate::ip::CompletionFence> {
-        if ibs.is_empty() || vmid == 0 || vmid > 15 || root_pde & 1 == 0 {
+        if submission.ibs.is_empty()
+            || submission.vmid == 0
+            || submission.vmid > 15
+            || submission.root_pde & 1 == 0
+        {
             return Err(Error::InvalidArgument);
         }
-        if ibs
+        if submission
+            .ibs
             .iter()
             .any(|ib| ib.flags & crate::uapi::AMDGPU_IB_FLAGS_SECURE != 0)
         {
@@ -2453,34 +2333,20 @@ impl IpBlock for GfxV10 {
             // never execute it as a normal IB.
             return Err(Error::Unsupported);
         }
-        let compute = match ip_type {
+        let compute = match submission.ip_type {
             crate::uapi::AMDGPU_HW_IP_GFX => false,
             crate::uapi::AMDGPU_HW_IP_COMPUTE => true,
             _ => return Err(Error::Unsupported),
         };
-        let mut rings = if compute {
-            core::mem::take(&mut self.compute_rings)
+        let rings = if compute {
+            &mut self.compute_rings
         } else {
-            core::mem::take(&mut self.gfx_rings)
+            &mut self.gfx_rings
         };
-        let result = match rings.get_mut(ring_index as usize) {
-            Some(ring) => Self::submit_ring_ibs(
-                ring,
-                dev,
-                compute,
-                vmid,
-                root_pde,
-                ((vmid as u64) << 32) | context_id as u64,
-                ibs,
-                user_fence,
-            ),
+        let result = match rings.get_mut(submission.ring as usize) {
+            Some(ring) => Self::submit_ring_ibs(ring, dev, compute, submission),
             None => Err(Error::InvalidArgument),
         };
-        if compute {
-            self.compute_rings = rings;
-        } else {
-            self.gfx_rings = rings;
-        }
         let (gpu_address, value) = result?;
         Ok(crate::ip::CompletionFence { gpu_address, value })
     }

@@ -97,6 +97,15 @@ impl HwIp {
         ];
         IPS[index]
     }
+
+    /// Resolves a binary IP-discovery hardware id to the driver's logical
+    /// block, matching Linux `hw_id_map[]`.
+    pub fn from_hardware_id(id: u16) -> Option<Self> {
+        HW_ID_MAP
+            .iter()
+            .find(|(_, hardware_id)| *hardware_id == id)
+            .map(|(ip, _)| *ip)
+    }
 }
 
 /// Full IP version as packed by the discovery table:
@@ -124,11 +133,44 @@ pub struct UserFence {
     pub sequence: u64,
 }
 
+/// Complete scheduler input for one userspace CS job.  Keeping the ring,
+/// VM and fence state together prevents the independent scalar arguments
+/// from drifting out of sync as more IP blocks gain submission support.
+#[derive(Clone, Copy, Debug)]
+pub struct UserSubmission<'a> {
+    pub ip_type: u32,
+    pub ring: u32,
+    pub vmid: u32,
+    pub root_pde: u64,
+    pub context_id: u32,
+    pub ibs: &'a [UserIb],
+    pub user_fence: Option<UserFence>,
+}
+
 /// Hardware completion fence returned by an asynchronous ring submission.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct CompletionFence {
     pub gpu_address: u64,
     pub value: u64,
+}
+
+#[derive(Clone, Copy)]
+pub enum InitStage {
+    Early,
+    Software,
+    Hardware,
+    Late,
+}
+
+impl InitStage {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Early => "early_init",
+            Self::Software => "sw_init",
+            Self::Hardware => "hw_init",
+            Self::Late => "late_init",
+        }
+    }
 }
 
 impl IpVersion {
@@ -179,16 +221,19 @@ pub trait IpBlock: Send {
         Ok(())
     }
 
+    fn init(&mut self, dev: &mut Adapter, stage: InitStage) -> Result<()> {
+        match stage {
+            InitStage::Early => self.early_init(dev),
+            InitStage::Software => self.sw_init(dev),
+            InitStage::Hardware => self.hw_init(dev),
+            InitStage::Late => self.late_init(dev),
+        }
+    }
+
     fn submit_user_ibs(
         &mut self,
         _dev: &mut Adapter,
-        _ip_type: u32,
-        _ring: u32,
-        _vmid: u32,
-        _root_pde: u64,
-        _context_id: u32,
-        _ibs: &[UserIb],
-        _user_fence: Option<UserFence>,
+        _submission: UserSubmission<'_>,
     ) -> Result<CompletionFence> {
         Err(na_std::Error::Unsupported)
     }
@@ -237,10 +282,3 @@ const HW_ID_MAP: &[(HwIp, u16)] = &[
     (HwIp::Pwr, 10),
     (HwIp::Lsdma, 2),
 ];
-
-pub fn hw_ip_for_id(id: u16) -> Option<HwIp> {
-    HW_ID_MAP
-        .iter()
-        .find(|(_, hw_id)| *hw_id == id)
-        .map(|(ip, _)| *ip)
-}

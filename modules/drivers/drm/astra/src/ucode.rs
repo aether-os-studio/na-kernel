@@ -1,10 +1,6 @@
 //! Firmware binary header formats (Linux `amdgpu_ucode.h`): common AMD
 //! firmware headers plus PSP SOS/TA packaging.
 
-// Firmware headers intentionally model the complete upstream ABI, including
-// fields and TA identifiers not needed by the current Navi23 boot path.
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 /// `struct common_firmware_header` (32 bytes).
@@ -46,17 +42,6 @@ impl CommonFirmwareHeader {
         }
         Some(header)
     }
-
-    pub fn payload<'a>(&self, data: &'a [u8]) -> Option<&'a [u8]> {
-        let start = self.ucode_array_offset_bytes as usize;
-        let end = start.checked_add(self.ucode_size_bytes as usize)?;
-        data.get(start..end)
-    }
-}
-
-/// Common firmware header prefix: `fw_version` sits at byte offset 12.
-pub fn fw_version(data: &[u8]) -> Option<u32> {
-    CommonFirmwareHeader::parse(data).map(|header| header.ucode_version)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -66,10 +51,49 @@ pub struct PspBootComponent {
     pub size_bytes: u32,
 }
 
+impl PspBootComponent {
+    fn from_firmware_type(fw_type: u32, offset_bytes: u32, size_bytes: u32) -> Option<Self> {
+        if size_bytes == 0 {
+            return None;
+        }
+        let command = match fw_type {
+            PSP_FW_TYPE_SYS => PSP_BL_LOAD_SYSDRV,
+            PSP_FW_TYPE_KDB => PSP_BL_LOAD_KDB,
+            PSP_FW_TYPE_SPL => PSP_BL_LOAD_SPL,
+            PSP_FW_TYPE_SOC => PSP_BL_LOAD_SOCDRV,
+            PSP_FW_TYPE_INTF => PSP_BL_LOAD_INTFDRV,
+            PSP_FW_TYPE_DBG => PSP_BL_LOAD_DBGDRV,
+            PSP_FW_TYPE_RAS => PSP_BL_LOAD_RASDRV,
+            PSP_FW_TYPE_IPKEYMGR => PSP_BL_LOAD_IPKEYMGRDRV,
+            PSP_FW_TYPE_SPDM => PSP_BL_LOAD_SPDMDRV,
+            _ => return None,
+        };
+        Some(Self {
+            command,
+            offset_bytes,
+            size_bytes,
+        })
+    }
+
+    fn priority(&self) -> u8 {
+        match self.command {
+            PSP_BL_LOAD_KDB => 0,
+            PSP_BL_LOAD_SPL => 1,
+            PSP_BL_LOAD_SYSDRV => 2,
+            PSP_BL_LOAD_SOCDRV => 3,
+            PSP_BL_LOAD_INTFDRV => 4,
+            PSP_BL_LOAD_DBGDRV => 5,
+            PSP_BL_LOAD_RASDRV => 6,
+            PSP_BL_LOAD_IPKEYMGRDRV => 7,
+            PSP_BL_LOAD_SPDMDRV => 8,
+            _ => u8::MAX,
+        }
+    }
+}
+
 /// Parsed SOS package. `sos_offset_bytes` and component offsets are absolute
 /// offsets within the firmware file, after applying `ucode_array_offset`.
 pub struct SosHeader {
-    pub header_size_bytes: u32,
     pub header_version_major: u16,
     pub header_version_minor: u16,
     pub sos_offset_bytes: u32,
@@ -154,14 +178,10 @@ impl SosHeader {
                         if size != 0 {
                             toc = Some((offset, size));
                         }
-                    } else if let Some(command) = boot_command(fw_type) {
-                        if size != 0 {
-                            components.push(PspBootComponent {
-                                command,
-                                offset_bytes: offset,
-                                size_bytes: size,
-                            });
-                        }
+                    } else if let Some(component) =
+                        PspBootComponent::from_firmware_type(fw_type, offset, size)
+                    {
+                        components.push(component);
                     }
                 }
                 sos?
@@ -172,7 +192,7 @@ impl SosHeader {
         if sos_size == 0 || sos_end > data.len() {
             return None;
         }
-        components.sort_by_key(|component| boot_priority(component.command));
+        components.sort_by_key(PspBootComponent::priority);
         for component in &components {
             let end =
                 (component.offset_bytes as usize).checked_add(component.size_bytes as usize)?;
@@ -186,7 +206,6 @@ impl SosHeader {
             return None;
         }
         Some(Self {
-            header_size_bytes: common.header_size_bytes,
             header_version_major: common.header_version_major,
             header_version_minor: common.header_version_minor,
             sos_offset_bytes: sos_offset,
@@ -199,7 +218,6 @@ impl SosHeader {
 }
 
 pub struct TaHeader {
-    pub header_size_bytes: u32,
     pub header_version_major: u16,
     pub header_version_minor: u16,
     pub ta_fw_bin_count: u32,
@@ -261,7 +279,6 @@ impl TaHeader {
             }
         }
         Some(Self {
-            header_size_bytes: common.header_size_bytes,
             header_version_major: common.header_version_major,
             header_version_minor: common.header_version_minor,
             ta_fw_bin_count: descriptors.len() as u32,
@@ -280,11 +297,6 @@ pub struct TaBinDesc {
 
 /// TA firmware types (Linux `enum ta_fw_type` in amdgpu_ucode.h).
 pub const TA_TYPE_ASD: u32 = 1;
-pub const TA_TYPE_RAS: u32 = 3;
-pub const TA_TYPE_HDCP: u32 = 4;
-pub const TA_TYPE_DTM: u32 = 5;
-pub const TA_TYPE_RAP: u32 = 6;
-pub const TA_TYPE_SECUREDISPLAY: u32 = 7;
 
 /// `GFX_CMD_ID_*` (psp_gfx_if.h).
 pub const GFX_CMD_ID_LOAD_TA: u32 = 0x1;
@@ -318,36 +330,6 @@ const PSP_FW_TYPE_DBG: u32 = 9;
 const PSP_FW_TYPE_RAS: u32 = 10;
 const PSP_FW_TYPE_IPKEYMGR: u32 = 11;
 const PSP_FW_TYPE_SPDM: u32 = 12;
-
-fn boot_command(fw_type: u32) -> Option<u32> {
-    Some(match fw_type {
-        PSP_FW_TYPE_SYS => PSP_BL_LOAD_SYSDRV,
-        PSP_FW_TYPE_KDB => PSP_BL_LOAD_KDB,
-        PSP_FW_TYPE_SPL => PSP_BL_LOAD_SPL,
-        PSP_FW_TYPE_SOC => PSP_BL_LOAD_SOCDRV,
-        PSP_FW_TYPE_INTF => PSP_BL_LOAD_INTFDRV,
-        PSP_FW_TYPE_DBG => PSP_BL_LOAD_DBGDRV,
-        PSP_FW_TYPE_RAS => PSP_BL_LOAD_RASDRV,
-        PSP_FW_TYPE_IPKEYMGR => PSP_BL_LOAD_IPKEYMGRDRV,
-        PSP_FW_TYPE_SPDM => PSP_BL_LOAD_SPDMDRV,
-        _ => return None,
-    })
-}
-
-fn boot_priority(command: u32) -> u8 {
-    match command {
-        PSP_BL_LOAD_KDB => 0,
-        PSP_BL_LOAD_SPL => 1,
-        PSP_BL_LOAD_SYSDRV => 2,
-        PSP_BL_LOAD_SOCDRV => 3,
-        PSP_BL_LOAD_INTFDRV => 4,
-        PSP_BL_LOAD_DBGDRV => 5,
-        PSP_BL_LOAD_RASDRV => 6,
-        PSP_BL_LOAD_IPKEYMGRDRV => 7,
-        PSP_BL_LOAD_SPDMDRV => 8,
-        _ => u8::MAX,
-    }
-}
 
 /// PSP command buffer version (PSP_GFX_CMD_BUF_VERSION).
 pub const PSP_GFX_CMD_BUF_VERSION: u32 = 0x1;

@@ -4948,17 +4948,25 @@ ssize_t drm_ioctl(void *data, ssize_t cmd, ssize_t arg, fd_t *fd) {
     void *ioarg = (void *)(uintptr_t)arg;
     void *karg = NULL;
 
+    uint64_t stack_karg[128 / sizeof(uint64_t)];
+
     if (ioctl_size > 0) {
-        karg = malloc(ioctl_size);
-        if (!karg) {
-            return -ENOMEM;
+        if (ioctl_size <= sizeof(stack_karg)) {
+            karg = stack_karg;
+        } else {
+            karg = malloc(ioctl_size);
+            if (!karg) {
+                return -ENOMEM;
+            }
         }
         memset(karg, 0, ioctl_size);
 
         if (ioctl_dir & _IOC_WRITE) {
             if (!arg ||
                 copy_from_user(karg, (void *)(uintptr_t)arg, ioctl_size)) {
-                free(karg);
+                if (karg != stack_karg) {
+                    free(karg);
+                }
                 return -EFAULT;
             }
         }
@@ -4968,7 +4976,7 @@ ssize_t drm_ioctl(void *data, ssize_t cmd, ssize_t arg, fd_t *fd) {
 
     ssize_t lease_ret = drm_ioctl_check_lease(drm_file, ioctl_cmd, ioarg);
     if (lease_ret < 0) {
-        if (karg) {
+        if (karg && karg != stack_karg) {
             free(karg);
         }
         return lease_ret;
@@ -5178,7 +5186,7 @@ ssize_t drm_ioctl(void *data, ssize_t cmd, ssize_t arg, fd_t *fd) {
         }
     }
 
-    if (karg) {
+    if (karg && karg != stack_karg) {
         free(karg);
     }
 

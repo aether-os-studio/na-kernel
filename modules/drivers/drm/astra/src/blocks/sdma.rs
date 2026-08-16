@@ -16,7 +16,7 @@ use crate::regs::nbio2_3 as nbio23;
 use crate::regs::nbio4_3_0 as nbio43;
 use crate::regs::set_field;
 use crate::ridx;
-use crate::ring::{Ring, RingKind};
+use crate::ring::{Ring, RingConfig, RingKind};
 use crate::{dev_err, dev_info};
 
 /// Ring size in dwords (sdma_v5_2_sw_init).
@@ -51,11 +51,10 @@ const SDMA_GCR_GLI_INV: u32 = 1;
 
 pub struct SdmaV52 {
     _version: IpVersion,
-    pub instances: u32,
+    instances: u32,
     rings: Vec<Ring>,
     /// Register distance between SDMA instances.
     inst_distance: u32,
-    logged_first_vm_update: bool,
 }
 
 impl SdmaV52 {
@@ -65,7 +64,6 @@ impl SdmaV52 {
             instances,
             rings: Vec::new(),
             inst_distance: 0,
-            logged_first_vm_update: false,
         }
     }
 
@@ -81,7 +79,7 @@ impl SdmaV52 {
         instance: u32,
         doorbell_index: u32,
     ) -> Result<u32> {
-        if super::uses_nbio_v2_3(dev) {
+        if dev.uses_nbio_v2_3() {
             let reg = match instance {
                 0 => nbio23::mmBIF_SDMA0_DOORBELL_RANGE,
                 1 => nbio23::mmBIF_SDMA1_DOORBELL_RANGE,
@@ -557,7 +555,7 @@ impl SdmaV52 {
     /// Linux `sdma_v5_2_ring_emit_hdp_flush`, using the NBIO function table
     /// selected for the discovered ASIC.
     fn emit_hdp_flush(ring: &mut Ring, dev: &Adapter, instance: u32) -> Result<()> {
-        let (done, request, sdma0_mask) = if super::uses_nbio_v2_3(dev) {
+        let (done, request, sdma0_mask) = if dev.uses_nbio_v2_3() {
             (
                 Self::full_reg(
                     dev,
@@ -636,126 +634,114 @@ impl SdmaV52 {
             10
         };
         let ib_dw = command_dw.next_multiple_of(8);
-        let mut ib = dev.mem.alloc_gart_aligned(&mut dev.regs, ib_dw * 4, 32)?;
-        let cpu = ib.cpu.as_mut().ok_or(Error::NoDevice)?;
-        {
-            let bytes = cpu.as_mut_slice();
-            let mut put = |index: usize, value: u32| -> Result<()> {
-                let at = index.checked_mul(4).ok_or(Error::Range)?;
-                let dst = bytes.get_mut(at..at + 4).ok_or(Error::Range)?;
-                dst.copy_from_slice(&value.to_le_bytes());
-                Ok(())
-            };
-            let mut at = 0usize;
-            if count < 3 {
-                put(at, SDMA_PKT_WRITE_HEADER)?;
-                at += 1;
-                put(at, dst as u32)?;
-                at += 1;
-                put(at, (dst >> 32) as u32)?;
-                at += 1;
-                put(at, count * 2 - 1)?;
-                at += 1;
-                let mut value = addr | flags;
-                for _ in 0..count {
-                    put(at, value as u32)?;
-                    put(at + 1, (value >> 32) as u32)?;
-                    at += 2;
-                    value = value.checked_add(incr as u64).ok_or(Error::Range)?;
+        let result = {
+            let mut ib = dev.mem.alloc_gart_aligned(&mut dev.regs, ib_dw * 4, 32)?;
+            let cpu = ib.cpu.as_mut().ok_or(Error::NoDevice)?;
+            {
+                let bytes = cpu.as_mut_slice();
+                let mut put = |index: usize, value: u32| -> Result<()> {
+                    let at = index.checked_mul(4).ok_or(Error::Range)?;
+                    let dst = bytes.get_mut(at..at + 4).ok_or(Error::Range)?;
+                    dst.copy_from_slice(&value.to_le_bytes());
+                    Ok(())
+                };
+                let mut at = 0usize;
+                if count < 3 {
+                    put(at, SDMA_PKT_WRITE_HEADER)?;
+                    at += 1;
+                    put(at, dst as u32)?;
+                    at += 1;
+                    put(at, (dst >> 32) as u32)?;
+                    at += 1;
+                    put(at, count * 2 - 1)?;
+                    at += 1;
+                    let mut value = addr | flags;
+                    for _ in 0..count {
+                        put(at, value as u32)?;
+                        put(at + 1, (value >> 32) as u32)?;
+                        at += 2;
+                        value = value.checked_add(incr as u64).ok_or(Error::Range)?;
+                    }
+                } else {
+                    put(at, SDMA_OP_PTEPDE)?;
+                    put(at + 1, dst as u32)?;
+                    put(at + 2, (dst >> 32) as u32)?;
+                    put(at + 3, flags as u32)?;
+                    put(at + 4, (flags >> 32) as u32)?;
+                    put(at + 5, addr as u32)?;
+                    put(at + 6, (addr >> 32) as u32)?;
+                    put(at + 7, incr)?;
+                    put(at + 8, 0)?;
+                    put(at + 9, count - 1)?;
                 }
-            } else {
-                put(at, SDMA_OP_PTEPDE)?;
-                put(at + 1, dst as u32)?;
-                put(at + 2, (dst >> 32) as u32)?;
-                put(at + 3, flags as u32)?;
-                put(at + 4, (flags >> 32) as u32)?;
-                put(at + 5, addr as u32)?;
-                put(at + 6, (addr >> 32) as u32)?;
-                put(at + 7, incr)?;
-                put(at + 8, 0)?;
-                put(at + 9, count - 1)?;
             }
-        }
-        cpu.sync_for_device();
-        super::flush_pending_gart(dev)?;
+            cpu.sync_for_device();
+            dev.flush_gart()?;
 
-        let result = (|| -> Result<()> {
-            let ring = &mut self.rings[0];
-            if ring.fence_wb == 0 {
-                return Err(Error::NoDevice);
-            }
-            let sequence = ring.fence_seq.checked_add(1).ok_or(Error::Range)?;
-            dev.wb
-                .as_mut()
-                .ok_or(Error::NoDevice)?
-                .write_u64(ring.fence_wb, 0)?;
+            (|| -> Result<()> {
+                let ring = &mut self.rings[0];
+                if ring.fence_wb == 0 {
+                    return Err(Error::NoDevice);
+                }
+                let sequence = ring.fence_seq.checked_add(1).ok_or(Error::Range)?;
+                dev.wb
+                    .as_mut()
+                    .ok_or(Error::NoDevice)?
+                    .write_u64(ring.fence_wb, 0)?;
 
-            if ring.current_ctx != Some(0) {
-                Self::emit_pipeline_sync(ring)?;
-            }
-            Self::emit_mem_sync(ring)?;
-            Self::emit_hdp_flush(ring, dev, 0)?;
-            for _ in 0..((2u32.wrapping_sub(ring.wptr)) & 7) {
+                if ring.current_ctx != Some(0) {
+                    Self::emit_pipeline_sync(ring)?;
+                }
+                Self::emit_mem_sync(ring)?;
+                Self::emit_hdp_flush(ring, dev, 0)?;
+                for _ in 0..((2u32.wrapping_sub(ring.wptr)) & 7) {
+                    ring.write(0)?;
+                }
+                ring.write(SDMA_OP_INDIRECT)?; // VMID 0, PRIV 0
+                ring.write(ib.gpu_addr as u32 & 0xffff_ffe0)?;
+                ring.write((ib.gpu_addr >> 32) as u32)?;
+                ring.write(ib_dw as u32)?;
+                ring.write(0)?; // VMID0 CSA address
                 ring.write(0)?;
-            }
-            ring.write(SDMA_OP_INDIRECT)?; // VMID 0, PRIV 0
-            ring.write(ib.gpu_addr as u32 & 0xffff_ffe0)?;
-            ring.write((ib.gpu_addr >> 32) as u32)?;
-            ring.write(ib_dw as u32)?;
-            ring.write(0)?; // VMID0 CSA address
-            ring.write(0)?;
 
-            Self::emit_hdp_invalidate(ring, dev)?;
-            ring.write(SDMA_OP_FENCE | SDMA_FENCE_MTYPE_UC)?;
-            ring.write(ring.fence_wb as u32)?;
-            ring.write((ring.fence_wb >> 32) as u32)?;
-            ring.write(sequence as u32)?;
-            ring.commit(dev)?;
-            ring.fence_seq = sequence;
-            ring.current_ctx = Some(0);
+                Self::emit_hdp_invalidate(ring, dev)?;
+                ring.write(SDMA_OP_FENCE | SDMA_FENCE_MTYPE_UC)?;
+                ring.write(ring.fence_wb as u32)?;
+                ring.write((ring.fence_wb >> 32) as u32)?;
+                ring.write(sequence as u32)?;
+                ring.commit(dev)?;
+                ring.fence_seq = sequence;
+                ring.current_ctx = Some(0);
 
-            if !self.logged_first_vm_update {
-                dev_info!(
-                    "astra: first Linux SDMA VM update: ring=sdma0 gfx queue, IB={:#018x} dst={:#018x} count={} op={} fence={:#018x}:{}",
-                    ib.gpu_addr,
-                    dst,
-                    count,
-                    if count < 3 { "WRITE" } else { "PTEPDE" },
-                    ring.fence_wb,
-                    sequence,
-                );
-                self.logged_first_vm_update = true;
-            }
-
-            for _ in 0..1_000_000 {
-                if dev
+                for _ in 0..1_000_000 {
+                    if dev
+                        .wb
+                        .as_mut()
+                        .ok_or(Error::NoDevice)?
+                        .read_u64(ring.fence_wb)? as u32
+                        == sequence as u32
+                    {
+                        return Ok(());
+                    }
+                    time::delay(Duration::from_micros(1));
+                }
+                let observed = dev
                     .wb
                     .as_mut()
                     .ok_or(Error::NoDevice)?
-                    .read_u64(ring.fence_wb)? as u32
-                    == sequence as u32
-                {
-                    return Ok(());
-                }
-                time::delay(Duration::from_micros(1));
-            }
-            let observed = dev
-                .wb
-                .as_mut()
-                .ok_or(Error::NoDevice)?
-                .read_u64(ring.fence_wb)?;
-            dev_err!(
-                "astra: SDMA VM update timeout dst={:#018x} count={} fence={} observed={}",
-                dst,
-                count,
-                sequence,
-                observed,
-            );
-            Err(Error::Io)
-        })();
+                    .read_u64(ring.fence_wb)?;
+                dev_err!(
+                    "astra: SDMA VM update timeout dst={:#018x} count={} fence={} observed={}",
+                    dst,
+                    count,
+                    sequence,
+                    observed,
+                );
+                Err(Error::Io)
+            })()
+        };
 
-        drop(ib);
-        let retire = super::flush_pending_gart(dev);
+        let retire = dev.flush_gart();
         result.and(retire)
     }
 }
@@ -784,13 +770,15 @@ impl IpBlock for SdmaV52 {
             let wptr_wb = dev.wb.as_mut().ok_or(Error::NoDevice)?.get()?;
             let mut ring = Ring::new(
                 bo,
-                doorbell::ring_doorbell(sdma_doors[instance as usize]),
-                rptr_wb,
-                wptr_wb,
-                instance,
-                0,
-                0,
-                RingKind::Sdma,
+                RingConfig {
+                    doorbell: doorbell::ring_doorbell(sdma_doors[instance as usize]),
+                    rptr_wb,
+                    wptr_wb,
+                    me: instance,
+                    pipe: 0,
+                    queue: 0,
+                    kind: RingKind::Sdma,
+                },
             );
             ring.fence_wb = dev.wb.as_mut().ok_or(Error::NoDevice)?.get()?;
             self.rings.push(ring);

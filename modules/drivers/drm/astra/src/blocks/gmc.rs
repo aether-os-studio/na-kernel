@@ -44,6 +44,16 @@ const ONE_MIB: u64 = 1 << 20;
 const BLOCK_SIZE: u32 = 9;
 const NUM_LEVEL: u32 = 3;
 
+#[derive(Clone, Copy)]
+struct InvalidateLayout {
+    ip: HwIp,
+    semaphore: u32,
+    request: u32,
+    acknowledge: u32,
+    engine_distance: u32,
+    use_semaphore: bool,
+}
+
 pub struct GmcBlock {
     _version: IpVersion,
     _mmhub_version: IpVersion,
@@ -195,8 +205,7 @@ impl GmcBlock {
     /// Linux gmc_v10_0_gart_init + wb/mem_scratch equivalents.
     fn gart_init(&mut self, dev: &mut Adapter) -> Result<()> {
         let gmc = dev.gmc;
-        let mut allocator = core::mem::take(&mut dev.mem);
-        allocator.init_ranges(
+        dev.mem.init_ranges(
             gmc.gart_start,
             gmc.gart_end,
             gmc.aper_size.min(gmc.mc_vram_size),
@@ -215,7 +224,7 @@ impl GmcBlock {
             .mc_vram_size
             .checked_sub(fw_reserved_size)
             .ok_or(Error::Range)?;
-        allocator.reserve_vram(fw_reserved_start, fw_reserved_size)?;
+        dev.mem.reserve_vram(fw_reserved_start, fw_reserved_size)?;
         dev_info!(
             "astra: firmware VRAM reservation: {} bytes at offset {:#x}",
             fw_reserved_size,
@@ -235,7 +244,7 @@ impl GmcBlock {
                 .checked_add(ONE_MIB - 1)
                 .map(|value| value & !(ONE_MIB - 1))
                 .ok_or(Error::Range)?;
-            allocator.reserve_vram(c2p_offset, MEM_TRAIN_DATA_SIZE)?;
+            dev.mem.reserve_vram(c2p_offset, MEM_TRAIN_DATA_SIZE)?;
             dev_info!(
                 "astra: memory-training VRAM reservation: {} bytes at offset {:#x}",
                 MEM_TRAIN_DATA_SIZE,
@@ -245,8 +254,7 @@ impl GmcBlock {
 
         // Zero dummy page in system memory (amdgpu_gart_dummy_page_init).
         let dummy_page = DmaBuffer::zeroed(GPU_PAGE_SIZE)?;
-        allocator.init_table(&mut dev.regs, dummy_page)?;
-        dev.mem = allocator;
+        dev.mem.init_table(&mut dev.regs, dummy_page)?;
 
         dev.gmc.dummy_page_addr = dev.mem.dummy_page_addr;
 
@@ -1265,55 +1273,40 @@ impl GmcBlock {
 
     /// Linux gmc_v10_0_flush_gpu_tlb (legacy register path).
     fn flush_gpu_tlb(&mut self, dev: &mut Adapter, mmhub: bool, vmid: u32) -> Result<()> {
-        let (ip, sem, req, ack, eng_distance, use_semaphore) = if mmhub {
-            (
-                HwIp::Mmhub,
-                self.mm_inv_eng0_sem,
-                self.mm_inv_eng0_req,
-                self.mm_inv_eng0_ack,
-                self.mm_eng_distance,
-                true,
-            )
+        let layout = if mmhub {
+            InvalidateLayout {
+                ip: HwIp::Mmhub,
+                semaphore: self.mm_inv_eng0_sem,
+                request: self.mm_inv_eng0_req,
+                acknowledge: self.mm_inv_eng0_ack,
+                engine_distance: self.mm_eng_distance,
+                use_semaphore: true,
+            }
         } else {
-            (
-                HwIp::Gc,
-                self.vm_inv_eng0_sem,
-                self.vm_inv_eng0_req,
-                self.vm_inv_eng0_ack,
-                self.eng_distance,
-                false,
-            )
+            InvalidateLayout {
+                ip: HwIp::Gc,
+                semaphore: self.vm_inv_eng0_sem,
+                request: self.vm_inv_eng0_req,
+                acknowledge: self.vm_inv_eng0_ack,
+                engine_distance: self.eng_distance,
+                use_semaphore: false,
+            }
         };
-        Self::flush_gpu_tlb_layout(
-            dev,
-            ip,
-            sem,
-            req,
-            ack,
-            eng_distance,
-            use_semaphore,
-            vmid,
-            false,
-        )
+        Self::flush_gpu_tlb_layout(dev, layout, vmid, false)
     }
 
     fn flush_gpu_tlb_layout(
         dev: &mut Adapter,
-        ip: HwIp,
-        sem: u32,
-        req: u32,
-        ack: u32,
-        eng_distance: u32,
-        use_semaphore: bool,
+        layout: InvalidateLayout,
         vmid: u32,
         strict: bool,
     ) -> Result<()> {
         // Flush HDP first (amdgpu_device_flush_hdp).
         Self::flush_hdp(dev)?;
 
-        let sem = sem + eng_distance * INV_ENG;
-        let req = req + eng_distance * INV_ENG;
-        let ack = ack + eng_distance * INV_ENG;
+        let sem = layout.semaphore + layout.engine_distance * INV_ENG;
+        let req = layout.request + layout.engine_distance * INV_ENG;
+        let ack = layout.acknowledge + layout.engine_distance * INV_ENG;
 
         // Invalidate request (hub get_invalidate_req(vmid, 0)).
         let mut inv_req = 1u32 << vmid;
@@ -1327,10 +1320,10 @@ impl GmcBlock {
             inv_req |= 1 << shift;
         }
 
-        if use_semaphore {
+        if layout.use_semaphore {
             let mut acquired = false;
             for _ in 0..10_000 {
-                if dev.regs.read_ip(ip, 0, sem, 0)? & 0x1 != 0 {
+                if dev.regs.read_ip(layout.ip, 0, sem, 0)? & 0x1 != 0 {
                     acquired = true;
                     break;
                 }
@@ -1344,11 +1337,11 @@ impl GmcBlock {
             }
         }
 
-        dev.regs.write_ip(ip, 0, req, 0, inv_req)?;
+        dev.regs.write_ip(layout.ip, 0, req, 0, inv_req)?;
 
         let mut done = false;
         for _ in 0..10_000 {
-            if dev.regs.read_ip(ip, 0, ack, 0)? & (1 << vmid) != 0 {
+            if dev.regs.read_ip(layout.ip, 0, ack, 0)? & (1 << vmid) != 0 {
                 done = true;
                 break;
             }
@@ -1357,15 +1350,15 @@ impl GmcBlock {
         if !done {
             dev_info!("astra: timeout waiting for VM flush");
             if strict {
-                if use_semaphore {
-                    dev.regs.write_ip(ip, 0, sem, 0, 0)?;
+                if layout.use_semaphore {
+                    dev.regs.write_ip(layout.ip, 0, sem, 0, 0)?;
                 }
                 return Err(Error::Io);
             }
         }
 
-        if use_semaphore {
-            dev.regs.write_ip(ip, 0, sem, 0, 0)?;
+        if layout.use_semaphore {
+            dev.regs.write_ip(layout.ip, 0, sem, 0, 0)?;
         }
         Ok(())
     }
@@ -1387,43 +1380,49 @@ impl GmcBlock {
     }
 }
 
-/// Flushes PTE writes made after GART enable, matching the TLB sync done by
-/// Linux when a GTT BO is bound. Calls are cheap when no PTE changed.
-pub(crate) fn flush_pending_gart(dev: &mut Adapter) -> Result<()> {
-    // BO Drop only transfers ownership to the allocator retire queue. Apply
-    // the PTE invalidations while register access is available, then retain
-    // DMA backing until both hubs have acknowledged the invalidate below.
-    dev.mem.prepare_retirements(&mut dev.regs)?;
-    if !dev.mem.needs_gart_flush() {
-        dev.mem.complete_retirements();
-        return Ok(());
-    }
+impl Adapter {
+    /// Flushes PTE writes made after GART enable, matching the TLB sync done
+    /// by Linux when a GTT BO is bound. Calls are cheap when no PTE changed.
+    pub(crate) fn flush_gart(&mut self) -> Result<()> {
+        // BO Drop only transfers ownership to the allocator retire queue.
+        // Apply invalidations while register access is available, retaining
+        // DMA backing until both hubs acknowledge them below.
+        self.mem.prepare_retirements(&mut self.regs)?;
+        if !self.mem.needs_gart_flush() {
+            self.mem.complete_retirements();
+            return Ok(());
+        }
 
-    GmcBlock::flush_gpu_tlb_layout(
-        dev,
-        HwIp::Mmhub,
-        mm::mmMMVM_INVALIDATE_ENG0_SEM,
-        mm::mmMMVM_INVALIDATE_ENG0_REQ,
-        mm::mmMMVM_INVALIDATE_ENG0_ACK,
-        mm::mmMMVM_INVALIDATE_ENG1_REQ - mm::mmMMVM_INVALIDATE_ENG0_REQ,
-        true,
-        0,
-        true,
-    )?;
-    GmcBlock::flush_gpu_tlb_layout(
-        dev,
-        HwIp::Gc,
-        gc::mmGCVM_INVALIDATE_ENG0_SEM,
-        gc::mmGCVM_INVALIDATE_ENG0_REQ,
-        gc::mmGCVM_INVALIDATE_ENG0_ACK,
-        gc::mmGCVM_INVALIDATE_ENG1_REQ - gc::mmGCVM_INVALIDATE_ENG0_REQ,
-        false,
-        0,
-        true,
-    )?;
-    dev.mem.mark_gart_flushed();
-    dev.mem.complete_retirements();
-    Ok(())
+        GmcBlock::flush_gpu_tlb_layout(
+            self,
+            InvalidateLayout {
+                ip: HwIp::Mmhub,
+                semaphore: mm::mmMMVM_INVALIDATE_ENG0_SEM,
+                request: mm::mmMMVM_INVALIDATE_ENG0_REQ,
+                acknowledge: mm::mmMMVM_INVALIDATE_ENG0_ACK,
+                engine_distance: mm::mmMMVM_INVALIDATE_ENG1_REQ - mm::mmMMVM_INVALIDATE_ENG0_REQ,
+                use_semaphore: true,
+            },
+            0,
+            true,
+        )?;
+        GmcBlock::flush_gpu_tlb_layout(
+            self,
+            InvalidateLayout {
+                ip: HwIp::Gc,
+                semaphore: gc::mmGCVM_INVALIDATE_ENG0_SEM,
+                request: gc::mmGCVM_INVALIDATE_ENG0_REQ,
+                acknowledge: gc::mmGCVM_INVALIDATE_ENG0_ACK,
+                engine_distance: gc::mmGCVM_INVALIDATE_ENG1_REQ - gc::mmGCVM_INVALIDATE_ENG0_REQ,
+                use_semaphore: false,
+            },
+            0,
+            true,
+        )?;
+        self.mem.mark_gart_flushed();
+        self.mem.complete_retirements();
+        Ok(())
+    }
 }
 
 impl IpBlock for GmcBlock {
@@ -1559,7 +1558,7 @@ impl IpBlock for GmcBlock {
         // this GTT BO updates the live GART, so perform the same TLB sync.
         let wb_bo = dev.mem.alloc_gart(&mut dev.regs, GPU_PAGE_SIZE)?;
         dev.wb = Some(crate::mem::Wb::new(wb_bo));
-        flush_pending_gart(dev)?;
+        dev.flush_gart()?;
         Ok(())
     }
 }

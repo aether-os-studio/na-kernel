@@ -14,7 +14,7 @@ use crate::regs::nbio2_3 as nbio23;
 use crate::regs::nbio4_3_0 as nbio;
 use crate::regs::set_field;
 use crate::regs::vcn3_0_0 as vcn;
-use crate::ring::{Ring, RingKind};
+use crate::ring::{Ring, RingConfig, RingKind};
 
 /// VCN ring size in dwords (vcn_v3_0_sw_init).
 const VCN_RING_DWORDS: usize = 512;
@@ -75,7 +75,7 @@ impl VcnV30 {
     fn mc_resume(&mut self, dev: &mut Adapter, tmr_addr: u64) -> Result<()> {
         let fw_addr = self.fw_bo.as_ref().ok_or(Error::NoDevice)?.gpu_addr;
         let shared_addr = self.fw_shared.as_ref().ok_or(Error::NoDevice)?.gpu_addr;
-        let size = tmr_size(dev)?;
+        let size = Self::tmr_size(dev)?;
 
         // Window 0: firmware (PSP TMR).
         dev.regs.write_ip(
@@ -390,7 +390,7 @@ impl VcnV30 {
         let ring = self.dec_ring.as_mut().ok_or(Error::NoDevice)?;
         ring.reset();
         ring.write(VCN_DEC_CMD_PACKET_START)?;
-        ring.write(((context_id - PACKET0_REGISTER_OFFSET) & 0xffff) | (0 << 30))?;
+        ring.write((context_id - PACKET0_REGISTER_OFFSET) & 0xffff)?;
         ring.write(0xDEAD_BEEF)?;
         ring.commit(dev)?;
         for _ in 0..1_000_000 {
@@ -401,15 +401,11 @@ impl VcnV30 {
         }
         Err(Error::Io)
     }
-}
 
-fn tmr_size(dev: &Adapter) -> Result<u32> {
-    let fw = dev
-        .fw
-        .iter()
-        .find(|fw| fw.id == UcodeId::Vcn)
-        .ok_or(Error::NoDevice)?;
-    Ok((fw.size as u32).next_multiple_of(4096) + 4)
+    fn tmr_size(dev: &Adapter) -> Result<u32> {
+        let firmware = dev.firmware(UcodeId::Vcn).ok_or(Error::NoDevice)?;
+        Ok((firmware.size as u32).next_multiple_of(4096) + 4)
+    }
 }
 
 impl IpBlock for VcnV30 {
@@ -424,10 +420,8 @@ impl IpBlock for VcnV30 {
     /// Linux vcn_v3_0_sw_init: fw/stack/context BO, shared BO, rings.
     fn sw_init(&mut self, dev: &mut Adapter) -> Result<()> {
         let fw_size = dev
-            .fw
-            .iter()
-            .find(|fw| fw.id == UcodeId::Vcn)
-            .map(|fw| fw.size)
+            .firmware(UcodeId::Vcn)
+            .map(|firmware| firmware.size)
             .unwrap_or(0);
         let total = fw_size + VCN_STACK_SIZE as usize + VCN_CONTEXT_SIZE as usize;
         self.fw_bo = Some(dev.mem.alloc_gart(&mut dev.regs, total)?);
@@ -439,13 +433,15 @@ impl IpBlock for VcnV30 {
             let wptr_wb = dev.wb.as_mut().ok_or(Error::NoDevice)?.get()?;
             self.dec_ring = Some(Ring::new(
                 bo,
-                doorbell::ring_doorbell(doorbell::DOORBELL_VCN_0_1),
-                rptr_wb,
-                wptr_wb,
-                0,
-                0,
-                0,
-                RingKind::Vcn { align_mask: 0x3f },
+                RingConfig {
+                    doorbell: doorbell::ring_doorbell(doorbell::DOORBELL_VCN_0_1),
+                    rptr_wb,
+                    wptr_wb,
+                    me: 0,
+                    pipe: 0,
+                    queue: 0,
+                    kind: RingKind::Vcn { align_mask: 0x3f },
+                },
             ));
             for enc in 0..2 {
                 let bo = dev.mem.alloc_gart(&mut dev.regs, VCN_RING_DWORDS * 4)?;
@@ -453,13 +449,15 @@ impl IpBlock for VcnV30 {
                 let wptr_wb = dev.wb.as_mut().ok_or(Error::NoDevice)?.get()?;
                 self.enc_rings.push(Ring::new(
                     bo,
-                    doorbell::ring_doorbell(doorbell::DOORBELL_VCN_0_1) + 2 + enc,
-                    rptr_wb,
-                    wptr_wb,
-                    0,
-                    0,
-                    0,
-                    RingKind::Vcn { align_mask: 0x3f },
+                    RingConfig {
+                        doorbell: doorbell::ring_doorbell(doorbell::DOORBELL_VCN_0_1) + 2 + enc,
+                        rptr_wb,
+                        wptr_wb,
+                        me: 0,
+                        pipe: 0,
+                        queue: 0,
+                        kind: RingKind::Vcn { align_mask: 0x3f },
+                    },
                 ));
             }
         }
@@ -469,7 +467,7 @@ impl IpBlock for VcnV30 {
     /// Linux vcn_v3_0_hw_init: doorbell range, start, ring tests.
     fn hw_init(&mut self, dev: &mut Adapter) -> Result<()> {
         let doorbell_index = doorbell::ring_doorbell(doorbell::DOORBELL_VCN_0_1);
-        if super::uses_nbio_v2_3(dev) {
+        if dev.uses_nbio_v2_3() {
             // Linux nbio_v2_3_vcn_doorbell_range, instance 0.
             let value = dev.regs.read_ip(
                 HwIp::Nbio,
@@ -533,9 +531,7 @@ impl IpBlock for VcnV30 {
 
         // PSP TMR address of the VCN firmware (LOAD_IP_FW response).
         let tmr_addr = dev
-            .fw
-            .iter()
-            .find(|fw| fw.id == UcodeId::Vcn)
+            .firmware(UcodeId::Vcn)
             .and_then(|fw| fw.tmr_addr)
             .ok_or(Error::NoDevice)?;
 
@@ -566,7 +562,7 @@ impl JpegV30 {
         let ring = self.ring.as_mut().ok_or(Error::NoDevice)?;
         ring.reset();
         ring.write(VCN_DEC_CMD_PACKET_START)?;
-        ring.write(((context_id - PACKET0_REGISTER_OFFSET) & 0xffff) | (0 << 30))?;
+        ring.write((context_id - PACKET0_REGISTER_OFFSET) & 0xffff)?;
         ring.write(0xDEAD_BEEF)?;
         ring.commit(dev)?;
         for _ in 0..1_000_000 {
@@ -595,13 +591,15 @@ impl IpBlock for JpegV30 {
         let wptr_wb = dev.wb.as_mut().ok_or(Error::NoDevice)?.get()?;
         self.ring = Some(Ring::new(
             bo,
-            doorbell::ring_doorbell(doorbell::DOORBELL_VCN_0_1) + 1,
-            rptr_wb,
-            wptr_wb,
-            0,
-            0,
-            0,
-            RingKind::Vcn { align_mask: 0x0f },
+            RingConfig {
+                doorbell: doorbell::ring_doorbell(doorbell::DOORBELL_VCN_0_1) + 1,
+                rptr_wb,
+                wptr_wb,
+                me: 0,
+                pipe: 0,
+                queue: 0,
+                kind: RingKind::Vcn { align_mask: 0x0f },
+            },
         ));
         Ok(())
     }

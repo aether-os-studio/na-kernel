@@ -20,19 +20,24 @@ mod ring;
 mod uapi;
 mod ucode;
 
-use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use na_std::pci::{self, DriverBuilder, Probe};
+use na_std::sync::SpinLock;
 use na_std::{Result, module_entry};
 
-use device::Adapter;
+use device::Gpu;
 
 /// AMD vendor id.
 const PCI_VENDOR_AMD: u16 = 0x1002;
 
-struct Driver;
+struct Driver {
+    devices: SpinLock<Vec<na_std::drm::OwnedDevice<display::DisplayDevice>>>,
+}
 
-static DRIVER: Driver = Driver;
+static DRIVER: Driver = Driver {
+    devices: SpinLock::new(Vec::new()),
+};
 
 impl pci::Driver for Driver {
     fn matches(&self, info: &pci::DeviceInfo) -> bool {
@@ -41,9 +46,12 @@ impl pci::Driver for Driver {
     }
 
     fn probe(&self, device: pci::Device<'_>) -> Result<Probe> {
-        let adapter = Box::leak(Adapter::probe(device)?);
-        adapter.init()?;
-        display::register(adapter)?;
+        let registered = display::DisplayDevice::register(Gpu::probe(device)?)?;
+        let mut devices = self.devices.lock();
+        devices
+            .try_reserve(1)
+            .map_err(|_| na_std::Error::OutOfMemory)?;
+        devices.push(registered);
         Ok(Probe::Claimed)
     }
 }

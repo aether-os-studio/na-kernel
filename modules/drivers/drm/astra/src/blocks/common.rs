@@ -74,10 +74,10 @@ impl IpBlock for CommonBlock {
         // SMN access (amdgpu_reg_access.c indirect_rreg/wreg).
         dev.regs.set_rsmu_window(
             dev.regs
-                .base_u32(HwIp::Nbio, 0, NBIO_BASE_RSMU as usize)?
+                .base_u32(HwIp::Nbio, 0, NBIO_BASE_RSMU)?
                 .wrapping_add(nbio::regBIF_BX_PF0_RSMU_INDEX),
             dev.regs
-                .base_u32(HwIp::Nbio, 0, NBIO_BASE_RSMU as usize)?
+                .base_u32(HwIp::Nbio, 0, NBIO_BASE_RSMU)?
                 .wrapping_add(nbio::regBIF_BX_PF0_RSMU_DATA),
         );
         Ok(())

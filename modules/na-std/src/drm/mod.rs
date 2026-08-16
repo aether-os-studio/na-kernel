@@ -4,7 +4,8 @@ mod modeset;
 mod resources;
 
 pub use device::{
-    Device, DeviceBuilder, Driver, DriverInfo, FileId, Ioctl, MmapRequest, PrimeBuffer,
+    Device, DeviceBuilder, Driver, DriverInfo, FileId, Ioctl, MmapRequest, OwnedDevice,
+    OwnedDeviceBuilder, PrimeBuffer,
 };
 pub use modeset::{
     AtomicCommit, AtomicProperty, Clip, CrtcUpdate, CursorUpdate, DisplayInfo, DumbBuffer,

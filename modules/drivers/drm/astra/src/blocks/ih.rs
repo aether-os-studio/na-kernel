@@ -1,7 +1,5 @@
 //! IH (interrupt handler) IP block (Linux `ih_v6_0.c`).
 
-use alloc::boxed::Box;
-
 use na_std::pci::MsiIrq;
 use na_std::{Error, Result};
 
@@ -9,7 +7,7 @@ use crate::dev_info;
 use crate::device::Adapter;
 use crate::doorbell;
 use crate::ip::{HwIp, IpBlock, IpVersion};
-use crate::irq::IhHandler;
+use crate::irq::{IhConfig, IhHandler};
 use crate::mem::Bo;
 use crate::regs::nbio2_3 as nbio23;
 use crate::regs::nbio4_3_0 as nbio;
@@ -231,9 +229,9 @@ impl IhV6 {
     }
 
     fn handler_wb_gpu_addr(&self, dev: &Adapter) -> u64 {
-        dev.ih_handler
+        dev.msi
             .as_ref()
-            .map(|h| h.wb_gpu_addr())
+            .map(|irq| irq.callback().wb_gpu_addr())
             .unwrap_or(0)
     }
 
@@ -323,7 +321,7 @@ impl IhV6 {
         self.enable_ring(dev, false)?;
         self.enable_ring(dev, true)?;
 
-        if super::uses_nbio_v2_3(dev) {
+        if dev.uses_nbio_v2_3() {
             // Linux nbio_v2_3_ih_doorbell_range.
             let value = dev.regs.read_ip(
                 HwIp::Nbio,
@@ -525,26 +523,24 @@ impl IpBlock for IhV6 {
 
         // Dedicated writeback buffer + IRQ handler for the MSI callback.
         let wb_bo = dev.mem.alloc_gart(&mut dev.regs, 4096)?;
-        let device = dev.pci.as_ref().ok_or(Error::NoDevice)?.as_device();
-        let bar5 = device.bar(5).and_then(map_bar_range)?.map_mmio()?;
-        let bar2 = device.bar(2).and_then(map_bar_range)?.map_mmio()?;
+        let device = dev.pci.as_device();
+        let bar5 = device.bar(5).and_then(Self::map_bar_range)?.map_mmio()?;
+        let bar2 = device.bar(2).and_then(Self::map_bar_range)?.map_mmio()?;
         let oss_base = dev.regs.base_u32(HwIp::OssSys, 0, 0)?;
-        let handler = IhHandler::new(
+        let handler = IhHandler::new(IhConfig {
             bar5,
             bar2,
-            wb_bo,
-            oss_base + self.ih.rb_rptr,
-            oss_base + self.ih1.rb_wptr,
-            oss_base + self.ih1.rb_rptr,
-            self.doorbell,
-            self.doorbell1,
-            (IH_RING_SIZE / 4) as u32,
-        );
-        let handler = Box::leak(Box::new(handler));
+            wb: wb_bo,
+            ih_rb_rptr: oss_base + self.ih.rb_rptr,
+            ih_rb_wptr1: oss_base + self.ih1.rb_wptr,
+            ih_rb_rptr1: oss_base + self.ih1.rb_rptr,
+            doorbell: self.doorbell,
+            doorbell1: self.doorbell1,
+            ring_size_dw: (IH_RING_SIZE / 4) as u32,
+        });
         let msi = MsiIrq::setup(&device, true, handler, c"astra")?;
         self.msi_enabled = true;
         dev.msi = Some(msi);
-        dev.ih_handler = Some(handler);
 
         self.ih_bo = Some(ih_bo);
         self.ih1_bo = Some(ih1_bo);
@@ -557,9 +553,11 @@ impl IpBlock for IhV6 {
     }
 }
 
-fn map_bar_range(bar: na_std::pci::Bar) -> Result<na_std::memory::PhysicalRange> {
-    match bar {
-        na_std::pci::Bar::Memory { range, .. } => Ok(range),
-        na_std::pci::Bar::Port { .. } => Err(Error::Unsupported),
+impl IhV6 {
+    fn map_bar_range(bar: na_std::pci::Bar) -> Result<na_std::memory::PhysicalRange> {
+        match bar {
+            na_std::pci::Bar::Memory { range, .. } => Ok(range),
+            na_std::pci::Bar::Port { .. } => Err(Error::Unsupported),
+        }
     }
 }

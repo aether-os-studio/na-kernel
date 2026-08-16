@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::{ffi::CStr, marker::PhantomData, ptr::NonNull};
 
 use crate::{
@@ -309,20 +310,16 @@ pub trait IrqCallback: Sync {
 /// Rust PCI driver. Keeps the callback alive; released when dropped.
 pub struct MsiIrq<C: IrqCallback + 'static> {
     handle: u64,
-    _callback: &'static C,
+    callback: Box<C>,
 }
 
 impl<C: IrqCallback + 'static> MsiIrq<C> {
     /// Programs MSI (or MSI-X when `prefer_msix`) and registers `callback`
     /// as the interrupt handler.
-    pub fn setup(
-        device: &Device<'_>,
-        prefer_msix: bool,
-        callback: &'static C,
-        name: &CStr,
-    ) -> Result<Self> {
+    pub fn setup(device: &Device<'_>, prefer_msix: bool, callback: C, name: &CStr) -> Result<Self> {
+        let callback = Box::new(callback);
         let mut handle = 0;
-        let data = callback as *const C as *mut core::ffi::c_void;
+        let data = callback.as_ref() as *const C as *mut core::ffi::c_void;
         let status = unsafe {
             bindings::na_msi_setup_irq(
                 device.raw.ptr.as_ptr(),
@@ -334,16 +331,16 @@ impl<C: IrqCallback + 'static> MsiIrq<C> {
             )
         };
         Error::from_status(status)?;
-        Ok(Self {
-            handle,
-            _callback: callback,
-        })
+        Ok(Self { handle, callback })
+    }
+
+    pub fn callback(&self) -> &C {
+        &self.callback
     }
 
     extern "C" fn irq_shim(irq_num: u64, data: *mut core::ffi::c_void) {
-        // SAFETY: `data` was produced from the `&'static C` passed to
-        // `setup`; the reference stays alive for the lifetime of the
-        // returned handle.
+        // SAFETY: `data` points into the boxed callback owned by the live
+        // `MsiIrq`; Drop unregisters the IRQ before freeing that box.
         let callback = unsafe { &*(data as *const C) };
         callback.irq(irq_num);
     }

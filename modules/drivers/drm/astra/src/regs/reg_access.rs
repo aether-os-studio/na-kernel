@@ -220,7 +220,7 @@ impl Regs {
     /// aperture) — direct BAR0 access when inside the aperture, else the
     /// MM_INDEX window (Linux `amdgpu_device_mm_access`).
     pub fn vram_read_dwords(&mut self, pos: u64, out: &mut [u32]) -> Result<()> {
-        if pos % 4 != 0 {
+        if !pos.is_multiple_of(4) {
             return Err(Error::InvalidArgument);
         }
         let end = pos
@@ -249,7 +249,7 @@ impl Regs {
     /// VRAM aperture) — direct BAR0 access when inside the aperture, else
     /// the MM_INDEX window.
     pub fn vram_write_dwords(&mut self, pos: u64, data: &[u32]) -> Result<()> {
-        if pos % 4 != 0 {
+        if !pos.is_multiple_of(4) {
             return Err(Error::InvalidArgument);
         }
         let end = pos

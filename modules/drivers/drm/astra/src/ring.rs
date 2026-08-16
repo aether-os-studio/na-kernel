@@ -14,6 +14,17 @@ pub enum RingKind {
     Vcn { align_mask: u32 },
 }
 
+#[derive(Clone, Copy)]
+pub struct RingConfig {
+    pub doorbell: u32,
+    pub rptr_wb: u64,
+    pub wptr_wb: u64,
+    pub me: u32,
+    pub pipe: u32,
+    pub queue: u32,
+    pub kind: RingKind,
+}
+
 /// A ring buffer: a GART BO written by the CPU, consumed by the engine,
 /// signaled through a doorbell.
 pub struct Ring {
@@ -49,16 +60,7 @@ pub struct Ring {
 }
 
 impl Ring {
-    pub fn new(
-        bo: Bo,
-        doorbell: u32,
-        rptr_wb: u64,
-        wptr_wb: u64,
-        me: u32,
-        pipe: u32,
-        queue: u32,
-        kind: RingKind,
-    ) -> Self {
+    pub fn new(bo: Bo, config: RingConfig) -> Self {
         let gpu_addr = bo.gpu_addr;
         let size = bo.size;
         Self {
@@ -66,13 +68,13 @@ impl Ring {
             gpu_addr,
             size,
             wptr: 0,
-            doorbell,
-            kind,
-            rptr_wb,
-            wptr_wb,
-            me,
-            pipe,
-            queue,
+            doorbell: config.doorbell,
+            kind: config.kind,
+            rptr_wb: config.rptr_wb,
+            wptr_wb: config.wptr_wb,
+            me: config.me,
+            pipe: config.pipe,
+            queue: config.queue,
             vm_inv_eng: u32::MAX,
             fence_wb: 0,
             fence_seq: 0,
@@ -131,15 +133,15 @@ impl Ring {
         match self.kind {
             RingKind::Gfx if count == 1 => {
                 // gfx_v10_ring_insert_nop: a lone header is itself a NOP.
-                self.write(PACKET3(PACKET3_NOP, 0x3fff))?;
+                self.write(packet3(PACKET3_NOP, 0x3fff))?;
             }
             RingKind::Gfx if count > 1 => {
                 // The first header covers exactly the remaining padding
                 // dwords. The following values are packet payload, matching
                 // gfx_v10_ring_insert_nop + amdgpu_ring_insert_nop.
-                self.write(PACKET3(PACKET3_NOP, (count - 2).min(0x3ffe)))?;
+                self.write(packet3(PACKET3_NOP, (count - 2).min(0x3ffe)))?;
                 for _ in 0..count - 1 {
-                    self.write(PACKET3(PACKET3_NOP, 0x3fff))?;
+                    self.write(packet3(PACKET3_NOP, 0x3fff))?;
                 }
             }
             RingKind::Sdma | RingKind::Vcn { .. } => {
@@ -202,7 +204,7 @@ impl Ring {
         // `scratch_reg` is already SOC15_REG_OFFSET(GC, 0, ...), so raw
         // access is required; read_ip/write_ip would add the GC base twice.
         dev.regs.write_raw(scratch_reg, 0xCAFE_DEAD)?;
-        self.write(PACKET3(PACKET3_SET_UCONFIG_REG, 1))?;
+        self.write(packet3(PACKET3_SET_UCONFIG_REG, 1))?;
         self.write(scratch_reg - PACKET3_SET_UCONFIG_REG_START)?;
         self.write(0xDEAD_BEEF)?;
         self.commit(dev)?;
@@ -218,8 +220,7 @@ impl Ring {
 }
 
 /// PACKET3 opcodes (soc15d.h / amdgpu ring spec).
-#[allow(non_snake_case)]
-pub const fn PACKET3(op: u32, count: u32) -> u32 {
+pub const fn packet3(op: u32, count: u32) -> u32 {
     (0x3 << 30) | (op << 8) | (count << 16)
 }
 

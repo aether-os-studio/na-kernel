@@ -1,4 +1,5 @@
-use core::{ffi::CStr, ptr::NonNull};
+use alloc::boxed::Box;
+use core::{ffi::CStr, pin::Pin, ptr::NonNull};
 
 use crate::memory::PhysicalAddress;
 use crate::{Error, Result, bindings, pci};
@@ -210,6 +211,26 @@ impl Drop for Device {
 
 unsafe impl Send for Device {}
 
+pub struct OwnedDevice<D: Driver + Send> {
+    raw: NonNull<bindings::DrmDevice>,
+    _driver: Pin<Box<D>>,
+}
+
+impl<D: Driver + Send> OwnedDevice<D> {
+    pub fn notify_hotplug(&self) -> Result<()> {
+        let status = unsafe { bindings::na_drm_device_notify_hotplug(self.raw.as_ptr()) };
+        Error::from_status(status)
+    }
+}
+
+impl<D: Driver + Send> Drop for OwnedDevice<D> {
+    fn drop(&mut self) {
+        unsafe { bindings::na_drm_device_unregister(self.raw.as_ptr()) };
+    }
+}
+
+unsafe impl<D: Driver + Send> Send for OwnedDevice<D> {}
+
 #[derive(Clone, Copy)]
 pub struct DriverInfo {
     kernel_name: &'static CStr,
@@ -243,22 +264,17 @@ impl DriverInfo {
     }
 }
 
-pub struct DeviceBuilder<D: Driver> {
-    driver: &'static D,
+#[derive(Clone, Copy)]
+struct RegistrationConfig {
     node_name: &'static CStr,
     driver_info: DriverInfo,
     supports_render_node: bool,
     supports_atomic_modeset: bool,
 }
 
-impl<D: Driver> DeviceBuilder<D> {
-    pub const fn new(
-        driver: &'static D,
-        node_name: &'static CStr,
-        driver_info: DriverInfo,
-    ) -> Self {
+impl RegistrationConfig {
+    const fn new(node_name: &'static CStr, driver_info: DriverInfo) -> Self {
         Self {
-            driver,
             node_name,
             driver_info,
             supports_render_node: false,
@@ -266,17 +282,11 @@ impl<D: Driver> DeviceBuilder<D> {
         }
     }
 
-    pub const fn render_node(mut self, enabled: bool) -> Self {
-        self.supports_render_node = enabled;
-        self
-    }
-
-    pub const fn atomic_modeset(mut self, enabled: bool) -> Self {
-        self.supports_atomic_modeset = enabled;
-        self
-    }
-
-    pub fn register(self, pci_device: Option<&pci::Device<'_>>) -> Result<Device> {
+    fn register<D: Driver>(
+        self,
+        driver: &D,
+        pci_device: Option<&pci::Device<'_>>,
+    ) -> Result<NonNull<bindings::DrmDevice>> {
         let driver_info = bindings::DrmDriverInfo {
             kernel_name: self.driver_info.kernel_name.as_ptr(),
             uapi_name: self.driver_info.uapi_name.as_ptr(),
@@ -287,7 +297,7 @@ impl<D: Driver> DeviceBuilder<D> {
             version_patchlevel: self.driver_info.version_patchlevel,
         };
         let ops = bindings::DrmDriverOps {
-            context: (self.driver as *const D).cast_mut().cast(),
+            context: (driver as *const D).cast_mut().cast(),
             supports_render_node: self.supports_render_node,
             supports_atomic_modeset: self.supports_atomic_modeset,
             open: Some(Callbacks::<D>::open),
@@ -327,8 +337,74 @@ impl<D: Driver> DeviceBuilder<D> {
                 &driver_info,
             )
         };
-        NonNull::new(raw)
+        NonNull::new(raw).ok_or(Error::OutOfMemory)
+    }
+}
+
+pub struct DeviceBuilder<D: Driver> {
+    driver: &'static D,
+    config: RegistrationConfig,
+}
+
+impl<D: Driver> DeviceBuilder<D> {
+    pub const fn new(
+        driver: &'static D,
+        node_name: &'static CStr,
+        driver_info: DriverInfo,
+    ) -> Self {
+        Self {
+            driver,
+            config: RegistrationConfig::new(node_name, driver_info),
+        }
+    }
+
+    pub const fn render_node(mut self, enabled: bool) -> Self {
+        self.config.supports_render_node = enabled;
+        self
+    }
+
+    pub const fn atomic_modeset(mut self, enabled: bool) -> Self {
+        self.config.supports_atomic_modeset = enabled;
+        self
+    }
+
+    pub fn register(self, pci_device: Option<&pci::Device<'_>>) -> Result<Device> {
+        self.config
+            .register(self.driver, pci_device)
             .map(|raw| Device { raw })
-            .ok_or(Error::OutOfMemory)
+    }
+}
+
+pub struct OwnedDeviceBuilder<D: Driver + Send> {
+    driver: Pin<Box<D>>,
+    config: RegistrationConfig,
+}
+
+impl<D: Driver + Send> OwnedDeviceBuilder<D> {
+    pub fn new(driver: D, node_name: &'static CStr, driver_info: DriverInfo) -> Self {
+        Self {
+            driver: Box::pin(driver),
+            config: RegistrationConfig::new(node_name, driver_info),
+        }
+    }
+
+    pub fn render_node(mut self, enabled: bool) -> Self {
+        self.config.supports_render_node = enabled;
+        self
+    }
+
+    pub fn atomic_modeset(mut self, enabled: bool) -> Self {
+        self.config.supports_atomic_modeset = enabled;
+        self
+    }
+
+    pub fn register(self, pci_device: Option<&pci::Device<'_>>) -> Result<OwnedDevice<D>> {
+        let raw = self
+            .config
+            .register(self.driver.as_ref().get_ref(), pci_device)?;
+        Ok(OwnedDevice {
+            raw,
+            _driver: self.driver,
+        })
     }
 }

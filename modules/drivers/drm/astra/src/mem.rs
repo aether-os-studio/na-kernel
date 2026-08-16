@@ -36,7 +36,14 @@ pub struct Bo {
     pub size: usize,
     pub place: Place,
     pub cpu: Option<DmaBuffer>,
+    release: ReleasePolicy,
     retire: Arc<SpinLock<RetireQueue>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleasePolicy {
+    Reuse,
+    Wipe,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,7 +57,8 @@ struct RetiredBo {
     size: usize,
     place: Place,
     /// Keeps system-memory backing alive until the GART invalidate completes.
-    _cpu: Option<DmaBuffer>,
+    cpu: Option<DmaBuffer>,
+    release: ReleasePolicy,
     state: RetireState,
 }
 
@@ -74,20 +82,147 @@ impl RetireQueue {
     }
 }
 
+/// Pre-reserved queue capacity owned by an allocation attempt.  Abandoning
+/// the attempt returns its live-object slot automatically; committing it
+/// transfers that slot and the backing allocation into a `Bo`.
+struct RetireReservation {
+    retire: Arc<SpinLock<RetireQueue>>,
+    committed: bool,
+}
+
+impl RetireReservation {
+    fn reserve(retire: &Arc<SpinLock<RetireQueue>>) -> Result<Self> {
+        {
+            let mut queue = retire.lock();
+            let required = queue
+                .live
+                .checked_add(queue.in_flight)
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Error::OutOfMemory)?;
+            let free = queue.pending.capacity().saturating_sub(queue.pending.len());
+            if free < required {
+                queue
+                    .pending
+                    .try_reserve(required)
+                    .map_err(|_| Error::OutOfMemory)?;
+            }
+            queue.live += 1;
+        }
+        Ok(Self {
+            retire: retire.clone(),
+            committed: false,
+        })
+    }
+
+    fn commit(mut self, gpu_addr: u64, size: usize, place: Place, cpu: Option<DmaBuffer>) -> Bo {
+        self.committed = true;
+        Bo {
+            gpu_addr,
+            size,
+            place,
+            cpu,
+            release: ReleasePolicy::Reuse,
+            retire: self.retire.clone(),
+        }
+    }
+}
+
+impl Drop for RetireReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut queue = self.retire.lock();
+            debug_assert!(queue.live != 0);
+            queue.live = queue.live.saturating_sub(1);
+        }
+    }
+}
+
+/// A retirement record temporarily removed from the shared queue.  Unless
+/// `finish` consumes it, Drop requeues the record and restores accounting,
+/// making every early-return path lossless.
+struct RetiredGuard {
+    retire: Arc<SpinLock<RetireQueue>>,
+    record: Option<RetiredBo>,
+}
+
+impl RetiredGuard {
+    fn record(&self) -> &RetiredBo {
+        self.record.as_ref().expect("retirement record consumed")
+    }
+
+    fn record_mut(&mut self) -> &mut RetiredBo {
+        self.record.as_mut().expect("retirement record consumed")
+    }
+
+    fn finish(mut self) {
+        self.record = None;
+        let mut queue = self.retire.lock();
+        debug_assert!(queue.in_flight != 0);
+        queue.in_flight = queue.in_flight.saturating_sub(1);
+    }
+}
+
+impl Drop for RetiredGuard {
+    fn drop(&mut self) {
+        let Some(record) = self.record.take() else {
+            return;
+        };
+        let mut queue = self.retire.lock();
+        debug_assert!(queue.in_flight != 0);
+        queue.in_flight = queue.in_flight.saturating_sub(1);
+        queue.pending.push(record);
+    }
+}
+
+impl RetiredBo {
+    fn wipe(&mut self, regs: &mut Regs) -> Result<()> {
+        if self.release != ReleasePolicy::Wipe {
+            return Ok(());
+        }
+        match self.place {
+            Place::Gart => {
+                let cpu = self.cpu.as_mut().ok_or(Error::NoDevice)?;
+                cpu.as_mut_slice().fill(0);
+                cpu.sync_for_device();
+            }
+            Place::Vram => {
+                let zero = [0u32; 1024];
+                let mut offset = self.gpu_addr;
+                for _ in 0..self.size / GPU_PAGE_SIZE {
+                    regs.vram_write_dwords(offset, &zero)?;
+                    offset += GPU_PAGE_SIZE as u64;
+                }
+            }
+        }
+        self.release = ReleasePolicy::Reuse;
+        Ok(())
+    }
+}
+
+impl Bo {
+    /// Applies Linux's `AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE` policy to
+    /// this ownership tree.  The final owner queues the wipe automatically.
+    pub(crate) fn wipe_on_release(mut self) -> Self {
+        self.release = ReleasePolicy::Wipe;
+        self
+    }
+}
+
 impl Drop for Bo {
     fn drop(&mut self) {
         let retired = RetiredBo {
             gpu_addr: self.gpu_addr,
             size: self.size,
             place: self.place,
-            _cpu: self.cpu.take(),
+            cpu: self.cpu.take(),
+            release: self.release,
             state: RetireState::Mapped,
         };
         let mut queue = self.retire.lock();
         debug_assert!(queue.live != 0);
         queue.live = queue.live.saturating_sub(1);
-        // `reserve_retire_slot` maintains enough spare capacity for every
-        // live/in-flight BO, so this push cannot allocate from Drop.
+        // Every live/in-flight BO owns pre-reserved capacity, so this push
+        // cannot allocate from Drop.
         queue.pending.push(retired);
     }
 }
@@ -216,7 +351,7 @@ impl BoAllocator {
         // Fill the table with the bare PTE flags (invalid entries);
         // each PTE is 8 bytes: flags low dword, 0 high dword.
         let mut chunk = alloc::vec![0u32; 1024];
-        for pair in chunk.chunks_exact_mut(2) {
+        for pair in chunk.as_chunks_mut::<2>().0 {
             pair[0] = self.table_flags as u32;
         }
         let mut pos = table.gpu_addr;
@@ -256,31 +391,21 @@ impl BoAllocator {
         let size = size.next_multiple_of(GPU_PAGE_SIZE);
         let cpu = DmaBuffer::zeroed(size)?;
         let va = self.alloc_gart_va_aligned(size, alignment)?;
-        self.reserve_retire_slot()?;
+        let reservation = RetireReservation::reserve(&self.retire)?;
         if let Err(error) = self.map_pte(regs, va, cpu.physical_address().get(), size) {
             // A failed BAR write may have installed a prefix of the mapping.
             // Transfer the backing into the normal RAII retire path instead
             // of freeing DMA memory while a valid PTE might still reference it.
             self.gart_allocated = self.gart_allocated.saturating_add(size as u64);
-            drop(Bo {
-                gpu_addr: va,
-                size,
-                place: Place::Gart,
-                cpu: Some(cpu),
-                retire: self.retire.clone(),
-            });
+            {
+                let _failed_mapping = reservation.commit(va, size, Place::Gart, Some(cpu));
+            }
             let _ = self.prepare_retirements(regs);
             self.complete_retirements();
             return Err(error);
         }
         self.gart_allocated = self.gart_allocated.saturating_add(size as u64);
-        Ok(Bo {
-            gpu_addr: va,
-            size,
-            place: Place::Gart,
-            cpu: Some(cpu),
-            retire: self.retire.clone(),
-        })
+        Ok(reservation.commit(va, size, Place::Gart, Some(cpu)))
     }
 
     /// Allocates a visible-VRAM BO (CPU access through the BAR0 aperture).
@@ -302,7 +427,7 @@ impl BoAllocator {
         }
         let alignment = alignment.max(GPU_PAGE_SIZE);
         let size = size.next_multiple_of(GPU_PAGE_SIZE);
-        self.reserve_retire_slot()?;
+        let reservation = RetireReservation::reserve(&self.retire)?;
         let mask = alignment as u64 - 1;
         let reused = Self::alloc_free_range(&mut self.free_vram, size as u64, alignment as u64);
         let mut bump_end = None;
@@ -313,18 +438,12 @@ impl BoAllocator {
                 .next_vram
                 .checked_add(mask)
                 .map(|value| value & !mask)
-                .ok_or_else(|| {
-                    self.cancel_retire_slot();
-                    Error::OutOfMemory
-                })?;
+                .ok_or(Error::OutOfMemory)?;
             let end = loop {
                 let end = gpu_addr
                     .checked_add(size as u64)
                     .filter(|end| *end <= self.next_vram_top)
-                    .ok_or_else(|| {
-                        self.cancel_retire_slot();
-                        Error::OutOfMemory
-                    })?;
+                    .ok_or(Error::OutOfMemory)?;
                 let next = self
                     .vram_reservations
                     .iter()
@@ -336,10 +455,7 @@ impl BoAllocator {
                         gpu_addr = next
                             .checked_add(mask)
                             .map(|value| value & !mask)
-                            .ok_or_else(|| {
-                                self.cancel_retire_slot();
-                                Error::OutOfMemory
-                            })?;
+                            .ok_or(Error::OutOfMemory)?;
                     }
                     None => break end,
                 }
@@ -355,7 +471,6 @@ impl BoAllocator {
                 if reused.is_some() {
                     Self::free_range(&mut self.free_vram, gpu_addr, size as u64);
                 }
-                self.cancel_retire_slot();
                 return Err(error);
             }
             pos += 4096;
@@ -364,13 +479,7 @@ impl BoAllocator {
             self.next_vram = end;
         }
         self.vram_allocated = self.vram_allocated.saturating_add(size as u64);
-        Ok(Bo {
-            gpu_addr,
-            size,
-            place: Place::Vram,
-            cpu: None,
-            retire: self.retire.clone(),
-        })
+        Ok(reservation.commit(gpu_addr, size, Place::Vram, None))
     }
 
     /// Allocates a no-CPU-access VRAM BO from the top of VRAM, matching
@@ -387,7 +496,7 @@ impl BoAllocator {
         }
         let alignment = alignment.max(GPU_PAGE_SIZE);
         let size = size.next_multiple_of(GPU_PAGE_SIZE);
-        self.reserve_retire_slot()?;
+        let reservation = RetireReservation::reserve(&self.retire)?;
         let mask = alignment as u64 - 1;
         let mut ceiling = self.next_vram_top;
         let gpu_addr = loop {
@@ -395,14 +504,10 @@ impl BoAllocator {
                 .checked_sub(size as u64)
                 .map(|value| value & !mask)
                 .filter(|value| *value >= self.next_vram)
-                .ok_or_else(|| {
-                    self.cancel_retire_slot();
-                    Error::OutOfMemory
-                })?;
-            let end = gpu_addr.checked_add(size as u64).ok_or_else(|| {
-                self.cancel_retire_slot();
-                Error::OutOfMemory
-            })?;
+                .ok_or(Error::OutOfMemory)?;
+            let end = gpu_addr
+                .checked_add(size as u64)
+                .ok_or(Error::OutOfMemory)?;
             let next_ceiling = self
                 .vram_reservations
                 .iter()
@@ -417,21 +522,12 @@ impl BoAllocator {
         let zero = [0u32; 1024];
         let mut pos = gpu_addr;
         for _ in 0..size / GPU_PAGE_SIZE {
-            if let Err(error) = regs.vram_write_dwords(pos, &zero) {
-                self.cancel_retire_slot();
-                return Err(error);
-            }
+            regs.vram_write_dwords(pos, &zero)?;
             pos += GPU_PAGE_SIZE as u64;
         }
         self.next_vram_top = gpu_addr;
         self.vram_allocated = self.vram_allocated.saturating_add(size as u64);
-        Ok(Bo {
-            gpu_addr,
-            size,
-            place: Place::Vram,
-            cpu: None,
-            retire: self.retire.clone(),
-        })
+        Ok(reservation.commit(gpu_addr, size, Place::Vram, None))
     }
 
     /// Maps `size` bytes of physically-contiguous memory at `va`.
@@ -456,31 +552,29 @@ impl BoAllocator {
         let count = self.retire.lock().pending.len();
         for _ in 0..count {
             let mut retired = self.take_retired().ok_or(Error::NoDevice)?;
-            match retired.place {
+            retired.record_mut().wipe(regs)?;
+            match retired.record().place {
                 Place::Vram => {
-                    Self::free_range(&mut self.free_vram, retired.gpu_addr, retired.size as u64);
-                    self.vram_allocated = self.vram_allocated.saturating_sub(retired.size as u64);
-                    self.finish_retired();
+                    let record = retired.record();
+                    Self::free_range(&mut self.free_vram, record.gpu_addr, record.size as u64);
+                    self.vram_allocated = self.vram_allocated.saturating_sub(record.size as u64);
+                    retired.finish();
                 }
-                Place::Gart if retired.state == RetireState::Mapped => {
-                    let mut pos = retired.gpu_addr;
+                Place::Gart if retired.record().state == RetireState::Mapped => {
+                    let mut pos = retired.record().gpu_addr;
                     let mut result = Ok(());
-                    for _ in 0..retired.size / GPU_PAGE_SIZE {
+                    for _ in 0..retired.record().size / GPU_PAGE_SIZE {
                         if let Err(error) = self.write_pte(regs, pos, 0, self.table_flags) {
                             result = Err(error);
                             break;
                         }
                         pos += GPU_PAGE_SIZE as u64;
                     }
-                    if let Err(error) = result {
-                        self.requeue_retired(retired);
-                        return Err(error);
-                    }
+                    result?;
                     self.pte_generation = self.pte_generation.wrapping_add(1);
-                    retired.state = RetireState::AwaitingFlush;
-                    self.requeue_retired(retired);
+                    retired.record_mut().state = RetireState::AwaitingFlush;
                 }
-                Place::Gart => self.requeue_retired(retired),
+                Place::Gart => {}
             }
         }
         Ok(())
@@ -498,59 +592,25 @@ impl BoAllocator {
                 Some(retired) => retired,
                 None => break,
             };
-            if retired.place == Place::Gart && retired.state == RetireState::AwaitingFlush {
-                Self::free_range(&mut self.free_gart, retired.gpu_addr, retired.size as u64);
-                self.gart_allocated = self.gart_allocated.saturating_sub(retired.size as u64);
-                self.finish_retired();
-                drop(retired);
-            } else {
-                self.requeue_retired(retired);
+            if retired.record().place == Place::Gart
+                && retired.record().state == RetireState::AwaitingFlush
+            {
+                let record = retired.record();
+                Self::free_range(&mut self.free_gart, record.gpu_addr, record.size as u64);
+                self.gart_allocated = self.gart_allocated.saturating_sub(record.size as u64);
+                retired.finish();
             }
         }
     }
 
-    fn reserve_retire_slot(&self) -> Result<()> {
+    fn take_retired(&self) -> Option<RetiredGuard> {
         let mut queue = self.retire.lock();
-        let required = queue
-            .live
-            .checked_add(queue.in_flight)
-            .and_then(|value| value.checked_add(1))
-            .ok_or(Error::OutOfMemory)?;
-        let free = queue.pending.capacity().saturating_sub(queue.pending.len());
-        if free < required {
-            queue
-                .pending
-                .try_reserve(required)
-                .map_err(|_| Error::OutOfMemory)?;
-        }
-        queue.live += 1;
-        Ok(())
-    }
-
-    fn cancel_retire_slot(&self) {
-        let mut queue = self.retire.lock();
-        debug_assert!(queue.live != 0);
-        queue.live = queue.live.saturating_sub(1);
-    }
-
-    fn take_retired(&self) -> Option<RetiredBo> {
-        let mut queue = self.retire.lock();
-        let retired = queue.pending.pop()?;
+        let record = queue.pending.pop()?;
         queue.in_flight += 1;
-        Some(retired)
-    }
-
-    fn requeue_retired(&self, retired: RetiredBo) {
-        let mut queue = self.retire.lock();
-        debug_assert!(queue.in_flight != 0);
-        queue.in_flight = queue.in_flight.saturating_sub(1);
-        queue.pending.push(retired);
-    }
-
-    fn finish_retired(&self) {
-        let mut queue = self.retire.lock();
-        debug_assert!(queue.in_flight != 0);
-        queue.in_flight = queue.in_flight.saturating_sub(1);
+        Some(RetiredGuard {
+            retire: self.retire.clone(),
+            record: Some(record),
+        })
     }
 
     fn write_pte(&mut self, regs: &mut Regs, va: u64, pa: u64, flags: u64) -> Result<()> {
@@ -726,20 +786,16 @@ impl Wb {
         Ok(())
     }
 
-    pub fn read_u64(&mut self, gpu_addr: u64) -> Result<u64> {
+    pub fn read_u64(&self, gpu_addr: u64) -> Result<u64> {
         let offset = gpu_addr
             .checked_sub(self.bo.gpu_addr)
             .and_then(|offset| usize::try_from(offset).ok())
             .ok_or(Error::Range)?;
         let cpu = self.bo.cpu.as_ref().ok_or(Error::NoDevice)?;
-        cpu.sync_for_cpu();
-        let src = cpu
-            .as_slice()
-            .get(offset..offset + core::mem::size_of::<u64>())
-            .ok_or(Error::Range)?;
-        Ok(u64::from_le_bytes([
-            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
-        ]))
+        // The writeback BO is DMA coherent on ASTRA's x86_64 platform. Linux
+        // polls these scheduler fences with READ_ONCE rather than invalidating
+        // the complete WB allocation for each observation.
+        cpu.read_volatile_u64(offset)
     }
 
     /// Stable CPU virtual address corresponding to a GPU writeback address.
