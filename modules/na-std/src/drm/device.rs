@@ -1,5 +1,6 @@
 use core::{ffi::CStr, ptr::NonNull};
 
+use crate::memory::PhysicalAddress;
 use crate::{Error, Result, bindings, pci};
 
 use super::{
@@ -23,6 +24,43 @@ impl FileId {
     pub const fn raw(self) -> u64 {
         self.0
     }
+
+    /// Waits for one DRM syncobj owned by this DRM file's process. A zero
+    /// point has binary-syncobj semantics and therefore waits for point one.
+    pub fn wait_syncobj(self, handle: u32, point: u64, timeout_ns: i64) -> Result<()> {
+        let status = unsafe { bindings::na_drm_syncobj_wait(self.0, handle, point, timeout_ns) };
+        Error::from_status(status)
+    }
+
+    /// Advances a DRM syncobj after a hardware submission has completed.
+    pub fn signal_syncobj(self, handle: u32, point: u64) -> Result<()> {
+        let status = unsafe { bindings::na_drm_syncobj_signal(self.0, handle, point) };
+        Error::from_status(status)
+    }
+
+    /// Backs a syncobj point with a monotonically increasing 64-bit GPU
+    /// writeback fence.  Wait and sync-file paths observe the fence directly,
+    /// so command submission can return before the GPU completes.
+    pub fn attach_syncobj_fence(
+        self,
+        handle: u32,
+        point: u64,
+        timeline: bool,
+        cpu_address: u64,
+        value: u64,
+    ) -> Result<()> {
+        let status = unsafe {
+            bindings::na_drm_syncobj_attach_fence(
+                self.0,
+                handle,
+                point,
+                timeline as u32,
+                cpu_address,
+                value,
+            )
+        };
+        Error::from_status(status)
+    }
 }
 
 pub struct Ioctl<'a> {
@@ -30,6 +68,21 @@ pub struct Ioctl<'a> {
     pub arg: &'a mut [u8],
     pub render_node: bool,
     pub file: Option<FileId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MmapRequest {
+    pub file: FileId,
+    pub offset: u64,
+    pub length: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrimeBuffer {
+    pub physical_address: PhysicalAddress,
+    pub length: usize,
+    /// Driver-private object reference held by the dma-buf file.
+    pub token: u64,
 }
 
 pub trait Driver: Sync + 'static {
@@ -41,6 +94,22 @@ pub trait Driver: Sync + 'static {
 
     fn driver_ioctl(&self, _ioctl: Ioctl<'_>) -> Result<usize> {
         Err(Error::NotATerminal)
+    }
+
+    fn mmap(&self, _request: MmapRequest) -> Result<PhysicalAddress> {
+        Err(Error::Unsupported)
+    }
+
+    fn prime_export(&self, _file: FileId, _handle: u32) -> Result<PrimeBuffer> {
+        Err(Error::Unsupported)
+    }
+
+    fn prime_import(&self, _file: FileId, _token: u64) -> Result<u32> {
+        Err(Error::Unsupported)
+    }
+
+    fn prime_release(&self, _token: u64) -> Result<()> {
+        Err(Error::Unsupported)
     }
 
     fn capability(&self, _capability: u64) -> Result<u64> {
@@ -93,6 +162,10 @@ pub trait Driver: Sync + 'static {
 
     fn release_framebuffer(&self, _handle: u32) {}
 
+    fn framebuffer_handle(&self, _file: FileId, _framebuffer_handle: u32) -> Result<u32> {
+        Err(Error::Unsupported)
+    }
+
     fn dirty_framebuffer(&self, _update: FramebufferUpdate<'_>) -> Result<()> {
         Err(Error::Unsupported)
     }
@@ -137,30 +210,59 @@ impl Drop for Device {
 
 unsafe impl Send for Device {}
 
+#[derive(Clone, Copy)]
+pub struct DriverInfo {
+    kernel_name: &'static CStr,
+    uapi_name: &'static CStr,
+    date: &'static CStr,
+    description: &'static CStr,
+    version_major: i32,
+    version_minor: i32,
+    version_patchlevel: i32,
+}
+
+impl DriverInfo {
+    pub const fn new(
+        kernel_name: &'static CStr,
+        uapi_name: &'static CStr,
+        date: &'static CStr,
+        description: &'static CStr,
+        version_major: i32,
+        version_minor: i32,
+        version_patchlevel: i32,
+    ) -> Self {
+        Self {
+            kernel_name,
+            uapi_name,
+            date,
+            description,
+            version_major,
+            version_minor,
+            version_patchlevel,
+        }
+    }
+}
+
 pub struct DeviceBuilder<D: Driver> {
     driver: &'static D,
     node_name: &'static CStr,
-    driver_name: &'static CStr,
-    driver_date: &'static CStr,
-    driver_description: &'static CStr,
+    driver_info: DriverInfo,
     supports_render_node: bool,
+    supports_atomic_modeset: bool,
 }
 
 impl<D: Driver> DeviceBuilder<D> {
     pub const fn new(
         driver: &'static D,
         node_name: &'static CStr,
-        driver_name: &'static CStr,
-        driver_date: &'static CStr,
-        driver_description: &'static CStr,
+        driver_info: DriverInfo,
     ) -> Self {
         Self {
             driver,
             node_name,
-            driver_name,
-            driver_date,
-            driver_description,
+            driver_info,
             supports_render_node: false,
+            supports_atomic_modeset: false,
         }
     }
 
@@ -169,10 +271,25 @@ impl<D: Driver> DeviceBuilder<D> {
         self
     }
 
+    pub const fn atomic_modeset(mut self, enabled: bool) -> Self {
+        self.supports_atomic_modeset = enabled;
+        self
+    }
+
     pub fn register(self, pci_device: Option<&pci::Device<'_>>) -> Result<Device> {
+        let driver_info = bindings::DrmDriverInfo {
+            kernel_name: self.driver_info.kernel_name.as_ptr(),
+            uapi_name: self.driver_info.uapi_name.as_ptr(),
+            date: self.driver_info.date.as_ptr(),
+            description: self.driver_info.description.as_ptr(),
+            version_major: self.driver_info.version_major,
+            version_minor: self.driver_info.version_minor,
+            version_patchlevel: self.driver_info.version_patchlevel,
+        };
         let ops = bindings::DrmDriverOps {
             context: (self.driver as *const D).cast_mut().cast(),
             supports_render_node: self.supports_render_node,
+            supports_atomic_modeset: self.supports_atomic_modeset,
             open: Some(Callbacks::<D>::open),
             close: Some(Callbacks::<D>::close),
             get_capability: Some(Callbacks::<D>::get_capability),
@@ -188,12 +305,17 @@ impl<D: Driver> DeviceBuilder<D> {
             get_planes: Some(Callbacks::<D>::get_planes),
             create_framebuffer: Some(Callbacks::<D>::create_framebuffer),
             release_framebuffer: Some(Callbacks::<D>::release_framebuffer),
+            get_framebuffer_handle: Some(Callbacks::<D>::get_framebuffer_handle),
             dirty_framebuffer: Some(Callbacks::<D>::dirty_framebuffer),
             set_plane: Some(Callbacks::<D>::set_plane),
             set_crtc: Some(Callbacks::<D>::set_crtc),
             page_flip: Some(Callbacks::<D>::page_flip),
             set_cursor: Some(Callbacks::<D>::set_cursor),
             atomic_commit: Some(Callbacks::<D>::atomic_commit),
+            mmap: Some(Callbacks::<D>::mmap),
+            prime_export: Some(Callbacks::<D>::prime_export),
+            prime_import: Some(Callbacks::<D>::prime_import),
+            prime_release: Some(Callbacks::<D>::prime_release),
             driver_ioctl: Some(Callbacks::<D>::driver_ioctl),
         };
         let pci_device = pci_device.map_or(core::ptr::null_mut(), pci::Device::raw_ptr);
@@ -202,9 +324,7 @@ impl<D: Driver> DeviceBuilder<D> {
                 &ops,
                 self.node_name.as_ptr(),
                 pci_device,
-                self.driver_name.as_ptr(),
-                self.driver_date.as_ptr(),
-                self.driver_description.as_ptr(),
+                &driver_info,
             )
         };
         NonNull::new(raw)

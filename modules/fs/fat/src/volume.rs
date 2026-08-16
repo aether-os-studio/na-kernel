@@ -10,6 +10,8 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
     pub cluster: u32,
+    pub cluster_hint: u32,
+    pub cluster_hint_index: u64,
     pub size: u64,
     pub dir: bool,
     pub contiguous: bool,
@@ -23,6 +25,7 @@ pub enum Volume {
 pub struct FatVolume {
     pub dev: BlockDevice,
     pub bpb: FatBpb,
+    next_free_cluster: u32,
 }
 pub struct ExFatVolume {
     pub dev: BlockDevice,
@@ -43,6 +46,7 @@ impl Volume {
             Ok(Self::Fat(FatVolume {
                 dev: device,
                 bpb: bpb::parse_fat(&boot)?,
+                next_free_cluster: 2,
             }))
         }
     }
@@ -61,6 +65,12 @@ impl Volume {
                 } else {
                     0
                 },
+                cluster_hint: if v.bpb.kind == FatKind::Fat32 {
+                    v.bpb.root_cluster
+                } else {
+                    0
+                },
+                cluster_hint_index: 0,
                 size: 0,
                 dir: true,
                 contiguous: false,
@@ -68,6 +78,8 @@ impl Volume {
             },
             Self::ExFat(v) => Node {
                 cluster: v.bpb.root_cluster,
+                cluster_hint: v.bpb.root_cluster,
+                cluster_hint_index: 0,
                 size: 0,
                 dir: true,
                 contiguous: false,
@@ -200,11 +212,11 @@ impl FatVolume {
             FatKind::Fat16 => (c as u64 * 2, 2),
             FatKind::Fat32 => (c as u64 * 4, 4),
         };
-        let base = self.bpb.reserved as u64 * self.bpb.bytes_per_sector as u64;
-        let mut b = [0; 4];
-        self.dev.read_at(base + off, &mut b[..len])?;
         match self.bpb.kind {
             FatKind::Fat12 => {
+                let base = self.bpb.reserved as u64 * self.bpb.bytes_per_sector as u64;
+                let mut b = [0; 4];
+                self.dev.read_at(base + off, &mut b[..len])?;
                 let old = le16(&b, 0);
                 let v = value as u16 & 0xfff;
                 let x = if c & 1 != 0 {
@@ -227,13 +239,20 @@ impl FatVolume {
         }
         Ok(())
     }
-    fn alloc_cluster(&self) -> Result<u32> {
-        for c in 2..self.bpb.total_clusters + 2 {
+    fn alloc_cluster(&mut self) -> Result<u32> {
+        let end = self.bpb.total_clusters + 2;
+        let mut c = self.next_free_cluster.clamp(2, end.saturating_sub(1));
+        for _ in 0..self.bpb.total_clusters {
             if self.fat_entry(c)? == 0 {
                 self.fat_write_entry(c, self.fat_eoc())?;
                 let zero = vec![0; self.cluster_size() as usize];
                 self.dev.write(self.cluster_offset(c), &zero)?;
+                self.next_free_cluster = if c + 1 < end { c + 1 } else { 2 };
                 return Ok(c);
+            }
+            c += 1;
+            if c >= end {
+                c = 2;
             }
         }
         Err(Error::NoSpace)
@@ -248,18 +267,14 @@ impl FatVolume {
             out.push(c);
             let next = self.fat_entry(c)?;
             if self.is_eoc(next) {
-                break;
+                return Ok(out);
             }
             if next < 2 || next >= self.bpb.total_clusters + 2 {
                 return Err(Error::Io);
             }
             c = next;
         }
-        let last = *out.last().ok_or(Error::Io)?;
-        if !self.is_eoc(self.fat_entry(last)?) {
-            return Err(Error::Io);
-        }
-        Ok(out)
+        Err(Error::Io)
     }
     fn dir_bytes(&self, dir: Node) -> Result<Vec<u8>> {
         if dir.cluster == 0 {
@@ -393,6 +408,8 @@ impl FatVolume {
                 name,
                 Node {
                     cluster: c,
+                    cluster_hint: c,
+                    cluster_hint_index: 0,
                     size: le32(e, 28) as u64,
                     dir: e[11] & 0x10 != 0,
                     contiguous: false,
@@ -438,10 +455,11 @@ impl FatVolume {
         while done < want {
             let c = chain[(p / self.cluster_size()) as usize];
             let off = (p % self.cluster_size()) as usize;
-            let mut b = vec![0; self.cluster_size() as usize];
-            self.dev.read_at(self.cluster_offset(c), &mut b)?;
-            let n = core::cmp::min(want - done, b.len() - off);
-            out[done..done + n].copy_from_slice(&b[off..off + n]);
+            let n = core::cmp::min(want - done, self.cluster_size() as usize - off);
+            self.dev.read_at(
+                self.cluster_offset(c) + off as u64,
+                &mut out[done..done + n],
+            )?;
             done += n;
             p += n as u64;
         }
@@ -478,7 +496,7 @@ impl FatVolume {
         }
         Ok((out, case_flags))
     }
-    fn create(&self, dir: Node, name: &[u8], is_dir: bool) -> Result<Node> {
+    fn create(&mut self, dir: Node, name: &[u8], is_dir: bool) -> Result<Node> {
         let (short, case_flags) = Self::encode_short(name)?;
         if self.lookup(dir, name).is_ok() {
             return Err(Error::AlreadyExists);
@@ -508,6 +526,8 @@ impl FatVolume {
         }
         Ok(Node {
             cluster,
+            cluster_hint: cluster,
+            cluster_hint_index: 0,
             size: 0,
             dir: is_dir,
             contiguous: false,
@@ -548,47 +568,83 @@ impl FatVolume {
         self.dev.write(node.entry_offset, &e)?;
         Ok(())
     }
-    fn write(&self, node: Node, pos: u64, data: &[u8]) -> Result<Node> {
+    fn write(&mut self, mut node: Node, pos: u64, data: &[u8]) -> Result<Node> {
         if node.dir {
             return Err(Error::IsDirectory);
         }
+        if data.is_empty() {
+            return Ok(node);
+        }
         let need = pos.checked_add(data.len() as u64).ok_or(Error::Range)?;
-        let mut chain = self.chain(node.cluster)?;
-        if chain.is_empty() {
+        if node.cluster < 2 {
             let c = self.alloc_cluster()?;
-            chain.push(c);
+            node.cluster = c;
+            node.cluster_hint = c;
+            node.cluster_hint_index = 0;
             let mut e = [0; 32];
             self.dev.read_at(node.entry_offset, &mut e)?;
             e[20..22].copy_from_slice(&((c >> 16) as u16).to_le_bytes());
             e[26..28].copy_from_slice(&(c as u16).to_le_bytes());
             self.dev.write(node.entry_offset, &e)?;
         }
-        while (chain.len() as u64) * self.cluster_size() < need {
-            let c = self.alloc_cluster()?;
-            self.fat_write_entry(*chain.last().unwrap(), c)?;
-            chain.push(c);
+
+        let target_index = pos / self.cluster_size();
+        let (mut c, mut cluster_index) =
+            if node.cluster_hint >= 2 && node.cluster_hint_index <= target_index {
+                (node.cluster_hint, node.cluster_hint_index)
+            } else {
+                (node.cluster, 0)
+            };
+        while cluster_index < target_index {
+            let next = self.fat_entry(c)?;
+            c = if self.is_eoc(next) {
+                let allocated = self.alloc_cluster()?;
+                self.fat_write_entry(c, allocated)?;
+                allocated
+            } else if next < 2 || next >= self.bpb.total_clusters + 2 {
+                return Err(Error::Io);
+            } else {
+                next
+            };
+            cluster_index += 1;
         }
+
         let mut done = 0;
         let mut p = pos;
         while done < data.len() {
-            let c = chain[(p / self.cluster_size()) as usize];
             let off = (p % self.cluster_size()) as usize;
-            let mut b = vec![0; self.cluster_size() as usize];
-            self.dev.read_at(self.cluster_offset(c), &mut b)?;
-            let n = core::cmp::min(data.len() - done, b.len() - off);
-            b[off..off + n].copy_from_slice(&data[done..done + n]);
-            self.dev.write(self.cluster_offset(c), &b)?;
+            let n = core::cmp::min(data.len() - done, self.cluster_size() as usize - off);
+            self.dev
+                .write(self.cluster_offset(c) + off as u64, &data[done..done + n])?;
             done += n;
             p += n as u64;
+            if done < data.len() {
+                let next = self.fat_entry(c)?;
+                c = if self.is_eoc(next) {
+                    let allocated = self.alloc_cluster()?;
+                    self.fat_write_entry(c, allocated)?;
+                    allocated
+                } else if next < 2 || next >= self.bpb.total_clusters + 2 {
+                    return Err(Error::Io);
+                } else {
+                    next
+                };
+                cluster_index += 1;
+            }
         }
-        let size = core::cmp::max(node.size, pos + data.len() as u64);
-        let mut e = [0; 32];
-        self.dev.read_at(node.entry_offset, &mut e)?;
-        e[28..32].copy_from_slice(&(size as u32).to_le_bytes());
-        self.dev.write(node.entry_offset, &e)?;
-        Ok(Node { size, ..node })
+        let size = core::cmp::max(node.size, need);
+        if size != node.size {
+            self.dev
+                .write(node.entry_offset + 28, &(size as u32).to_le_bytes())?;
+        }
+        Ok(Node {
+            cluster_hint: c,
+            cluster_hint_index: cluster_index,
+            size,
+            ..node
+        })
     }
-    fn truncate(&self, node: Node, size: u64) -> Result<Node> {
+    fn truncate(&self, mut node: Node, size: u64) -> Result<Node> {
         if size > node.size {
             return Ok(node);
         }
@@ -598,14 +654,26 @@ impl FatVolume {
             for c in chain {
                 self.fat_write_entry(c, 0)?;
             }
+            node.cluster = 0;
+            node.cluster_hint = 0;
+            node.cluster_hint_index = 0;
         } else if keep < chain.len() {
             self.fat_write_entry(chain[keep - 1], self.fat_eoc())?;
             for c in &chain[keep..] {
                 self.fat_write_entry(*c, 0)?;
             }
+            node.cluster_hint = chain[keep - 1];
+            node.cluster_hint_index = keep as u64 - 1;
+        } else if node.cluster_hint_index >= keep as u64 {
+            node.cluster_hint = chain[keep - 1];
+            node.cluster_hint_index = keep as u64 - 1;
         }
         let mut e = [0; 32];
         self.dev.read_at(node.entry_offset, &mut e)?;
+        if keep == 0 {
+            e[20..22].copy_from_slice(&0u16.to_le_bytes());
+            e[26..28].copy_from_slice(&0u16.to_le_bytes());
+        }
         e[28..32].copy_from_slice(&(size as u32).to_le_bytes());
         self.dev.write(node.entry_offset, &e)?;
         Ok(Node { size, ..node })
@@ -672,6 +740,8 @@ impl ExFatVolume {
                     n,
                     Node {
                         cluster: le32(s, 20),
+                        cluster_hint: le32(s, 20),
+                        cluster_hint_index: 0,
                         size: le64(s, 24),
                         dir: le16(e, 4) & 0x10 != 0,
                         contiguous: s[1] & 2 != 0,
@@ -723,10 +793,11 @@ impl ExFatVolume {
         let mut done = 0;
         let mut off = (pos % self.cluster_size()) as usize;
         while done < want {
-            let mut b = vec![0; self.cluster_size() as usize];
-            self.dev.read_at(self.cluster_offset(c), &mut b)?;
-            let n = core::cmp::min(want - done, b.len() - off);
-            out[done..done + n].copy_from_slice(&b[off..off + n]);
+            let n = core::cmp::min(want - done, self.cluster_size() as usize - off);
+            self.dev.read_at(
+                self.cluster_offset(c) + off as u64,
+                &mut out[done..done + n],
+            )?;
             done += n;
             off = 0;
             if done < want && !node.contiguous {

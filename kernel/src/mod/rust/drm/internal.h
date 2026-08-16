@@ -32,6 +32,9 @@ int na_drm_add_framebuffer2(drm_device_t *device,
                             struct drm_mode_fb_cmd2 *command, fd_t *fd);
 void na_drm_release_framebuffer(drm_device_t *device,
                                 drm_framebuffer_t *framebuffer);
+int na_drm_get_framebuffer_handle(drm_device_t *device,
+                                  drm_framebuffer_t *framebuffer, fd_t *fd,
+                                  uint32_t *handle);
 int na_drm_dirty_framebuffer(drm_device_t *device,
                              struct drm_mode_fb_dirty_cmd *command, fd_t *fd);
 int na_drm_set_plane(drm_device_t *device, struct drm_mode_set_plane *command,
@@ -40,6 +43,7 @@ int na_drm_set_crtc(drm_device_t *device, struct drm_mode_crtc *command,
                     fd_t *fd);
 int na_drm_page_flip(drm_device_t *device,
                      struct drm_mode_crtc_page_flip *command, fd_t *fd);
-int na_drm_set_cursor(drm_device_t *device, struct drm_mode_cursor *command);
+int na_drm_set_cursor(drm_device_t *device, struct drm_mode_cursor *command,
+                      fd_t *fd);
 int na_drm_atomic_commit(drm_device_t *device, struct drm_mode_atomic *command,
                          fd_t *fd);

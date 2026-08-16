@@ -58,7 +58,7 @@ impl PhysicalAddress {
         self.0
     }
 
-    pub(crate) const fn new(address: u64) -> Self {
+    pub const fn new(address: u64) -> Self {
         Self(address)
     }
 }
@@ -164,6 +164,10 @@ impl DmaBuffer {
 
     pub const fn length(&self) -> usize {
         self.length
+    }
+
+    pub fn address(&self) -> usize {
+        self.ptr.as_ptr() as usize
     }
 
     pub fn as_slice(&self) -> &[u8] {

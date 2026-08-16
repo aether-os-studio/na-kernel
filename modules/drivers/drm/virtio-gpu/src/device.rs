@@ -100,11 +100,18 @@ impl GpuDevice {
         let drm = drm::DeviceBuilder::new(
             self,
             c"dri/card",
-            c"virtio_gpu",
-            c"20260610",
-            c"NaOS virtio GPU DRM",
+            drm::DriverInfo::new(
+                c"virtio_gpu",
+                c"virtio_gpu",
+                c"20260610",
+                c"NaOS virtio GPU DRM",
+                0,
+                0,
+                0,
+            ),
         )
         .render_node(true)
+        .atomic_modeset(true)
         .register(pci.as_ref())?;
         KernelLog::write(c"virtio-gpu: drm registered\n");
         let _ = Box::leak(Box::new(drm));

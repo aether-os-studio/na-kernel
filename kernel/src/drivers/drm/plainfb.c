@@ -493,9 +493,10 @@ static int plainfb_destroy_dumb(drm_device_t *drm_dev, uint32_t handle,
 }
 
 static int plainfb_set_cursor(drm_device_t *drm_dev,
-                              struct drm_mode_cursor *cursor) {
+                              struct drm_mode_cursor *cursor, fd_t *fd) {
     (void)drm_dev;
     (void)cursor;
+    (void)fd;
     return -ENOTSUP;
 }
 
@@ -1203,6 +1204,7 @@ int plainfb_get_planes(drm_device_t *drm_dev, drm_plane_t **planes,
 // DRM device operations structure
 drm_device_op_t plainfb_drm_device_op = {
     .supports_render_node = false,
+    .supports_atomic_modeset = true,
     .get_display_info = plainfb_get_display_info,
     .get_fb = NULL,
     .create_dumb = plainfb_create_dumb,
@@ -1319,14 +1321,22 @@ void drm_plainfb_init() {
 
     memset(gpu_device->dumbbuffers, 0, sizeof(gpu_device->dumbbuffers));
 
-    // Register with DRM subsystem using PCI device
-    drm_device_t *drm_dev =
-        drm_regist_pci_dev(gpu_device, &plainfb_drm_device_op, fake_gpu_device);
-    if (drm_dev) {
-        const char *driver_name = "simpledrm";
+    static const drm_driver_info_t driver_info = {
+        .kernel_name = "simpledrm",
+        .uapi_name = "simpledrm",
+        .date = "20260310",
+        .description = "NaOS plain framebuffer DRM",
+        .version_major = 1,
+        .version_minor = 0,
+        .version_patchlevel = 0,
+    };
 
-        drm_device_set_driver_info(drm_dev, driver_name, "20260310",
-                                   "NaOS plain framebuffer DRM");
+    // Register with DRM subsystem using PCI device
+    drm_device_t *drm_dev = drm_register_device_with_info(
+        gpu_device, &plainfb_drm_device_op, "dri/card", fake_gpu_device,
+        &driver_info);
+    if (drm_dev) {
+        const char *driver_name = driver_info.kernel_name;
 
         char driver_root[128];
         sprintf(driver_root, "/sys/bus/pci/drivers/%s", driver_name);

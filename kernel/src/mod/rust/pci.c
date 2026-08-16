@@ -1,4 +1,5 @@
 #include <drivers/bus/pci.h>
+#include <drivers/bus/pci_msi.h>
 #include <libs/klibc.h>
 #include <mod/rust/api.h>
 
@@ -15,7 +16,7 @@ static bool na_pci_match(pci_device_t *device, const pci_driver_t *driver) {
 }
 
 static int na_pci_probe(pci_device_t *device) {
-    pci_driver_t *driver = pci_get_current_probe_driver();
+    pci_driver_t *driver = device->kernel_driver;
     if (!driver)
         return -ENODEV;
 
@@ -60,6 +61,23 @@ int na_pci_bar_info(pci_device_t *device, uint8_t index,
         .size = bar->size,
         .is_mmio = bar->mmio,
         .prefetchable = bar->prefetchable,
+    };
+    return 0;
+}
+
+int na_pci_rom_bar(pci_device_t *device, na_pci_bar_info_t *info) {
+    if (!device || !info)
+        return -EINVAL;
+
+    pci_bar_t *rom = &device->rom;
+    if (!rom->size)
+        return -ENOENT;
+
+    *info = (na_pci_bar_info_t){
+        .address = rom->address,
+        .size = rom->size,
+        .is_mmio = rom->mmio,
+        .prefetchable = rom->prefetchable,
     };
     return 0;
 }
@@ -157,4 +175,50 @@ int na_pci_driver_register(const char *name, uint32_t class_id, int flags,
     if (result < 0)
         free(bridge);
     return result;
+}
+
+typedef struct na_msi_bridge_irq {
+    struct msi_desc_t desc;
+    na_irq_handler_fn handler;
+    void *handler_data;
+} na_msi_bridge_irq_t;
+
+static void na_msi_irq_dispatch(uint64_t irq_num, void *data,
+                                struct pt_regs *regs) {
+    na_msi_bridge_irq_t *irq = data;
+    (void)regs;
+    irq->handler(irq_num, irq->handler_data);
+}
+
+int na_msi_setup_irq(pci_device_t *device, bool prefer_msix,
+                     na_irq_handler_fn handler, void *handler_data,
+                     const char *name, uint64_t *out_handle) {
+    na_msi_bridge_irq_t *irq;
+
+    if (!device || !handler || !name || !out_handle)
+        return -EINVAL;
+
+    irq = calloc(1, sizeof(*irq));
+    if (!irq)
+        return -ENOMEM;
+
+    irq->handler = handler;
+    irq->handler_data = handler_data;
+
+    int result = msi_setup_irq(&irq->desc, device, 0, prefer_msix,
+                               na_msi_irq_dispatch, irq, (char *)name);
+    if (result < 0) {
+        free(irq);
+        return result;
+    }
+    *out_handle = (uint64_t)(uintptr_t)irq;
+    return 0;
+}
+
+void na_msi_release_irq(uint64_t handle) {
+    na_msi_bridge_irq_t *irq = (na_msi_bridge_irq_t *)(uintptr_t)handle;
+    if (!irq)
+        return;
+    msi_release_desc(&irq->desc);
+    free(irq);
 }

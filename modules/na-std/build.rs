@@ -41,6 +41,7 @@ fn main() {
         "DrmPageFlip = na_drm_page_flip",
         "DrmCursorUpdate = na_drm_cursor_update",
         "DrmAtomicProperty = na_drm_atomic_property",
+        "DrmDriverInfo = na_drm_driver_info",
         "DrmDriverOps = na_drm_driver_ops",
     ];
 

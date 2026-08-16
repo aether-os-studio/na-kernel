@@ -4,9 +4,11 @@
 #include <dev/device.h>
 #include <arch/arch.h>
 #include <task/task.h>
+#include <libs/klibc.h>
 
 DEFINE_LLIST(blk_dev_list);
 uint64_t blk_devnum = 0;
+spinlock_t blk_dev_lock = SPIN_INIT;
 
 uint64_t device_regist_blk(int subtype, void *data, char *name, void *ioctl,
                            void *read, void *write) {
@@ -15,42 +17,58 @@ uint64_t device_regist_blk(int subtype, void *data, char *name, void *ioctl,
 }
 
 blkdev_t *find_blkdev_by_ptr(void *ptr) {
-    blkdev_t *dev, *n;
+    blkdev_t *dev, *n, *found = NULL;
+    spin_lock(&blk_dev_lock);
     llist_for_each(dev, n, &blk_dev_list, list) {
-        if (dev->ptr == ptr)
-            return dev;
+        if (dev->ptr == ptr) {
+            found = dev;
+            break;
+        }
     }
-    return NULL;
+    spin_unlock(&blk_dev_lock);
+    return found;
 }
 
 blkdev_t *find_blkdev_by_id(uint64_t id) {
-    blkdev_t *dev, *n;
+    blkdev_t *dev, *n, *found = NULL;
+    spin_lock(&blk_dev_lock);
     llist_for_each(dev, n, &blk_dev_list, list) {
-        if (dev->id == id)
-            return dev;
+        if (dev->id == id) {
+            found = dev;
+            break;
+        }
     }
-    return NULL;
+    spin_unlock(&blk_dev_lock);
+    return found;
 }
 
 blkdev_t *find_blkdev_by_name(const char *name) {
-    blkdev_t *dev, *n;
+    blkdev_t *dev, *n, *found = NULL;
+    spin_lock(&blk_dev_lock);
     llist_for_each(dev, n, &blk_dev_list, list) {
-        if (dev->name && strcmp(dev->name, name) == 0)
-            return dev;
+        if (dev->name && strcmp(dev->name, name) == 0) {
+            found = dev;
+            break;
+        }
     }
-    return NULL;
+    spin_unlock(&blk_dev_lock);
+    return found;
 }
 
 void blkdev_register(blkdev_t *dev) {
+    spin_lock(&blk_dev_lock);
     llist_append(&blk_dev_list, &dev->list);
     dev->id = blk_devnum++;
+    spin_unlock(&blk_dev_lock);
     dev->mounted = false;
 }
 
 void blkdev_unregister(blkdev_t *dev) {
     if (dev->mounted)
         blkdev_unmount(dev);
+    spin_lock(&blk_dev_lock);
     llist_delete(&dev->list);
+    spin_unlock(&blk_dev_lock);
     free(dev->name);
 }
 
@@ -93,10 +111,12 @@ int blkdev_mount(blkdev_t *dev) {
         return -EIO;
     }
 
+    spin_lock(&partition_lock);
     for (uint32_t j = 0; j < 128; j++) {
         if (dptes[j].starting_lba == 0 || dptes[j].ending_lba == 0)
             continue;
         if (partition_num >= MAX_PARTITIONS_NUM) {
+            spin_unlock(&partition_lock);
             free(dptes);
             free(buffer);
             return -ENOSPC;
@@ -116,6 +136,7 @@ int blkdev_mount(blkdev_t *dev) {
 
         partition_num++;
     }
+    spin_unlock(&partition_lock);
 
     free(dptes);
     free(buffer);
@@ -130,7 +151,9 @@ probe_mbr:
     is_iso9660 = blkdev_read(dev->id, 0x8001, iso9660_detect, 5) == 5 &&
                  !memcmp(iso9660_detect, "CD001", 5);
     if (is_iso9660) {
+        spin_lock(&partition_lock);
         if (partition_num >= MAX_PARTITIONS_NUM) {
+            spin_unlock(&partition_lock);
             free(iso9660_detect);
             return -ENOSPC;
         }
@@ -149,6 +172,7 @@ probe_mbr:
                               partition_ioctl, partition_read, partition_write);
 
         partition_num++;
+        spin_unlock(&partition_lock);
         free(iso9660_detect);
         dev->mounted = true;
         return 0;
@@ -164,36 +188,15 @@ probe_mbr:
         return -EIO;
     }
 
-    if (boot_sector->bs_trail_sig != 0xAA55) {
-        if (partition_num >= MAX_PARTITIONS_NUM) {
-            free(boot_sector);
-            return -ENOSPC;
-        }
+    uint64_t old_partition_num = partition_num;
 
-        partition_t *part = &partitions[partition_num];
-        part->blkdev_id = dev->id;
-        part->starting_lba = 0;
-        part->ending_lba =
-            blkdev_ioctl(dev->id, IOCTL_GETSIZE, 0) / lba_size - 1;
-        part->type = RAW;
-
-        char pname[32];
-        sprintf(pname, "%spart%d", dev->name, dev->id);
-        partitions[partition_num].dev =
-            device_regist_blk(DEV_PART, &partitions[partition_num], pname,
-                              partition_ioctl, partition_read, partition_write);
-
-        partition_num++;
-        free(boot_sector);
-        dev->mounted = true;
-        return 0;
-    }
-
+    spin_lock(&partition_lock);
     for (int j = 0; j < MBR_MAX_PARTITION_NUM; j++) {
         if (boot_sector->dpte[j].start_lba == 0 ||
             boot_sector->dpte[j].sectors_limit == 0)
             continue;
         if (partition_num >= MAX_PARTITIONS_NUM) {
+            spin_unlock(&partition_lock);
             free(boot_sector);
             return -ENOSPC;
         }
@@ -213,8 +216,29 @@ probe_mbr:
 
         partition_num++;
     }
+    spin_unlock(&partition_lock);
 
     free(boot_sector);
+
+    if (old_partition_num == partition_num) {
+        spin_lock(&partition_lock);
+        partition_t *part = &partitions[partition_num];
+        part->blkdev_id = dev->id;
+        part->starting_lba = 0;
+        part->ending_lba =
+            blkdev_ioctl(dev->id, IOCTL_GETSIZE, 0) / lba_size - 1;
+        part->type = RAW;
+
+        char pname[32];
+        sprintf(pname, "%spart%d", dev->name, dev->id);
+        partitions[partition_num].dev =
+            device_regist_blk(DEV_PART, &partitions[partition_num], pname,
+                              partition_ioctl, partition_read, partition_write);
+
+        partition_num++;
+        spin_unlock(&partition_lock);
+    }
+
     dev->mounted = true;
     return 0;
 }
@@ -223,6 +247,7 @@ int blkdev_unmount(blkdev_t *dev) {
     if (!dev || !dev->mounted)
         return -1;
 
+    spin_lock(&partition_lock);
     for (int i = 0; i < partition_num; i++) {
         if (partitions[i].blkdev_id == dev->id) {
             partitions[i].blkdev_id = (uint64_t)-1;
@@ -230,6 +255,7 @@ int blkdev_unmount(blkdev_t *dev) {
             partitions[i].ending_lba = 0;
         }
     }
+    spin_unlock(&partition_lock);
     dev->mounted = false;
     return 0;
 }

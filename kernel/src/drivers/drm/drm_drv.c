@@ -350,21 +350,39 @@ ssize_t drm_poll(void *data, size_t event, fd_t *fd) {
  *
  * Maps a DRM buffer (typically a dumb buffer) to user space
  */
-void *drm_map(void *data, void *addr, uint64_t offset, uint64_t len) {
-    drm_device_t *dev = drm_data_to_device(data);
+void *drm_map(void *data, void *addr, uint64_t offset, uint64_t len,
+              uint64_t prot, fd_t *fd) {
+    drm_file_t *file = drm_current_file(data, fd);
+    drm_device_t *dev = file ? file->dev : drm_data_to_device(data);
     if (!dev) {
         return (void *)-ENODEV;
     }
 
+    (void)prot;
     uint64_t user_addr = (uint64_t)addr;
-    uint64_t kernel_base = get_physical_memory_offset();
 
     if (dev->op && dev->op->mmap) {
-        int ret = dev->op->mmap(dev, user_addr, offset, len);
+        uint64_t phys = 0;
+        int ret = dev->op->mmap(dev, file, offset, len, &phys);
         if (ret == 0) {
+            if (!file || !current_task || !current_task->mm ||
+                (phys & (PAGE_SIZE - 1)) != (user_addr & (PAGE_SIZE - 1))) {
+                return (void *)-EINVAL;
+            }
+
+            uint64_t page_delta = phys & (PAGE_SIZE - 1);
+            uint64_t map_phys = PADDING_DOWN(phys, PAGE_SIZE);
+            uint64_t map_addr = PADDING_DOWN(user_addr, PAGE_SIZE);
+            uint64_t map_len = PADDING_UP(len + page_delta, PAGE_SIZE);
+            if (map_page_range(
+                    (uint64_t *)phys_to_virt(current_task->mm->page_table_addr),
+                    map_addr, map_phys, map_len,
+                    PT_FLAG_R | PT_FLAG_W | PT_FLAG_U) != 0) {
+                return (void *)-ENOMEM;
+            }
             return addr;
         }
-        if (ret != -ENOSYS) {
+        if (ret != -ENOSYS && ret != -ENOTSUP) {
             return (void *)(int64_t)ret;
         }
     }
@@ -425,12 +443,22 @@ void *drm_map(void *data, void *addr, uint64_t offset, uint64_t len) {
  */
 static void drm_device_init(drm_device_t *dev, void *data,
                             drm_device_op_t *op) {
+    static const drm_driver_info_t default_driver_info = {
+        .kernel_name = DRM_NAME,
+        .uapi_name = DRM_NAME,
+        .date = "20060810",
+        .description = "NaOS DRM",
+        .version_major = 1,
+        .version_minor = 0,
+        .version_patchlevel = 0,
+    };
+
     memset(dev, 0, sizeof(drm_device_t));
     // ID initialize after device registed
     dev->data = data;
     dev->op = op;
     dev->pci_dev = NULL;
-    drm_device_set_driver_info(dev, DRM_NAME, "20060810", "NaOS DRM");
+    drm_device_set_driver_info(dev, &default_driver_info);
     spin_init(&dev->event_lock);
     spin_init(&dev->lease_lock);
     dev->next_lease_id = 1;
@@ -446,7 +474,7 @@ ssize_t drm_open(void *data, void *arg) {
     struct vfs_file *file = (struct vfs_file *)arg;
     drm_file_t *drm_file;
 
-    if (!node || !file) {
+    if (!node || !node->dev || !file) {
         return -EINVAL;
     }
 
@@ -458,7 +486,9 @@ ssize_t drm_open(void *data, void *arg) {
     drm_file->magic = DRM_FILE_MAGIC;
     drm_file->dev = node->dev;
     drm_file->type = node->type;
+    drm_file->authenticated = true;
     drm_file->event_node = vfs_igrab(file->f_inode);
+
     if (node->dev && node->dev->op && node->dev->op->open) {
         int ret = node->dev->op->open(node->dev, drm_file);
         if (ret != 0) {
@@ -478,6 +508,7 @@ ssize_t drm_open(void *data, void *arg) {
         free(drm_file);
         return -EBADF;
     }
+
     return 0;
 }
 
@@ -536,25 +567,36 @@ ssize_t drm_close(void *data, void *arg) {
     return 0;
 }
 
-void drm_device_set_driver_info(drm_device_t *dev, const char *name,
-                                const char *date, const char *desc) {
+void drm_device_set_driver_info(drm_device_t *dev,
+                                const drm_driver_info_t *info) {
     if (!dev) {
         return;
     }
 
-    if (!name || !name[0]) {
-        name = DRM_NAME;
-    }
-    if (!date || !date[0]) {
-        date = "20060810";
-    }
-    if (!desc || !desc[0]) {
-        desc = "NaOS DRM";
-    }
+    const char *kernel_name = info && info->kernel_name && info->kernel_name[0]
+                                  ? info->kernel_name
+                                  : DRM_NAME;
+    const char *uapi_name = info && info->uapi_name && info->uapi_name[0]
+                                ? info->uapi_name
+                                : kernel_name;
+    const char *date =
+        info && info->date && info->date[0] ? info->date : "20060810";
+    const char *description = info && info->description && info->description[0]
+                                  ? info->description
+                                  : "NaOS DRM";
 
-    strncpy(dev->driver_name, name, sizeof(dev->driver_name) - 1);
+    memset(dev->driver_name, 0, sizeof(dev->driver_name));
+    memset(dev->driver_uapi_name, 0, sizeof(dev->driver_uapi_name));
+    memset(dev->driver_date, 0, sizeof(dev->driver_date));
+    memset(dev->driver_desc, 0, sizeof(dev->driver_desc));
+    strncpy(dev->driver_name, kernel_name, sizeof(dev->driver_name) - 1);
+    strncpy(dev->driver_uapi_name, uapi_name,
+            sizeof(dev->driver_uapi_name) - 1);
     strncpy(dev->driver_date, date, sizeof(dev->driver_date) - 1);
-    strncpy(dev->driver_desc, desc, sizeof(dev->driver_desc) - 1);
+    strncpy(dev->driver_desc, description, sizeof(dev->driver_desc) - 1);
+    dev->driver_version_major = info ? info->version_major : 1;
+    dev->driver_version_minor = info ? info->version_minor : 0;
+    dev->driver_version_patchlevel = info ? info->version_patchlevel : 0;
 }
 
 /**
@@ -702,9 +744,7 @@ static void drm_import_resource_id(drm_device_t *dev, uint32_t obj_id) {
 drm_device_t *drm_register_device_with_info(void *data, drm_device_op_t *op,
                                             const char *node_name,
                                             pci_device_t *pci_dev,
-                                            const char *driver_name,
-                                            const char *driver_date,
-                                            const char *driver_desc) {
+                                            const drm_driver_info_t *info) {
     char card_dev_name[32];
     char render_dev_name[32];
     uint32_t card_minor = (uint32_t)drm_id;
@@ -721,7 +761,7 @@ drm_device_t *drm_register_device_with_info(void *data, drm_device_op_t *op,
     }
 
     drm_device_init(dev, data, op);
-    drm_device_set_driver_info(dev, driver_name, driver_date, driver_desc);
+    drm_device_set_driver_info(dev, info);
     dev->pci_dev = pci_dev;
     dev->primary_minor = card_minor;
     dev->render_minor = render_minor;
@@ -950,8 +990,17 @@ drm_device_t *drm_register_device_with_info(void *data, drm_device_op_t *op,
 
 drm_device_t *drm_register_device(void *data, drm_device_op_t *op,
                                   const char *name, pci_device_t *pci_dev) {
-    return drm_register_device_with_info(data, op, name, pci_dev, DRM_NAME,
-                                         "20060810", "NaOS DRM");
+    static const drm_driver_info_t default_driver_info = {
+        .kernel_name = DRM_NAME,
+        .uapi_name = DRM_NAME,
+        .date = "20060810",
+        .description = "NaOS DRM",
+        .version_major = 1,
+        .version_minor = 0,
+        .version_patchlevel = 0,
+    };
+    return drm_register_device_with_info(data, op, name, pci_dev,
+                                         &default_driver_info);
 }
 
 /**

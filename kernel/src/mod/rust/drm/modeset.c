@@ -2,12 +2,14 @@
 
 static int na_drm_add_framebuffer(drm_device_t *device,
                                   na_drm_framebuffer_request_t *request,
-                                  uint32_t *framebuffer_id) {
+                                  uint32_t *framebuffer_id, fd_t *fd) {
     na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
     if (!bridge || !request || !framebuffer_id ||
         !bridge->ops.create_framebuffer)
         return -ENOSYS;
 
+    request->file_id =
+        (uint64_t)(uintptr_t)(fd ? device_file_private(fd) : NULL);
     int result = bridge->ops.create_framebuffer(bridge->ops.context, request);
     if (result < 0)
         return result;
@@ -17,7 +19,9 @@ static int na_drm_add_framebuffer(drm_device_t *device,
     if (!framebuffer) {
         if (bridge->ops.release_framebuffer)
             bridge->ops.release_framebuffer(bridge->ops.context,
-                                            request->handles[0]);
+                                            request->driver_handle
+                                                ? request->driver_handle
+                                                : request->handles[0]);
         return -ENOMEM;
     }
 
@@ -27,6 +31,8 @@ static int na_drm_add_framebuffer(drm_device_t *device,
     framebuffer->bpp = request->bits_per_pixel;
     framebuffer->depth = request->depth;
     framebuffer->handle = request->handles[0];
+    framebuffer->driver_handle =
+        request->driver_handle ? request->driver_handle : request->handles[0];
     framebuffer->modifier = request->modifiers[0];
     framebuffer->format = request->pixel_format;
     framebuffer->flags = request->flags;
@@ -48,7 +54,7 @@ int na_drm_add_framebuffer_legacy(drm_device_t *device,
         .handles = {command->handle},
         .pitches = {command->pitch},
     };
-    return na_drm_add_framebuffer(device, &request, &command->fb_id);
+    return na_drm_add_framebuffer(device, &request, &command->fb_id, fd);
 }
 
 int na_drm_add_framebuffer2(drm_device_t *device,
@@ -67,7 +73,7 @@ int na_drm_add_framebuffer2(drm_device_t *device,
     memcpy(request.pitches, command->pitches, sizeof(request.pitches));
     memcpy(request.offsets, command->offsets, sizeof(request.offsets));
     memcpy(request.modifiers, command->modifier, sizeof(request.modifiers));
-    return na_drm_add_framebuffer(device, &request, &command->fb_id);
+    return na_drm_add_framebuffer(device, &request, &command->fb_id, fd);
 }
 
 void na_drm_release_framebuffer(drm_device_t *device,
@@ -75,7 +81,20 @@ void na_drm_release_framebuffer(drm_device_t *device,
     na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
     if (bridge && framebuffer && bridge->ops.release_framebuffer)
         bridge->ops.release_framebuffer(bridge->ops.context,
-                                        framebuffer->handle);
+                                        framebuffer->driver_handle);
+}
+
+int na_drm_get_framebuffer_handle(drm_device_t *device,
+                                  drm_framebuffer_t *framebuffer, fd_t *fd,
+                                  uint32_t *handle) {
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+    if (!bridge || !framebuffer || !handle ||
+        !bridge->ops.get_framebuffer_handle)
+        return -ENOSYS;
+    uint64_t file_id =
+        (uint64_t)(uintptr_t)(fd ? device_file_private(fd) : NULL);
+    return bridge->ops.get_framebuffer_handle(
+        bridge->ops.context, file_id, framebuffer->driver_handle, handle);
 }
 
 int na_drm_dirty_framebuffer(drm_device_t *device,
@@ -108,7 +127,7 @@ int na_drm_dirty_framebuffer(drm_device_t *device,
         return -ENOENT;
     }
     int result = bridge->ops.dirty_framebuffer(
-        bridge->ops.context, command->fb_id, framebuffer->handle,
+        bridge->ops.context, command->fb_id, framebuffer->driver_handle,
         command->flags, command->color, clips, command->num_clips);
     drm_framebuffer_free(&device->resource_mgr, framebuffer->id);
     free(clips);
@@ -140,7 +159,7 @@ int na_drm_set_plane(drm_device_t *device, struct drm_mode_set_plane *command,
         drm_framebuffer_get(&device->resource_mgr, command->fb_id);
     if (!framebuffer)
         return -ENOENT;
-    update.framebuffer_handle = framebuffer->handle;
+    update.framebuffer_handle = framebuffer->driver_handle;
     int result = bridge->ops.set_plane(bridge->ops.context, &update);
     drm_framebuffer_free(&device->resource_mgr, framebuffer->id);
     return result;
@@ -177,7 +196,7 @@ int na_drm_set_crtc(drm_device_t *device, struct drm_mode_crtc *command,
             drm_framebuffer_get(&device->resource_mgr, command->fb_id);
         if (!framebuffer)
             return -ENOENT;
-        update.framebuffer_handle = framebuffer->handle;
+        update.framebuffer_handle = framebuffer->driver_handle;
     }
     if (command->mode_valid)
         na_drm_mode_export(&update.mode_info, &command->mode);
@@ -204,7 +223,7 @@ int na_drm_page_flip(drm_device_t *device,
         drm_framebuffer_get(&device->resource_mgr, command->fb_id);
     if (!framebuffer)
         return -ENOENT;
-    flip.framebuffer_handle = framebuffer->handle;
+    flip.framebuffer_handle = framebuffer->driver_handle;
     int result = bridge->ops.page_flip(bridge->ops.context, &flip);
     drm_framebuffer_free(&device->resource_mgr, framebuffer->id);
     if (result == 0 && (command->flags & DRM_MODE_PAGE_FLIP_EVENT))
@@ -213,12 +232,14 @@ int na_drm_page_flip(drm_device_t *device,
     return result;
 }
 
-int na_drm_set_cursor(drm_device_t *device, struct drm_mode_cursor *command) {
+int na_drm_set_cursor(drm_device_t *device, struct drm_mode_cursor *command,
+                      fd_t *fd) {
     na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
     if (!bridge || !command || !bridge->ops.set_cursor)
         return -ENOSYS;
 
     na_drm_cursor_update_t update = {
+        .file_id = (uint64_t)(uintptr_t)(fd ? device_file_private(fd) : NULL),
         .flags = command->flags,
         .crtc_id = command->crtc_id,
         .x = command->x,
@@ -318,7 +339,7 @@ int na_drm_atomic_commit(drm_device_t *device, struct drm_mode_atomic *command,
                         goto out;
                     }
                     properties[property_index].framebuffer_handle =
-                        framebuffer->handle;
+                        framebuffer->driver_handle;
                     drm_framebuffer_free(&device->resource_mgr,
                                          framebuffer->id);
                 }

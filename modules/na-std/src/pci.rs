@@ -110,6 +110,16 @@ impl Device<'_> {
         Ok(Bar::Port { base, length })
     }
 
+    pub fn rom_bar(&self) -> Result<Bar> {
+        let mut raw = bindings::PciBarInfo::default();
+        let status = unsafe { bindings::na_pci_rom_bar(self.raw.ptr.as_ptr(), &mut raw) };
+        Error::from_status(status)?;
+        Ok(Bar::Memory {
+            range: PhysicalRange::new(raw.address, raw.size)?,
+            prefetchable: raw.prefetchable,
+        })
+    }
+
     pub fn read_config<T: ConfigValue>(&self, offset: u16) -> Result<T> {
         let mut value = 0;
         let status = unsafe {
@@ -158,6 +168,30 @@ impl Device<'_> {
 
     pub(crate) fn raw_ptr(&self) -> *mut bindings::PciDevice {
         self.raw.ptr.as_ptr()
+    }
+
+    /// Retains access to the kernel PCI device beyond the probe callback.
+    /// The device object lives as long as the PCI bus enumeration does.
+    pub fn retain(self) -> DeviceHandle {
+        DeviceHandle {
+            ptr: self.raw.ptr.as_ptr(),
+        }
+    }
+}
+
+/// Long-lived handle to a kernel PCI device (see `Device::retain`).
+pub struct DeviceHandle {
+    ptr: *mut bindings::PciDevice,
+}
+
+unsafe impl Send for DeviceHandle {}
+unsafe impl Sync for DeviceHandle {}
+
+impl DeviceHandle {
+    /// Reborrows the device for kernel calls (MSI setup, config access).
+    pub fn as_device(&self) -> Device<'_> {
+        // SAFETY: the kernel PCI device outlives every bus enumeration.
+        Device::from_raw(self.ptr).unwrap()
     }
 }
 
@@ -263,5 +297,60 @@ impl<D: Driver> DriverBuilder<D> {
             Ok(Probe::Continue) => 1,
             Err(error) => error.status(),
         }
+    }
+}
+
+pub trait IrqCallback: Sync {
+    /// Runs in interrupt context — keep the handler short.
+    fn irq(&self, irq_num: u64);
+}
+
+/// Message-Signaled Interrupt registered with the kernel on behalf of a
+/// Rust PCI driver. Keeps the callback alive; released when dropped.
+pub struct MsiIrq<C: IrqCallback + 'static> {
+    handle: u64,
+    _callback: &'static C,
+}
+
+impl<C: IrqCallback + 'static> MsiIrq<C> {
+    /// Programs MSI (or MSI-X when `prefer_msix`) and registers `callback`
+    /// as the interrupt handler.
+    pub fn setup(
+        device: &Device<'_>,
+        prefer_msix: bool,
+        callback: &'static C,
+        name: &CStr,
+    ) -> Result<Self> {
+        let mut handle = 0;
+        let data = callback as *const C as *mut core::ffi::c_void;
+        let status = unsafe {
+            bindings::na_msi_setup_irq(
+                device.raw.ptr.as_ptr(),
+                prefer_msix,
+                Some(Self::irq_shim),
+                data,
+                name.as_ptr(),
+                &mut handle,
+            )
+        };
+        Error::from_status(status)?;
+        Ok(Self {
+            handle,
+            _callback: callback,
+        })
+    }
+
+    extern "C" fn irq_shim(irq_num: u64, data: *mut core::ffi::c_void) {
+        // SAFETY: `data` was produced from the `&'static C` passed to
+        // `setup`; the reference stays alive for the lifetime of the
+        // returned handle.
+        let callback = unsafe { &*(data as *const C) };
+        callback.irq(irq_num);
+    }
+}
+
+impl<C: IrqCallback + 'static> Drop for MsiIrq<C> {
+    fn drop(&mut self) {
+        unsafe { bindings::na_msi_release_irq(self.handle) };
     }
 }

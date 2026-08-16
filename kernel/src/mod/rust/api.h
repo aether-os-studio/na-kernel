@@ -102,6 +102,25 @@ void na_mutex_lock(na_mutex_t *mutex);
 void na_mutex_unlock(na_mutex_t *mutex);
 int na_acpi_table_find(const char signature[4], UacpiTable *table);
 void na_acpi_table_release(UacpiTable *table);
+int na_acpi_atrm_read(uint8_t *buf, size_t buf_size, size_t *out_len);
+
+typedef struct na_boot_framebuffer {
+    uint64_t physical_address;
+    uint64_t width;
+    uint64_t height;
+    uint64_t bpp;
+    uint64_t pitch;
+    uint8_t red_mask_size;
+    uint8_t red_mask_shift;
+    uint8_t green_mask_size;
+    uint8_t green_mask_shift;
+    uint8_t blue_mask_size;
+    uint8_t blue_mask_shift;
+} na_boot_framebuffer_t;
+typedef na_boot_framebuffer_t BootFramebuffer;
+
+int na_boot_get_framebuffer(na_boot_framebuffer_t *out);
+int na_tty_rebind_framebuffer(const na_boot_framebuffer_t *framebuffer);
 
 typedef struct na_pci_device_info {
     uint32_t class_code;
@@ -140,6 +159,7 @@ void na_log(const char *message);
 int na_pci_device_info(pci_device_t *device, na_pci_device_info_t *info);
 int na_pci_bar_info(pci_device_t *device, uint8_t index,
                     na_pci_bar_info_t *info);
+int na_pci_rom_bar(pci_device_t *device, na_pci_bar_info_t *info);
 int na_pci_config_read(pci_device_t *device, uint16_t offset, uint8_t width,
                        uint32_t *value);
 int na_pci_config_write(pci_device_t *device, uint16_t offset, uint8_t width,
@@ -148,6 +168,13 @@ int na_pci_bar_claim(pci_device_t *device, uint8_t index);
 void na_pci_bar_release(pci_device_t *device, uint8_t index);
 int na_pci_driver_register(const char *name, uint32_t class_id, int flags,
                            const na_pci_driver_ops_t *ops);
+
+typedef void (*na_irq_handler_fn)(uint64_t irq_num, void *data);
+
+int na_msi_setup_irq(pci_device_t *device, bool prefer_msix,
+                     na_irq_handler_fn handler, void *handler_data,
+                     const char *name, uint64_t *out_handle);
+void na_msi_release_irq(uint64_t handle);
 
 struct na_virtio_device;
 typedef struct na_virtio_device na_virtio_device_t;
@@ -274,6 +301,8 @@ typedef struct na_drm_framebuffer_request {
     uint32_t pitches[4];
     uint32_t offsets[4];
     uint64_t modifiers[4];
+    uint64_t file_id;
+    uint32_t driver_handle;
 } na_drm_framebuffer_request_t;
 typedef na_drm_framebuffer_request_t DrmFramebufferRequest;
 
@@ -324,6 +353,7 @@ typedef struct na_drm_page_flip {
 typedef na_drm_page_flip_t DrmPageFlip;
 
 typedef struct na_drm_cursor_update {
+    uint64_t file_id;
     uint32_t flags;
     uint32_t crtc_id;
     int32_t x;
@@ -342,9 +372,21 @@ typedef struct na_drm_atomic_property {
 } na_drm_atomic_property_t;
 typedef na_drm_atomic_property_t DrmAtomicProperty;
 
+typedef struct na_drm_driver_info {
+    const char *kernel_name;
+    const char *uapi_name;
+    const char *date;
+    const char *description;
+    int version_major;
+    int version_minor;
+    int version_patchlevel;
+} na_drm_driver_info_t;
+typedef na_drm_driver_info_t DrmDriverInfo;
+
 typedef struct na_drm_driver_ops {
     void *context;
     bool supports_render_node;
+    bool supports_atomic_modeset;
     int (*open)(void *context, uint64_t file_id);
     void (*close)(void *context, uint64_t file_id);
     int (*get_capability)(void *context, uint64_t capability, uint64_t *value);
@@ -371,6 +413,9 @@ typedef struct na_drm_driver_ops {
     int (*create_framebuffer)(void *context,
                               na_drm_framebuffer_request_t *request);
     void (*release_framebuffer)(void *context, uint32_t handle);
+    int (*get_framebuffer_handle)(void *context, uint64_t file_id,
+                                  uint32_t framebuffer_handle,
+                                  uint32_t *gem_handle);
     int (*dirty_framebuffer)(void *context, uint32_t framebuffer_id,
                              uint32_t framebuffer_handle, uint32_t flags,
                              uint32_t color, const na_drm_clip_t *clips,
@@ -383,16 +428,24 @@ typedef struct na_drm_driver_ops {
     int (*atomic_commit)(void *context, uint32_t flags, uint64_t user_data,
                          const na_drm_atomic_property_t *properties,
                          size_t property_count);
+    int (*mmap)(void *context, uint64_t file_id, uint64_t offset,
+                uint64_t length, uint64_t *physical_address);
+    int (*prime_export)(void *context, uint64_t file_id, uint32_t handle,
+                        uint64_t *physical_address, uint64_t *size,
+                        uint64_t *token);
+    int (*prime_import)(void *context, uint64_t file_id, uint64_t token,
+                        uint32_t *handle);
+    int (*prime_release)(void *context, uint64_t token);
     int64_t (*driver_ioctl)(void *context, uint32_t command, void *arg,
                             size_t arg_size, bool render_node,
                             uint64_t file_id);
 } na_drm_driver_ops_t;
 typedef na_drm_driver_ops_t DrmDriverOps;
 
-drm_device_t *
-na_drm_device_register(const na_drm_driver_ops_t *ops, const char *node_name,
-                       pci_device_t *pci_device, const char *driver_name,
-                       const char *driver_date, const char *driver_description);
+drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
+                                     const char *node_name,
+                                     pci_device_t *pci_device,
+                                     const na_drm_driver_info_t *driver_info);
 void na_drm_device_unregister(drm_device_t *device);
 int na_drm_device_notify_hotplug(drm_device_t *device);
 drm_connector_t *na_drm_connector_create(const na_drm_connector_info_t *info);
@@ -407,6 +460,12 @@ drm_plane_t *na_drm_plane_create(drm_device_t *device,
                                  const na_drm_plane_info_t *info);
 int na_drm_plane_add_format(drm_plane_t *plane, uint32_t format);
 void na_drm_plane_destroy(drm_plane_t *plane);
+int na_drm_syncobj_wait(uint64_t file_id, uint32_t handle, uint64_t point,
+                        int64_t timeout_ns);
+int na_drm_syncobj_signal(uint64_t file_id, uint32_t handle, uint64_t point);
+int na_drm_syncobj_attach_fence(uint64_t file_id, uint32_t handle,
+                                uint64_t point, uint32_t timeline,
+                                uint64_t cpu_address, uint64_t value);
 
 struct fdt_device;
 typedef struct fdt_device fdt_device_t;

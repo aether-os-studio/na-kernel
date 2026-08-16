@@ -13,6 +13,8 @@
 #include <libs/flanterm/flanterm_backends/fb_private.h>
 #include <libs/flanterm/flanterm_backends/fb.h>
 
+static spinlock_t terminal_write_lock = SPIN_INIT;
+
 void terminal_flush(tty_t *session) {
     if (session && session->terminal)
         flanterm_flush(session->terminal);
@@ -128,9 +130,14 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
     case KDSETMODE:
         if (arg != KD_TEXT && arg != KD_GRAPHICS)
             return -EINVAL;
+        spin_lock(&terminal_write_lock);
         device->tty_mode = arg;
-        if (arg == KD_TEXT && tty_vt_is_active(device) && device->terminal)
-            flanterm_full_refresh(device->terminal);
+        // if (tty_vt_is_active(device) && device->terminal) {
+        //     flanterm_set_output_enabled(device->terminal, arg == KD_TEXT);
+        //     if (arg == KD_TEXT)
+        //         flanterm_full_refresh(device->terminal);
+        // }
+        spin_unlock(&terminal_write_lock);
         return 0;
     case KDGKBMODE: {
         int kbmode = device->tty_kbmode;
@@ -212,17 +219,49 @@ int terminal_poll(tty_t *device, int events) {
     return tty_input_poll(device, events);
 }
 
-spinlock_t terminal_write_lock = SPIN_INIT;
+int terminal_rebind_framebuffer(tty_t *tty,
+                                const struct tty_graphics_ *framebuffer) {
+    struct flanterm_fb_context *ctx;
+
+    if (!tty || !tty->terminal || !framebuffer || !framebuffer->address)
+        return -EINVAL;
+    if (framebuffer->bpp != 32 || framebuffer->pitch < framebuffer->width * 4 ||
+        framebuffer->red_mask_size < 8 || framebuffer->green_mask_size < 8 ||
+        framebuffer->blue_mask_size < 8)
+        return -ENOTSUP;
+
+    ctx = tty->terminal;
+
+    /* Repoint the existing backend instead of constructing a new flanterm
+     * context.  Its grid, cursor and parser state are the console history we
+     * need to redraw after the display controller changes scanout buffers. */
+    if (ctx->width != framebuffer->width || ctx->height != framebuffer->height)
+        return -ERANGE;
+
+    spin_lock(&terminal_write_lock);
+    ctx->framebuffer = framebuffer->address;
+    ctx->pitch = framebuffer->pitch;
+    ctx->red_mask_size = framebuffer->red_mask_size;
+    ctx->red_mask_shift =
+        framebuffer->red_mask_shift + (framebuffer->red_mask_size - 8);
+    ctx->green_mask_size = framebuffer->green_mask_size;
+    ctx->green_mask_shift =
+        framebuffer->green_mask_shift + (framebuffer->green_mask_size - 8);
+    ctx->blue_mask_size = framebuffer->blue_mask_size;
+    ctx->blue_mask_shift =
+        framebuffer->blue_mask_shift + (framebuffer->blue_mask_size - 8);
+    if (ctx->output_enabled && tty->tty_mode == KD_TEXT)
+        flanterm_full_refresh(tty->terminal);
+    spin_unlock(&terminal_write_lock);
+    return 0;
+}
 
 size_t terminal_write(tty_t *device, const char *buf, size_t count) {
     spin_lock(&terminal_write_lock);
 #if SERIAL_DEBUG
     serial_printk((char *)buf, count);
 #endif
-    /* KD_TEXT/KD_GRAPHICS controls whether the kernel console owns the
-     * framebuffer. VT_AUTO/VT_PROCESS instead controls who arbitrates VT
-     * switching and must not be used as a rendering-mode test. */
-    if (device->tty_mode == KD_TEXT && device->terminal) {
+    if (device->terminal) {
         flanterm_write(device->terminal, buf, count);
     }
     spin_unlock(&terminal_write_lock);
@@ -234,7 +273,8 @@ void terminal_set_active(tty_t *tty, bool active) {
         return;
 
     spin_lock(&terminal_write_lock);
-    flanterm_set_output_enabled(tty->terminal, active);
+    flanterm_set_output_enabled(tty->terminal,
+                                active && tty->tty_mode == KD_TEXT);
     if (active && tty->tty_mode == KD_TEXT)
         flanterm_full_refresh(tty->terminal);
     spin_unlock(&terminal_write_lock);

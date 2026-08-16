@@ -71,16 +71,20 @@ static inline int __msix_map_table(pci_device_t *pci_dev,
     }
 
     uint64_t bar_physical_address = pci_dev->bars[bir].address;
+    uint64_t bar_size = pci_dev->bars[bir].size;
 
-    if (bar_physical_address == 0) {
+    if (bar_physical_address == 0 || bar_size == 0) {
         return -ENOMEM;
     }
 
     pci_dev->msix_mmio_vaddr =
         (uint64_t)phys_to_virt((uint64_t)bar_physical_address);
-    map_page_range(get_current_page_dir(false), pci_dev->msix_mmio_vaddr,
-                   bar_physical_address, pci_dev->bars[bir].size,
-                   PT_FLAG_R | PT_FLAG_W | PT_FLAG_DEVICE);
+    if (map_page_range(get_kernel_page_dir(), pci_dev->msix_mmio_vaddr,
+                       bar_physical_address, bar_size,
+                       PT_FLAG_R | PT_FLAG_W | PT_FLAG_DEVICE) != 0) {
+        pci_dev->msix_mmio_vaddr = 0;
+        return -ENOMEM;
+    }
 
     return 0;
 }

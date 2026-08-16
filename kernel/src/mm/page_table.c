@@ -161,6 +161,11 @@ typedef struct page_map_path {
     uint64_t created_parent_indices[ARCH_MAX_PT_LEVEL - 1];
     uint64_t created_table_addrs[ARCH_MAX_PT_LEVEL - 1];
     size_t created_tables;
+    // Large pages split during the walk, restored on rollback.
+    uint64_t *split_parent_tables[ARCH_MAX_PT_LEVEL - 1];
+    uint64_t split_parent_indices[ARCH_MAX_PT_LEVEL - 1];
+    uint64_t split_old_entries[ARCH_MAX_PT_LEVEL - 1];
+    size_t split_tables;
 } page_map_path_t;
 
 static void page_map_path_rollback(page_map_path_t *path) {
@@ -171,6 +176,57 @@ static void page_map_path_rollback(page_map_path_t *path) {
             [path->created_parent_indices[path->created_tables]] = 0;
         unmap_release_table(path->created_table_addrs[path->created_tables]);
     }
+    while (path->split_tables > 0) {
+        path->split_tables--;
+        uint64_t current = path->split_parent_tables
+                               [path->split_tables]
+                               [path->split_parent_indices[path->split_tables]];
+        unmap_release_table(ARCH_READ_PTE(current));
+        path->split_parent_tables
+            [path->split_tables]
+            [path->split_parent_indices[path->split_tables]] =
+            path->split_old_entries[path->split_tables];
+    }
+}
+
+static bool page_map_split_large(uint64_t *pgdir, uint64_t index,
+                                 uint64_t level, uint64_t levels,
+                                 uint64_t vaddr, uint64_t flags, bool flush,
+                                 page_map_path_t *path) {
+    if (path->split_tables >= ARCH_MAX_PT_LEVEL - 1)
+        return false;
+
+    uint64_t base = ARCH_READ_PTE(pgdir[index]);
+    uint64_t old_flags = ARCH_READ_PTE_FLAG(pgdir[index]);
+
+    uint64_t a = alloc_frames(1);
+    if (a == 0)
+        return false;
+    uint64_t *table = (uint64_t *)phys_to_virt(a);
+    memset(table, 0, PAGE_SIZE);
+
+    uint64_t sub_shift =
+        ARCH_PT_OFFSET_BASE + ARCH_PT_OFFSET_PER_LEVEL * (levels - 2 - level);
+    uint64_t sub_size = 1UL << sub_shift;
+    bool sub_is_huge = (level + 2 < levels);
+
+    for (uint64_t j = 0; j < (1UL << ARCH_PT_OFFSET_PER_LEVEL); j++) {
+        uint64_t sub_paddr = base + j * sub_size;
+        if (sub_is_huge)
+            table[j] = ARCH_MAKE_HUGE_PTE(sub_paddr, old_flags);
+        else
+            table[j] = ARCH_MAKE_PTE(sub_paddr, old_flags);
+    }
+
+    path->split_parent_tables[path->split_tables] = pgdir;
+    path->split_parent_indices[path->split_tables] = index;
+    path->split_old_entries[path->split_tables] = pgdir[index];
+    path->split_tables++;
+
+    pgdir[index] = arch_make_page_table_entry(a, flags);
+    if (flush)
+        arch_flush_tlb(vaddr);
+    return true;
 }
 
 static bool page_map_find_leaf(uint64_t *pgdir, uint64_t vaddr, uint64_t flags,
@@ -181,8 +237,12 @@ static bool page_map_find_leaf(uint64_t *pgdir, uint64_t vaddr, uint64_t flags,
     for (uint64_t i = 0; i < levels - 1; i++) {
         uint64_t index = PAGE_TABLE_LEVEL_INDEX(vaddr, i + 1, levels);
         uint64_t addr = pgdir[index];
-        if (ARCH_PT_IS_LARGE(addr))
-            goto fail;
+        if (ARCH_PT_IS_LARGE(addr)) {
+            if (!page_map_split_large(pgdir, index, i, levels, vaddr, flags,
+                                      flush, path))
+                goto fail;
+            addr = pgdir[index];
+        }
 
         if (!ARCH_PT_IS_TABLE(addr)) {
             uint64_t a = alloc_frames(1);

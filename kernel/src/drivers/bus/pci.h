@@ -63,6 +63,23 @@ typedef struct {
 
 struct pcie_info;
 
+struct pci_device;
+
+struct kernel_pci_driver;
+typedef bool (*pci_driver_match_t)(struct pci_device *dev,
+                                   const struct kernel_pci_driver *driver);
+
+typedef struct kernel_pci_driver {
+    const char *name;
+    uint32_t class_id;
+    pci_driver_match_t match;
+    int (*probe)(struct pci_device *dev);
+    void (*remove)(struct pci_device *dev);
+    void (*shutdown)(struct pci_device *dev);
+    int flags;
+    void *private_data;
+} pci_driver_t;
+
 /**
  * Enumerated PCI function plus driver/runtime state discovered during probing.
  */
@@ -82,6 +99,7 @@ typedef struct pci_device {
     uint8_t slot;
     uint8_t func;
     pci_bar_t bars[6];
+    pci_bar_t rom;
 
     uint32_t capability_point;
     struct pcie_info *pcie;
@@ -99,6 +117,7 @@ typedef struct pci_device {
     pci_device_op_t *op;
 
     void *desc;
+    pci_driver_t *kernel_driver;
 } pci_device_t;
 
 extern pci_device_t *pci_devices[PCI_DEVICE_MAX];
@@ -179,26 +198,12 @@ void pci_controller_init();
  */
 void pci_init();
 
-#define PCI_DRIVER_FLAGS_NEED_SYSFS (1 << 0)
-
-struct kernel_pci_driver;
-typedef bool (*pci_driver_match_t)(pci_device_t *dev,
-                                   const struct kernel_pci_driver *driver);
-
 /**
- * High-level PCI driver descriptor. The core matches enumerated pci_device_t
- * objects against this table and then calls probe/remove/shutdown.
+ * Wait until every probe task dispatched by pci_init() has returned.
+ * This is the device-initialization barrier used before fbdev/DRM fallback
+ * registration and before entering userland.
  */
-typedef struct kernel_pci_driver {
-    const char *name;
-    uint32_t class_id;
-    pci_driver_match_t match;
-    int (*probe)(pci_device_t *dev);
-    void (*remove)(pci_device_t *dev);
-    void (*shutdown)(pci_device_t *dev);
-    int flags;
-    void *private_data;
-} pci_driver_t;
+void pci_wait_for_probes();
 
 #define MAX_PCI_DRIVERS 64
 
@@ -208,4 +213,3 @@ typedef struct kernel_pci_driver {
  * probe decisions, so the driver object must remain valid after this call.
  */
 int regist_pci_driver(pci_driver_t *driver);
-pci_driver_t *pci_get_current_probe_driver(void);

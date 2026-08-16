@@ -9,12 +9,8 @@ crate-type = ["staticlib"]
 [dependencies]
 na-std = { path = "../../na-std", features = ["module-runtime"] }
 
-[profile.dev]
-panic = "abort"
-
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = "s"
-panic = "abort"
 strip = "debuginfo"

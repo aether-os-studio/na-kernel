@@ -1,4 +1,5 @@
 #include <drivers/tty.h>
+#include <drivers/fbtty.h>
 #include <dev/device.h>
 #include <mm/mm.h>
 #include <boot/boot.h>
@@ -714,6 +715,41 @@ tty_device_t *get_tty_device(const char *name) {
         }
     }
     return NULL;
+}
+
+int tty_rebind_framebuffer(const struct tty_graphics_ *framebuffer) {
+    tty_device_t *device;
+    struct tty_graphics_ *graphics;
+
+    if (!framebuffer || !framebuffer->address || framebuffer->bpp != 32 ||
+        framebuffer->red_mask_size < 8 || framebuffer->green_mask_size < 8 ||
+        framebuffer->blue_mask_size < 8 ||
+        framebuffer->pitch < framebuffer->width * 4)
+        return -EINVAL;
+
+    device = get_tty_device("tty0");
+    if (!device || device->type != TTY_DEVICE_GRAPHI || !device->private_data)
+        return -ENODEV;
+
+    graphics = device->private_data;
+    /* Existing flanterm grids are dimensioned at boot.  ASTRA currently
+     * preserves the firmware's 1920x1080 mode, so a pointer/pitch rebind is
+     * lossless and retains the complete text console state. */
+    if (graphics->width != framebuffer->width ||
+        graphics->height != framebuffer->height)
+        return -ERANGE;
+
+    for (unsigned int i = 1; i < 64; i++) {
+        tty_t *tty = tty_vts[i];
+        if (!tty || tty->device != device || !tty->terminal)
+            continue;
+        int ret = terminal_rebind_framebuffer(tty, framebuffer);
+        if (ret < 0)
+            return ret;
+    }
+
+    *graphics = *framebuffer;
+    return 0;
 }
 
 char *default_console = NULL;

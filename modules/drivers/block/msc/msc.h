@@ -2,6 +2,7 @@
 
 #include <block/block.h>
 #include <drivers/bus/usb.h>
+#include <task/wait.h>
 
 // CBW/CSW结构体
 typedef struct {
@@ -43,7 +44,9 @@ struct usb_msc_device {
     usb_device_interface_t *iface;
     usb_pipe_t *bulk_in;
     usb_pipe_t *bulk_out;
-    spinlock_t lock;
+    // 串行化单命令传输；USB bulk 传输路径会阻塞（等待事件），
+    // 因此必须使用可睡眠的互斥锁而不是自旋锁。
+    wait_mutex_t lock;
     uint32_t next_tag;
     uint8_t lun_count;
     usb_msc_lun_t *luns;

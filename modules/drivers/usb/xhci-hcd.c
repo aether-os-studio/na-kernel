@@ -1113,10 +1113,29 @@ static void xhci_xfer_normal(struct xhci_pipe *pipe, void *data, int datalen,
                              uint16_t stream_id) {
     usb_xhci_t *xhci = container_of(pipe->pipe.cntl, usb_xhci_t, usb);
     uint32_t doorbell = pipe->epid;
+    uint16_t interrupter = xhci_pick_interrupter(xhci);
+    uint8_t *cursor = data;
+    uint32_t remaining = datalen > 0 ? (uint32_t)datalen : 0;
 
-    xhci_trb_queue(&pipe->reqs, data,
-                   xhci_trb_status(datalen, xhci_pick_interrupter(xhci)),
-                   (TR_NORMAL << TRB_TYPE_SHIFT) | TRB_TR_IOC);
+    do {
+        uint64_t phys = cursor ? xhci_virt_to_phys(cursor) : 0;
+        uint32_t chunk = remaining;
+        if (chunk > xhci_bytes_to_64kb_boundary(phys))
+            chunk = xhci_bytes_to_64kb_boundary(phys);
+
+        bool last = chunk == remaining;
+        uint32_t flags = TR_NORMAL << TRB_TYPE_SHIFT;
+        if (last)
+            flags |= TRB_TR_IOC;
+        else
+            flags |= TRB_TR_CH;
+
+        xhci_trb_queue_phys(&pipe->reqs, phys,
+                            xhci_trb_status(chunk, interrupter), flags);
+        cursor += chunk;
+        remaining -= chunk;
+    } while (remaining > 0);
+
     xhci_doorbell(xhci, pipe->slotid, doorbell);
 }
 

@@ -177,7 +177,10 @@ impl InodeOperations for FatInodeOps {
         let volume = unsafe { &mut *(sb.private().cast::<Volume>()) };
         let node = node_of(&inode)?;
         let updated = volume.truncate(node, stat.size())?;
-        unsafe { (*inode.raw()).i_size = updated.size };
+        unsafe {
+            *((*inode.raw()).i_private.cast::<Node>()) = updated;
+            (*inode.raw()).i_size = updated.size;
+        }
         Ok(())
     }
 }
@@ -244,10 +247,15 @@ impl FileOperations for FatFileOps {
         let sb = inode.super_block().ok_or(Error::InvalidArgument)?;
         let volume = unsafe { &mut *(sb.private().cast::<Volume>()) };
         let node = node_of(&inode)?;
-        let pos = u64::try_from((*position).max(0)).map_err(|_| Error::InvalidArgument)?;
+        let pos = u64::try_from(*position).map_err(|_| Error::InvalidArgument)?;
+        let written = i64::try_from(buffer.len()).map_err(|_| Error::Range)?;
+        let next_position = position.checked_add(written).ok_or(Error::Range)?;
         let updated = volume.write(node, pos, buffer)?;
-        unsafe { (*inode.raw()).i_size = updated.size };
-        *position += buffer.len() as i64;
+        unsafe {
+            *((*inode.raw()).i_private.cast::<Node>()) = updated;
+            (*inode.raw()).i_size = updated.size;
+        }
+        *position = next_position;
         Ok(buffer.len())
     }
     fn llseek(&self, file: &mut File<'_>, offset: i64, whence: i32) -> Result<i64> {
@@ -273,6 +281,9 @@ impl FileOperations for FatFileOps {
         let sb = inode.super_block().ok_or(Error::InvalidArgument)?;
         let volume = unsafe { &*(sb.private().cast::<Volume>()) };
         volume.flush()
+    }
+    fn fsync(&self, file: &mut File<'_>, _start: i64, _end: i64, _datasync: bool) -> Result<()> {
+        self.flush(file)
     }
     fn iterate(&self, file: &mut File<'_>, context: &mut DirContext<'_>) -> Result<()> {
         let inode = file.inode().ok_or(Error::InvalidArgument)?;

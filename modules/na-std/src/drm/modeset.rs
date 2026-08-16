@@ -2,6 +2,8 @@ use core::slice;
 
 use crate::{bindings, memory::PhysicalAddress};
 
+use super::device::FileId;
+
 use super::resources::Mode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,10 +44,13 @@ pub struct DumbBufferMapping {
 pub struct FramebufferFormat {
     pub bits_per_pixel: u32,
     pub depth: u32,
+    /// Driver-private reference retained by the KMS framebuffer object.
+    pub driver_handle: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FramebufferRequest {
+    pub file: Option<FileId>,
     pub width: u32,
     pub height: u32,
     pub pixel_format: u32,
@@ -59,6 +64,7 @@ pub struct FramebufferRequest {
 impl From<&bindings::DrmFramebufferRequest> for FramebufferRequest {
     fn from(raw: &bindings::DrmFramebufferRequest) -> Self {
         Self {
+            file: (raw.file_id != 0).then(|| FileId::from_raw(raw.file_id)),
             width: raw.width,
             height: raw.height,
             pixel_format: raw.pixel_format,
@@ -220,6 +226,7 @@ impl From<&bindings::DrmPageFlip> for PageFlip {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CursorUpdate {
+    pub file: FileId,
     pub flags: u32,
     pub crtc_id: u32,
     pub x: i32,
@@ -232,6 +239,7 @@ pub struct CursorUpdate {
 impl From<&bindings::DrmCursorUpdate> for CursorUpdate {
     fn from(raw: &bindings::DrmCursorUpdate) -> Self {
         Self {
+            file: FileId::from_raw(raw.file_id),
             flags: raw.flags,
             crtc_id: raw.crtc_id,
             x: raw.x,

@@ -1,4 +1,5 @@
 #include <boot/boot.h>
+#include <drivers/tty.h>
 #include <drivers/logger.h>
 #include <libs/klibc.h>
 #include <mm/cache.h>
@@ -75,7 +76,88 @@ int na_firmware_request(const char *name, void **data, size_t *size) {
 
 void na_log(const char *message) {
     if (message)
-        serial_fprintk("%s", message);
+        printk("%s", message);
+}
+
+int na_boot_get_framebuffer(na_boot_framebuffer_t *out) {
+    boot_framebuffer_t *fb;
+
+    if (!out)
+        return -EINVAL;
+
+    fb = boot_get_framebuffer();
+    if (!fb)
+        return -ENODEV;
+
+    memset(out, 0, sizeof(*out));
+    out->physical_address = virt_to_phys((void *)fb->address);
+    out->width = fb->width;
+    out->height = fb->height;
+    out->bpp = fb->bpp;
+    out->pitch = fb->pitch;
+    out->red_mask_size = fb->red_mask_size;
+    out->red_mask_shift = fb->red_mask_shift;
+    out->green_mask_size = fb->green_mask_size;
+    out->green_mask_shift = fb->green_mask_shift;
+    out->blue_mask_size = fb->blue_mask_size;
+    out->blue_mask_shift = fb->blue_mask_shift;
+    return 0;
+}
+
+int na_tty_rebind_framebuffer(const na_boot_framebuffer_t *framebuffer) {
+    struct tty_graphics_ graphics;
+    boot_framebuffer_t *boot_framebuffer;
+    uint64_t byte_size;
+    void *address;
+
+    if (!framebuffer || !framebuffer->physical_address || !framebuffer->width ||
+        !framebuffer->height || framebuffer->bpp != 32 ||
+        framebuffer->pitch < framebuffer->width * 4 ||
+        framebuffer->pitch > UINT64_MAX / framebuffer->height)
+        return -EINVAL;
+
+    byte_size = framebuffer->pitch * framebuffer->height;
+    if (byte_size > SIZE_MAX)
+        return -EOVERFLOW;
+    address = na_mmio_map(framebuffer->physical_address, (size_t)byte_size);
+    if (!address)
+        return -ENOMEM;
+
+    boot_framebuffer = boot_get_framebuffer();
+    if (!boot_framebuffer)
+        return -ENODEV;
+
+    memset(&graphics, 0, sizeof(graphics));
+    graphics.address = address;
+    graphics.width = framebuffer->width;
+    graphics.height = framebuffer->height;
+    graphics.bpp = (uint16_t)framebuffer->bpp;
+    graphics.pitch = framebuffer->pitch;
+    graphics.red_mask_size = framebuffer->red_mask_size;
+    graphics.red_mask_shift = framebuffer->red_mask_shift;
+    graphics.green_mask_size = framebuffer->green_mask_size;
+    graphics.green_mask_shift = framebuffer->green_mask_shift;
+    graphics.blue_mask_size = framebuffer->blue_mask_size;
+    graphics.blue_mask_shift = framebuffer->blue_mask_shift;
+
+    int ret = tty_rebind_framebuffer(&graphics);
+    if (ret < 0)
+        return ret;
+
+    *boot_framebuffer = (boot_framebuffer_t){
+        .address = (uintptr_t)address,
+        .width = framebuffer->width,
+        .height = framebuffer->height,
+        .bpp = framebuffer->bpp,
+        .pitch = framebuffer->pitch,
+        .red_mask_size = framebuffer->red_mask_size,
+        .red_mask_shift = framebuffer->red_mask_shift,
+        .green_mask_size = framebuffer->green_mask_size,
+        .green_mask_shift = framebuffer->green_mask_shift,
+        .blue_mask_size = framebuffer->blue_mask_size,
+        .blue_mask_shift = framebuffer->blue_mask_shift,
+    };
+    return 0;
 }
 
 uint64_t na_monotonic_time_ns(void) { return nano_time(); }

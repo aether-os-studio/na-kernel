@@ -7,6 +7,7 @@
 
 partition_t partitions[MAX_PARTITIONS_NUM] = {0};
 uint64_t partition_num = 0;
+spinlock_t partition_lock = SPIN_INIT;
 
 static inline uint64_t partition_lba_size(partition_t *part) {
     uint64_t lba_size = blkdev_ioctl(part->blkdev_id, IOCTL_GETBLKSIZE, 0);

@@ -57,7 +57,15 @@ ssize_t drm_ioctl_prime_handle_to_fd(drm_device_t *dev, void *arg, fd_t *fd);
 ssize_t drm_ioctl_prime_fd_to_handle(drm_device_t *dev, void *arg, fd_t *fd);
 
 ssize_t drm_primefd_create(drm_device_t *dev, uint32_t handle, uint64_t phys,
-                           uint64_t size, uint32_t flags);
+                           uint64_t size, uint64_t token, uint32_t flags);
+
+/* Driver-facing syncobj bridge used by private command submission ioctls. */
+int na_drm_syncobj_wait(uint64_t file_id, uint32_t handle, uint64_t point,
+                        int64_t timeout_ns);
+int na_drm_syncobj_signal(uint64_t file_id, uint32_t handle, uint64_t point);
+int na_drm_syncobj_attach_fence(uint64_t file_id, uint32_t handle,
+                                uint64_t point, uint32_t timeline,
+                                uint64_t cpu_address, uint64_t value);
 
 /**
  * drm_ioctl_mode_getresources - Handle DRM_IOCTL_MODE_GETRESOURCES
@@ -106,7 +114,7 @@ ssize_t drm_ioctl_mode_getconnector(drm_device_t *dev, void *arg);
  * @dev: DRM device
  * @arg: ioctl argument
  */
-ssize_t drm_ioctl_mode_getfb(drm_device_t *dev, void *arg);
+ssize_t drm_ioctl_mode_getfb(drm_device_t *dev, void *arg, fd_t *fd);
 
 /**
  * drm_ioctl_mode_addfb - Handle DRM_IOCTL_MODE_ADDFB
@@ -226,14 +234,14 @@ ssize_t drm_ioctl_page_flip(drm_device_t *dev, void *arg, fd_t *fd);
  * @dev: DRM device
  * @arg: ioctl argument
  */
-ssize_t drm_ioctl_cursor(drm_device_t *dev, void *arg);
+ssize_t drm_ioctl_cursor(drm_device_t *dev, void *arg, fd_t *fd);
 
 /**
  * drm_ioctl_curso2r - Handle DRM_IOCTL_MODE_CURSOR2
  * @dev: DRM device
  * @arg: ioctl argument
  */
-ssize_t drm_ioctl_cursor2(drm_device_t *dev, void *arg);
+ssize_t drm_ioctl_cursor2(drm_device_t *dev, void *arg, fd_t *fd);
 
 /**
  * drm_ioctl_get_magic - Handle DRM_IOCTL_GET_MAGIC
@@ -241,6 +249,11 @@ ssize_t drm_ioctl_cursor2(drm_device_t *dev, void *arg);
  * @arg: ioctl argument
  */
 ssize_t drm_ioctl_get_magic(drm_device_t *dev, void *arg);
+
+/**
+ * drm_ioctl_get_client - Query the current DRM file authentication state
+ */
+ssize_t drm_ioctl_get_client(drm_device_t *dev, void *arg, fd_t *fd);
 
 /**
  * drm_ioctl_auth_magic - Handle DRM_IOCTL_AUTH_MAGIC

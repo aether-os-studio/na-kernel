@@ -25,6 +25,7 @@ typedef struct blkdev {
 
 extern struct llist_header blk_dev_list;
 extern uint64_t blk_devnum;
+extern spinlock_t blk_dev_lock;
 
 /**
  * Look up a block device by its driver-private backing pointer.

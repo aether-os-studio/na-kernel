@@ -41,6 +41,18 @@ impl MmioRegion {
         self.length
     }
 
+    /// Creates another view of the same permanently mapped MMIO aperture.
+    ///
+    /// Callers must still serialize accesses whose hardware semantics require
+    /// it. In particular, separate views must not drive the same indirect
+    /// index/data window without a shared lock.
+    pub fn shared_view(&self) -> Self {
+        Self {
+            base: self.base,
+            length: self.length,
+        }
+    }
+
     pub fn read<T: RegisterValue>(&self, offset: usize) -> Result<T> {
         let ptr = self.register::<T>(offset)?;
         Ok(unsafe { ptr.as_ptr().read_volatile() })

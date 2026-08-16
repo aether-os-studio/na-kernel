@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod arch;
+pub mod boot;
 #[allow(
     clippy::all,
     dead_code,
@@ -47,7 +48,11 @@ macro_rules! module_entry {
 
 #[cfg(feature = "module-runtime")]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    use alloc::ffi::CString;
+
+    KernelLog::write(CString::new(alloc::format!("{}", info)).unwrap().as_c_str());
+
     loop {
         core::hint::spin_loop();
     }

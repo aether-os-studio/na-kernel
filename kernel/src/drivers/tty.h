@@ -124,6 +124,7 @@ int tty_vt_get_state(struct vt_state *state);
 bool tty_vt_is_active(const tty_t *tty);
 tty_t *tty_vt_active(void);
 void terminal_set_active(tty_t *tty, bool active);
+int tty_rebind_framebuffer(const struct tty_graphics_ *framebuffer);
 void tty_sysfs_register(uint64_t dev, const char *name);
 void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
                      int32_t value);

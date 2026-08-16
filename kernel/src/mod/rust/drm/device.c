@@ -111,14 +111,50 @@ static int na_drm_get_dumb_buffer_mapping(drm_device_t *device, uint32_t handle,
                                                physical, size);
 }
 
+static int na_drm_mmap(drm_device_t *device, drm_file_t *file, uint64_t offset,
+                       uint64_t length, uint64_t *physical) {
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+    if (!bridge || !file || !physical || !bridge->ops.mmap)
+        return -ENOSYS;
+    return bridge->ops.mmap(bridge->ops.context, (uint64_t)(uintptr_t)file,
+                            offset, length, physical);
+}
+
+static int na_drm_prime_export(drm_device_t *device, drm_file_t *file,
+                               uint32_t handle, uint64_t *physical,
+                               uint64_t *size, uint64_t *token) {
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+    if (!bridge || !file || !physical || !size || !token ||
+        !bridge->ops.prime_export)
+        return -ENOSYS;
+    return bridge->ops.prime_export(bridge->ops.context,
+                                    (uint64_t)(uintptr_t)file, handle, physical,
+                                    size, token);
+}
+
+static int na_drm_prime_import(drm_device_t *device, drm_file_t *file,
+                               uint64_t token, uint32_t *handle) {
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+    if (!bridge || !file || !handle || !bridge->ops.prime_import)
+        return -ENOSYS;
+    return bridge->ops.prime_import(bridge->ops.context,
+                                    (uint64_t)(uintptr_t)file, token, handle);
+}
+
+static int na_drm_prime_release(drm_device_t *device, uint64_t token) {
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+    if (!bridge || !bridge->ops.prime_release)
+        return -ENOSYS;
+    return bridge->ops.prime_release(bridge->ops.context, token);
+}
+
 drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
                                      const char *node_name,
                                      pci_device_t *pci_device,
-                                     const char *driver_name,
-                                     const char *driver_date,
-                                     const char *driver_description) {
-    if (!ops || !node_name || !driver_name || !driver_date ||
-        !driver_description)
+                                     const na_drm_driver_info_t *driver_info) {
+    if (!ops || !node_name || !driver_info || !driver_info->kernel_name ||
+        !driver_info->uapi_name || !driver_info->date ||
+        !driver_info->description)
         return NULL;
 
     na_drm_driver_bridge_t *bridge = calloc(1, sizeof(*bridge));
@@ -128,6 +164,7 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
     bridge->ops = *ops;
     bridge->device_ops = (drm_device_op_t){
         .supports_render_node = ops->supports_render_node,
+        .supports_atomic_modeset = ops->supports_atomic_modeset,
         .open = na_drm_open,
         .close = na_drm_close,
         .get_cap = na_drm_get_capability,
@@ -139,6 +176,7 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
         .add_fb = na_drm_add_framebuffer_legacy,
         .add_fb2 = na_drm_add_framebuffer2,
         .release_fb = na_drm_release_framebuffer,
+        .get_fb_handle = na_drm_get_framebuffer_handle,
         .set_plane = na_drm_set_plane,
         .atomic_commit = na_drm_atomic_commit,
         .map_dumb = na_drm_map_dumb_buffer,
@@ -149,13 +187,25 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
         .get_crtcs = na_drm_get_crtcs,
         .get_encoders = na_drm_get_encoders,
         .get_planes = na_drm_get_planes,
+        .mmap = na_drm_mmap,
         .get_dumb_map = na_drm_get_dumb_buffer_mapping,
+        .prime_export = na_drm_prime_export,
+        .prime_import = na_drm_prime_import,
+        .prime_release = na_drm_prime_release,
         .driver_ioctl = na_drm_driver_ioctl,
     };
 
+    const drm_driver_info_t info = {
+        .kernel_name = driver_info->kernel_name,
+        .uapi_name = driver_info->uapi_name,
+        .date = driver_info->date,
+        .description = driver_info->description,
+        .version_major = driver_info->version_major,
+        .version_minor = driver_info->version_minor,
+        .version_patchlevel = driver_info->version_patchlevel,
+    };
     drm_device_t *device = drm_register_device_with_info(
-        bridge, &bridge->device_ops, node_name, pci_device, driver_name,
-        driver_date, driver_description);
+        bridge, &bridge->device_ops, node_name, pci_device, &info);
     if (!device)
         free(bridge);
     return device;
@@ -185,7 +235,7 @@ void na_drm_device_unregister(drm_device_t *device) {
                 device->resource_mgr.framebuffers[i];
             if (framebuffer && framebuffer->driver_data == bridge)
                 bridge->ops.release_framebuffer(bridge->ops.context,
-                                                framebuffer->handle);
+                                                framebuffer->driver_handle);
         }
     }
     drm_unregister_device(device);

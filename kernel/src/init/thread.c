@@ -56,13 +56,15 @@ void init_thread(uint64_t arg) {
     fsfdfs_init();
     cgroupfs_init();
 
-    pci_init();
-
     acpi_init_after_pci();
+
+    pci_init();
 
     arch_init_after_acpi_pci();
 
     arch_input_dev_init();
+
+    pci_wait_for_probes();
 
     fbdev_init();
 

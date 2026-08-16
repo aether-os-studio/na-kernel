@@ -4,6 +4,8 @@
 #include <drivers/bus/pci-dtb_ecam.h>
 #include <uacpi/acpi.h>
 #include <uacpi/tables.h>
+#include <task/task.h>
+#include <task/wait.h>
 
 struct acpi_mcfg_allocation *mcfg_entries[PCI_MCFG_MAX_ENTRIES_LEN];
 uint64_t mcfg_entries_len = 0;
@@ -552,6 +554,10 @@ void pci_scan_bus(pci_device_op_t *op, uint16_t segment_group, uint8_t bus);
 
 void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
                        uint8_t device, uint8_t function) {
+    if (pci_find_bdfs(bus, device, function, segment)) {
+        return;
+    }
+
     // 读取 vendor ID
     uint16_t vendor_id = op->read16(bus, device, function, segment, 0x00);
     if (vendor_id == 0xFFFF || vendor_id == 0x0000) {
@@ -592,10 +598,6 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
     uint32_t class_code_24bit = (class_code << 16) | (subclass << 8) | prog_if;
     pci_device->class_code = class_code_24bit;
     pci_device->name = pci_classname(class_code_24bit);
-
-    printk("PCIe: Found device %02x:%02x.%x - %04x:%04x %06x [%s]\n", bus,
-           device, function, vendor_id, device_id, class_code_24bit,
-           pci_device->name);
 
     switch (header_type) {
     case 0x00: { // Standard device (Endpoint)
@@ -773,6 +775,41 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
             }
         }
 
+        // 枚举 ROM BAR（config 0x30），为需要 VBIOS 的驱动分配并启用
+        {
+            uint32_t rom = op->read32(bus, device, function, segment, 0x30);
+            uint32_t orig = rom;
+
+            op->write32(bus, device, function, segment, 0x30, 0xFFFFF800);
+            uint32_t mask = op->read32(bus, device, function, segment, 0x30);
+            op->write32(bus, device, function, segment, 0x30, orig);
+
+            uint64_t size = ~(uint64_t)(mask & 0xFFFFF800) + 1;
+            if (size != 0 && (mask & 0xFFFFF800) != 0xFFFFF800 &&
+                size <= (16 << 20)) {
+                uint64_t pci_base = orig & 0xFFFFF800;
+                if (pci_base == 0 && op->allocate_bar_address) {
+                    pci_base =
+                        op->allocate_bar_address(bus, device, function, segment,
+                                                 6, size, true, false, false);
+                }
+                if (pci_base != 0) {
+                    pci_device->rom.address =
+                        op->convert_bar_address
+                            ? op->convert_bar_address(pci_base)
+                            : pci_base;
+                    pci_device->rom.size = size;
+                    pci_device->rom.mmio = true;
+                    pci_device->rom.prefetchable = false;
+                    op->write32(bus, device, function, segment, 0x30,
+                                (uint32_t)(pci_base & 0xFFFFF800) | 1);
+                    printk("PCIe: ROM BAR for %02x:%02x.%u at PCI 0x%llx "
+                           "size 0x%llx\n",
+                           bus, device, function, pci_base, size);
+                }
+            }
+        }
+
         // 启用设备命令寄存器
         uint16_t command = op->read16(bus, device, function, segment, 0x04);
         command |= (1 << 0); // I/O Space Enable
@@ -849,9 +886,6 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
         uint8_t secondary_bus = (buses >> 8) & 0xFF;
         uint8_t subordinate_bus = (buses >> 16) & 0xFF;
 
-        printk("  PCI-PCI Bridge: Primary=%d, Secondary=%d, Subordinate=%d\n",
-               primary_bus, secondary_bus, subordinate_bus);
-
         // 启用桥接器
         uint16_t bridge_ctrl = op->read16(bus, device, function, segment, 0x3E);
         bridge_ctrl &= ~(1 << 6); // Clear Secondary Bus Reset
@@ -863,11 +897,12 @@ void pci_scan_function(pci_device_op_t *op, uint16_t segment, uint8_t bus,
         command |= (1 << 2); // Bus Master Enable
         op->write16(bus, device, function, segment, 0x04, command);
 
-        // 递归扫描次级总线范围
-        if (secondary_bus != 0 && secondary_bus <= subordinate_bus) {
-            for (uint8_t b = secondary_bus; b <= subordinate_bus; b++) {
-                pci_scan_bus(op, segment, b);
-            }
+        /* Walk the topology through the bridge's secondary bus.  Scanning the
+         * complete secondary..subordinate range here and doing the same again
+         * for child bridges visits every endpoint once per ancestor bridge. */
+        if (secondary_bus != 0 && secondary_bus <= subordinate_bus &&
+            secondary_bus != primary_bus) {
+            pci_scan_bus(op, segment, secondary_bus);
         }
 
         free(pci_device);
@@ -978,15 +1013,74 @@ void pci_controller_init() {
 #endif
 }
 
-static pci_driver_t *pci_current_probe_driver;
+typedef struct pci_probe_job {
+    pci_device_t *dev;
+    pci_driver_t *drv;
+} pci_probe_job_t;
+
+static spinlock_t pci_current_lock = SPIN_INIT;
+static wait_queue_head_t pci_probe_wait;
+static bool pci_probe_wait_initialized;
+static uint64_t pci_probe_pending;
+
+static void pci_probe_job_complete(void) {
+    bool wake = false;
+
+    spin_lock(&pci_current_lock);
+    if (pci_probe_pending > 0) {
+        pci_probe_pending--;
+        wake = pci_probe_pending == 0;
+    }
+    spin_unlock(&pci_current_lock);
+
+    if (wake)
+        wait_queue_wake_all(&pci_probe_wait, 0, EOK);
+}
+
+static void pci_probe_device_task(uint64_t arg) {
+    pci_probe_job_t *job = (pci_probe_job_t *)(uintptr_t)arg;
+    pci_device_t *dev = job->dev;
+    pci_driver_t *drv = job->drv;
+
+    int ret = drv->probe(dev);
+    if (ret < 0) {
+        printk("PCI driver %s probe failed for %04x:%02x:%02x.%u (ret=%d)\n",
+               drv->name, dev->segment, dev->bus, dev->slot, dev->func, ret);
+    }
+
+    if (ret != 0) {
+        spin_lock(&pci_current_lock);
+        if (dev->kernel_driver == drv)
+            dev->kernel_driver = NULL;
+        spin_unlock(&pci_current_lock);
+    } else {
+        printk("PCI driver %s bound to %04x:%02x:%02x.%u\n", drv->name,
+               dev->segment, dev->bus, dev->slot, dev->func);
+    }
+    free(job);
+    pci_probe_job_complete();
+}
 
 void pci_init() {
+    spin_lock(&pci_current_lock);
+    if (!pci_probe_wait_initialized) {
+        wait_queue_init(&pci_probe_wait);
+        pci_probe_wait_initialized = true;
+    }
+    spin_unlock(&pci_current_lock);
+
     for (uint64_t i = 0; i < pci_device_number; i++) {
         pci_device_t *device = pci_devices[i];
 
-        if (!device || device->desc) {
+        if (!device) {
             continue;
         }
+
+        spin_lock(&pci_current_lock);
+        bool already_bound = device->desc || device->kernel_driver;
+        spin_unlock(&pci_current_lock);
+        if (already_bound)
+            continue;
 
         for (uint64_t d = 0; d < MAX_PCI_DRIVERS; d++) {
             if (!pci_drivers[d]) {
@@ -1001,23 +1095,87 @@ void pci_init() {
             }
 
             if (matched) {
-                pci_current_probe_driver = pci_drivers[d];
-                int ret = pci_drivers[d]->probe(device);
-                pci_current_probe_driver = NULL;
-                if (ret < 0) {
-                    printk("PCI driver %s probe failed for %04x:%02x:%02x.%u "
-                           "(ret=%d)\n",
-                           pci_drivers[d]->name, device->segment, device->bus,
-                           device->slot, device->func, ret);
-                    continue;
-                }
-
-                if (ret == 0) {
+                pci_probe_job_t *job = malloc(sizeof(*job));
+                if (!job) {
+                    printk("PCI: failed to allocate probe job for "
+                           "%04x:%02x:%02x.%u\n",
+                           device->segment, device->bus, device->slot,
+                           device->func);
                     break;
                 }
+
+                spin_lock(&pci_current_lock);
+                if (device->desc || device->kernel_driver) {
+                    spin_unlock(&pci_current_lock);
+                    free(job);
+                    break;
+                }
+                device->kernel_driver = pci_drivers[d];
+                spin_unlock(&pci_current_lock);
+
+                job->dev = device;
+                job->drv = pci_drivers[d];
+
+                /* Increment before publishing the task: it may run and
+                 * finish on another CPU before task_create() returns. */
+                spin_lock(&pci_current_lock);
+                pci_probe_pending++;
+                spin_unlock(&pci_current_lock);
+
+                if (!task_create("dev_probe", pci_probe_device_task,
+                                 (uint64_t)(uintptr_t)job, NORMAL_PRIORITY)) {
+                    spin_lock(&pci_current_lock);
+                    if (device->kernel_driver == job->drv)
+                        device->kernel_driver = NULL;
+                    spin_unlock(&pci_current_lock);
+                    free(job);
+                    printk("PCI: failed to create probe task for "
+                           "%04x:%02x:%02x.%u\n",
+                           device->segment, device->bus, device->slot,
+                           device->func);
+                    pci_probe_job_complete();
+                }
+                break; /* first matching driver, like the old synchronous loop
+                        */
             }
         }
     }
+}
+
+void pci_wait_for_probes() {
+    uint64_t pending;
+
+    spin_lock(&pci_current_lock);
+    pending = pci_probe_wait_initialized ? pci_probe_pending : 0;
+    spin_unlock(&pci_current_lock);
+    if (pending == 0)
+        return;
+
+    printk("PCI: waiting for %llu driver probe task(s)\n", pending);
+
+    for (;;) {
+        wait_queue_entry_t wait;
+
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&pci_probe_wait, &wait);
+
+        spin_lock(&pci_current_lock);
+        pending = pci_probe_pending;
+        spin_unlock(&pci_current_lock);
+        if (pending == 0) {
+            wait_queue_remove(&pci_probe_wait, &wait);
+            task_cancel_block_prepare(current_task);
+            break;
+        }
+
+        (void)task_block(current_task, TASK_UNINTERRUPTABLE, -1,
+                         "pci_probe_wait");
+        wait_queue_remove(&pci_probe_wait, &wait);
+        task_cancel_block_prepare(current_task);
+    }
+
+    printk("PCI: all driver probe tasks completed\n");
 }
 
 pci_driver_t *pci_drivers[MAX_PCI_DRIVERS] = {NULL};
@@ -1038,8 +1196,4 @@ int regist_pci_driver(pci_driver_t *driver) {
     }
 
     return -ENOSPC;
-}
-
-pci_driver_t *pci_get_current_probe_driver(void) {
-    return pci_current_probe_driver;
 }

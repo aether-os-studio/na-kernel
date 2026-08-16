@@ -1205,6 +1205,8 @@ typedef struct drm_file {
     uint32_t magic;
     drm_device_t *dev;
     drm_minor_type_t type;
+    bool authenticated;
+    uint64_t ioctl_count;
     bool lessee;
     bool revoked;
     void *driver_priv;
@@ -1225,8 +1227,19 @@ typedef struct drm_lease_entry {
     uint32_t lessor_id;
 } drm_lease_entry_t;
 
+typedef struct drm_driver_info {
+    const char *kernel_name;
+    const char *uapi_name;
+    const char *date;
+    const char *description;
+    int version_major;
+    int version_minor;
+    int version_patchlevel;
+} drm_driver_info_t;
+
 typedef struct drm_device_op {
     bool supports_render_node;
+    bool supports_atomic_modeset;
     int (*open)(drm_device_t *drm_dev, drm_file_t *file);
     void (*close)(drm_device_t *drm_dev, drm_file_t *file);
     int (*get_cap)(drm_device_t *drm_dev, struct drm_get_cap *cap);
@@ -1243,6 +1256,8 @@ typedef struct drm_device_op {
     int (*add_fb2)(drm_device_t *drm_dev, struct drm_mode_fb_cmd2 *cmd,
                    fd_t *fd);
     void (*release_fb)(drm_device_t *drm_dev, drm_framebuffer_t *fb);
+    int (*get_fb_handle)(drm_device_t *drm_dev, drm_framebuffer_t *fb, fd_t *fd,
+                         uint32_t *handle);
     int (*set_plane)(drm_device_t *drm_dev, struct drm_mode_set_plane *plane,
                      fd_t *fd);
     int (*atomic_commit)(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
@@ -1253,7 +1268,8 @@ typedef struct drm_device_op {
                     fd_t *fd);
     int (*page_flip)(struct drm_device *dev,
                      struct drm_mode_crtc_page_flip *flip, fd_t *fd);
-    int (*set_cursor)(drm_device_t *drm_dev, struct drm_mode_cursor *cursor);
+    int (*set_cursor)(drm_device_t *drm_dev, struct drm_mode_cursor *cursor,
+                      fd_t *fd);
     int (*gamma_set)(drm_device_t *drm_dev, struct drm_mode_crtc_lut *gamma);
     int (*get_connectors)(drm_device_t *drm_dev, drm_connector_t **connectors,
                           uint32_t *count);
@@ -1263,10 +1279,16 @@ typedef struct drm_device_op {
                         uint32_t *count);
     int (*get_planes)(drm_device_t *drm_dev, drm_plane_t **planes,
                       uint32_t *count);
-    int (*mmap)(drm_device_t *drm_dev, uint64_t addr, uint64_t offset,
-                uint64_t len);
+    int (*mmap)(drm_device_t *drm_dev, drm_file_t *file, uint64_t offset,
+                uint64_t len, uint64_t *physical_address);
     int (*get_dumb_map)(drm_device_t *drm_dev, uint32_t handle, uint64_t *phys,
                         uint64_t *size);
+    int (*prime_export)(drm_device_t *drm_dev, drm_file_t *file,
+                        uint32_t handle, uint64_t *phys, uint64_t *size,
+                        uint64_t *token);
+    int (*prime_import)(drm_device_t *drm_dev, drm_file_t *file, uint64_t token,
+                        uint32_t *handle);
+    int (*prime_release)(drm_device_t *drm_dev, uint64_t token);
     ssize_t (*driver_ioctl)(drm_device_t *drm_dev, uint32_t cmd, void *arg,
                             bool render_node, fd_t *fd);
 } drm_device_op_t;
@@ -1280,8 +1302,12 @@ struct drm_device {
     drm_device_op_t *op;
     pci_device_t *pci_dev;
     char driver_name[32];
+    char driver_uapi_name[32];
     char driver_date[32];
     char driver_desc[128];
+    int driver_version_major;
+    int driver_version_minor;
+    int driver_version_patchlevel;
     drm_file_node_t primary_node;
     drm_file_node_t render_node;
     uint32_t primary_minor;
@@ -1357,16 +1383,14 @@ drm_device_t *drm_register_device(void *data, drm_device_op_t *op,
 drm_device_t *drm_register_device_with_info(void *data, drm_device_op_t *op,
                                             const char *node_name,
                                             pci_device_t *pci_dev,
-                                            const char *driver_name,
-                                            const char *driver_date,
-                                            const char *driver_desc);
+                                            const drm_driver_info_t *info);
 void drm_register_sysfs_nodes(int major, int card_minor, int render_minor,
                               bool has_render_node, pci_device_t *pci_dev,
                               const char *driver_name,
                               const char *card_dev_name,
                               const char *render_dev_name);
-void drm_device_set_driver_info(drm_device_t *dev, const char *name,
-                                const char *date, const char *desc);
+void drm_device_set_driver_info(drm_device_t *dev,
+                                const drm_driver_info_t *info);
 void drm_unregister_device(drm_device_t *dev);
 void drm_init_after_pci_sysfs();
 
@@ -1374,7 +1398,8 @@ void drm_init_after_pci_sysfs();
 ssize_t drm_read(void *data, void *buf, uint64_t offset, uint64_t len,
                  fd_t *fd);
 ssize_t drm_poll(void *data, size_t event, fd_t *fd);
-void *drm_map(void *data, void *addr, uint64_t offset, uint64_t len);
+void *drm_map(void *data, void *addr, uint64_t offset, uint64_t len,
+              uint64_t prot, fd_t *fd);
 ssize_t drm_open(void *data, void *arg);
 ssize_t drm_close(void *data, void *arg);
 

@@ -3,7 +3,7 @@ use core::{marker::PhantomData, ptr::NonNull, slice};
 use crate::{Error, bindings};
 
 use super::{
-    device::{Driver, FileId, Ioctl},
+    device::{Driver, FileId, Ioctl, MmapRequest},
     modeset::{
         AtomicCommit, CrtcUpdate, CursorUpdate, DumbBufferRequest, FramebufferRequest,
         FramebufferUpdate, PageFlip, PlaneUpdate,
@@ -61,6 +61,106 @@ impl<D: Driver> Callbacks<D> {
             Ok(size) => size as i64,
             Err(error) => error.status() as i64,
         }
+    }
+
+    pub(super) unsafe extern "C" fn mmap(
+        context: *mut core::ffi::c_void,
+        file_id: u64,
+        offset: u64,
+        length: u64,
+        physical_address: *mut u64,
+    ) -> i32 {
+        let (Some(driver), Some(physical_address)) = (
+            unsafe { Self::driver(context) },
+            NonNull::new(physical_address),
+        ) else {
+            return Error::InvalidArgument.status();
+        };
+        let Ok(length) = usize::try_from(length) else {
+            return Error::InvalidArgument.status();
+        };
+        if file_id == 0 || length == 0 {
+            return Error::InvalidArgument.status();
+        }
+        match driver.mmap(MmapRequest {
+            file: FileId::from_raw(file_id),
+            offset,
+            length,
+        }) {
+            Ok(result) => {
+                unsafe { physical_address.as_ptr().write(result.get()) };
+                0
+            }
+            Err(error) => error.status(),
+        }
+    }
+
+    pub(super) unsafe extern "C" fn prime_export(
+        context: *mut core::ffi::c_void,
+        file_id: u64,
+        handle: u32,
+        physical_address: *mut u64,
+        size: *mut u64,
+        token: *mut u64,
+    ) -> i32 {
+        let (Some(driver), Some(physical_address), Some(size), Some(token)) = (
+            unsafe { Self::driver(context) },
+            NonNull::new(physical_address),
+            NonNull::new(size),
+            NonNull::new(token),
+        ) else {
+            return Error::InvalidArgument.status();
+        };
+        if file_id == 0 {
+            return Error::InvalidArgument.status();
+        }
+        match driver.prime_export(FileId::from_raw(file_id), handle) {
+            Ok(buffer) => {
+                unsafe {
+                    physical_address
+                        .as_ptr()
+                        .write(buffer.physical_address.get());
+                    size.as_ptr().write(buffer.length as u64);
+                    token.as_ptr().write(buffer.token);
+                }
+                0
+            }
+            Err(error) => error.status(),
+        }
+    }
+
+    pub(super) unsafe extern "C" fn prime_import(
+        context: *mut core::ffi::c_void,
+        file_id: u64,
+        token: u64,
+        handle: *mut u32,
+    ) -> i32 {
+        let (Some(driver), Some(handle)) = (unsafe { Self::driver(context) }, NonNull::new(handle))
+        else {
+            return Error::InvalidArgument.status();
+        };
+        if file_id == 0 || token == 0 {
+            return Error::InvalidArgument.status();
+        }
+        match driver.prime_import(FileId::from_raw(file_id), token) {
+            Ok(result) => {
+                unsafe { handle.as_ptr().write(result) };
+                0
+            }
+            Err(error) => error.status(),
+        }
+    }
+
+    pub(super) unsafe extern "C" fn prime_release(
+        context: *mut core::ffi::c_void,
+        token: u64,
+    ) -> i32 {
+        let Some(driver) = (unsafe { Self::driver(context) }) else {
+            return Error::InvalidArgument.status();
+        };
+        driver
+            .prime_release(token)
+            .map_or_else(Error::status, |()| 0)
     }
 
     pub(super) unsafe extern "C" fn get_capability(
@@ -304,6 +404,7 @@ impl<D: Driver> Callbacks<D> {
                 let output = unsafe { raw.as_mut() };
                 output.bits_per_pixel = format.bits_per_pixel;
                 output.depth = format.depth;
+                output.driver_handle = format.driver_handle;
                 0
             }
             Err(error) => error.status(),
@@ -360,6 +461,25 @@ impl<D: Driver> Callbacks<D> {
         driver
             .set_plane(PlaneUpdate::from(raw))
             .map_or_else(Error::status, |()| 0)
+    }
+
+    pub(super) unsafe extern "C" fn get_framebuffer_handle(
+        context: *mut core::ffi::c_void,
+        file_id: u64,
+        framebuffer_handle: u32,
+        gem_handle: *mut u32,
+    ) -> i32 {
+        let (Some(driver), Some(gem_handle)) = (unsafe { Self::driver(context) }, unsafe {
+            gem_handle.as_mut()
+        }) else {
+            return Error::InvalidArgument.status();
+        };
+        driver
+            .framebuffer_handle(FileId::from_raw(file_id), framebuffer_handle)
+            .map_or_else(Error::status, |handle| {
+                *gem_handle = handle;
+                0
+            })
     }
 
     pub(super) unsafe extern "C" fn set_crtc(

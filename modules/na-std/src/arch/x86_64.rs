@@ -2,6 +2,22 @@ use core::arch::asm;
 
 use crate::{Error, Result, pci::Bar};
 
+pub mod fence {
+    use core::arch::asm;
+
+    pub fn sfence() {
+        unsafe { asm!("sfence", options(nostack, preserves_flags)) };
+    }
+
+    pub fn lfence() {
+        unsafe { asm!("lfence", options(nostack, preserves_flags)) };
+    }
+
+    pub fn mfence() {
+        unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+    }
+}
+
 pub struct PortRegion {
     base: u16,
     length: u16,

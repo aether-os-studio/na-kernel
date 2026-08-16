@@ -13,7 +13,7 @@ volatile uint64_t usbmsc_drive_id = 0;
 #define MSC_READY_RETRIES 20
 #define MSC_READY_DELAY_MS 200
 #define MSC_RESET_DELAY_MS 100
-#define MSC_MAX_TRANSFER_SIZE (64 * 1024)
+#define MSC_MAX_TRANSFER_SIZE (256 * 1024)
 
 static inline uint32_t msc_be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -119,7 +119,7 @@ static int msc_command_once(usb_msc_device_t *ctrl, uint8_t lun,
     if (data_len > 0 && !data)
         return -EINVAL;
 
-    spin_lock(&ctrl->lock);
+    wait_mutex_lock(&ctrl->lock);
 
     memset(&cbw, 0, sizeof(cbw));
     cbw.dCBWSignature = MSC_CBW_SIGNATURE;
@@ -149,19 +149,26 @@ static int msc_command_once(usb_msc_device_t *ctrl, uint8_t lun,
     if (ret != 0)
         goto transport_error;
 
-    spin_unlock(&ctrl->lock);
-
-    if (csw.bCSWStatus == 0)
-        return 0;
-    if (csw.bCSWStatus == 1)
+    if (csw.bCSWStatus == 0) {
+        ret = csw.dCSWDataResidue == 0 ? 0 : -EIO;
+        wait_mutex_unlock(&ctrl->lock);
+        return ret;
+    }
+    if (csw.bCSWStatus == 1) {
+        wait_mutex_unlock(&ctrl->lock);
         return -EIO;
+    }
 
+    /* BOT reset recovery is part of the failed command.  Keep the command
+     * mutex held so another reader cannot insert a new CBW between the error
+     * and the reset/clear-halt sequence. */
     msc_reset_recovery(ctrl);
+    wait_mutex_unlock(&ctrl->lock);
     return -EAGAIN;
 
 transport_error:
-    spin_unlock(&ctrl->lock);
     msc_reset_recovery(ctrl);
+    wait_mutex_unlock(&ctrl->lock);
     return -EAGAIN;
 }
 
@@ -421,7 +428,7 @@ int usb_msc_setup(usb_device_t *usbdev, usb_device_interface_t *iface) {
     memset(ctrl, 0, sizeof(*ctrl));
     ctrl->udev = usbdev;
     ctrl->iface = iface;
-    ctrl->lock = SPIN_INIT;
+    wait_mutex_init(&ctrl->lock);
     ctrl->next_tag = 1;
 
     indesc = usb_find_desc(iface, USB_ENDPOINT_XFER_BULK, USB_DIR_IN);

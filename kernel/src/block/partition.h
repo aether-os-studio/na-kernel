@@ -69,6 +69,7 @@ typedef struct partition {
 
 extern partition_t partitions[MAX_PARTITIONS_NUM];
 extern uint64_t partition_num;
+extern spinlock_t partition_lock;
 
 ssize_t partition_read(void *data, void *buf, uint64_t offset, uint64_t len,
                        uint64_t flags);

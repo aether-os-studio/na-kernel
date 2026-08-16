@@ -247,6 +247,7 @@ impl Driver for GpuDevice {
         Ok(FramebufferFormat {
             bits_per_pixel: 32,
             depth,
+            driver_handle: request.handles[0],
         })
     }
 

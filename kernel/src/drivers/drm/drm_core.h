@@ -74,6 +74,7 @@ typedef struct drm_framebuffer {
     uint32_t bpp;
     uint32_t depth;
     uint32_t handle;
+    uint32_t driver_handle;
     uint64_t modifier;
     uint32_t format;
     uint32_t flags;

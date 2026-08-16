@@ -3,7 +3,9 @@ mod device;
 mod modeset;
 mod resources;
 
-pub use device::{Device, DeviceBuilder, Driver, FileId, Ioctl};
+pub use device::{
+    Device, DeviceBuilder, Driver, DriverInfo, FileId, Ioctl, MmapRequest, PrimeBuffer,
+};
 pub use modeset::{
     AtomicCommit, AtomicProperty, Clip, CrtcUpdate, CursorUpdate, DisplayInfo, DumbBuffer,
     DumbBufferMapping, DumbBufferRequest, FramebufferFormat, FramebufferInfo, FramebufferRequest,

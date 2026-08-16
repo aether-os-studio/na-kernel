@@ -54,3 +54,14 @@ impl Drop for Table {
         }
     }
 }
+
+/// Reads the VBIOS via the ATRM ACPI method (AMD discrete-GPU VBIOS image
+/// source, Linux `amdgpu_atrm_get_bios`). Fills `buf` with the image and
+/// returns the number of bytes written, or `Error::NotFound` when no ATRM
+/// method exists on this platform.
+pub fn read_atrm(buf: &mut [u8]) -> Result<usize> {
+    let mut out_len = 0usize;
+    let status = unsafe { bindings::na_acpi_atrm_read(buf.as_mut_ptr(), buf.len(), &mut out_len) };
+    Error::from_status(status as i32)?;
+    Ok(out_len)
+}
