@@ -33,6 +33,13 @@ impl<D: Driver> Callbacks<D> {
         }
     }
 
+    pub(super) unsafe extern "C" fn restore_console(context: *mut core::ffi::c_void) -> i32 {
+        let Some(driver) = (unsafe { Self::driver(context) }) else {
+            return Error::InvalidArgument.status();
+        };
+        driver.restore_console().map_or_else(Error::status, |()| 0)
+    }
+
     pub(super) unsafe extern "C" fn driver_ioctl(
         context: *mut core::ffi::c_void,
         command: u32,

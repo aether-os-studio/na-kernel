@@ -327,6 +327,25 @@ pub struct PrimarySurfaceConfig {
     pub dcc_independent_block: u32,
 }
 
+impl PrimarySurfaceConfig {
+    pub const fn linear(address: u64, width: u32, height: u32, pitch: u32) -> Self {
+        Self {
+            address,
+            meta_address: None,
+            width,
+            height,
+            pitch,
+            swizzle: 0,
+            num_pipes: 0,
+            pipe_interleave: 0,
+            max_compressed_frags: 0,
+            num_pkrs: 0,
+            meta_pitch: 0,
+            dcc_independent_block: 0,
+        }
+    }
+}
+
 /// Mutable view of the active DCN302 display pipe. The short-lived borrow
 /// groups primary-plane programming without creating a second register owner
 /// in the display device.

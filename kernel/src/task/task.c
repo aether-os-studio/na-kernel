@@ -2282,10 +2282,12 @@ int task_block(task_t *task, task_state_t state, int64_t timeout_ns,
 
     if (task == current_task && task->preempt_count) {
         printk("Task %lu(%s) maybe deadlock: preempt_count=%lu "
-               "reason=%s state=%d current_state=%d cpu=%u caller=%p\n",
+               "reason=%s state=%d current_state=%d cpu=%u caller=%p "
+               "lock_caller=%p\n",
                task->pid, task->name, task->preempt_count,
                blocking_reason ? blocking_reason : "<unknown>", task->state,
-               task->current_state, task->cpu_id, __builtin_return_address(0));
+               task->current_state, task->cpu_id, __builtin_return_address(0),
+               task->preempt_caller);
         return -EDEADLK;
     }
 

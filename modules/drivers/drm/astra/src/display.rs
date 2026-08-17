@@ -87,11 +87,6 @@ impl DisplayDevice {
         framebuffer.blue_mask_size = 8;
         framebuffer.blue_mask_shift = 0;
 
-        na_std::boot::rebind_framebuffer(framebuffer)?;
-        dev_info!(
-            "astra: TTY framebuffer rebound to BAR0 scanout at {:#x}",
-            framebuffer.physical_address,
-        );
         let cursor = crate::blocks::DcnCursor::new(gpu.regs.dcn_cursor_regs());
         let fb_start = gpu.gmc.fb_start;
         let pci = gpu.pci.as_device().retain();
@@ -141,6 +136,12 @@ impl DisplayDevice {
         )
         .render_node(true)
         .register(Some(&pci_device))?;
+        drm.bind_console(framebuffer)?;
+
+        dev_info!(
+            "astra: TTY framebuffer rebound to BAR0 scanout at {:#x}",
+            framebuffer.physical_address,
+        );
 
         dev_info!(
             "astra: DRM device registered ({}x{} bpp {} @ {:#x})",
@@ -176,9 +177,9 @@ impl DisplayDevice {
         Ok(m)
     }
 
-    fn program_scanout(
+    fn program_primary(
         adapter: &mut Adapter,
-        scanout: &crate::ioctl::ScanoutBuffer,
+        config: &crate::blocks::PrimarySurfaceConfig,
         geometry_changed: bool,
     ) -> Result<()> {
         let mut pipe = crate::blocks::DcnDisplayPipe::new(&mut adapter.regs);
@@ -186,8 +187,20 @@ impl DisplayDevice {
             // Linux updates DSCL RECOUT/MPC geometry when the plane is
             // enabled or its scaling/position changes, not on an ordinary
             // address-only page flip.
-            pipe.set_primary_geometry(scanout.width, scanout.height)?;
+            pipe.set_primary_geometry(config.width, config.height)?;
         }
+        if geometry_changed {
+            pipe.set_primary_surface(config)
+        } else {
+            pipe.set_primary_address(config.address, config.meta_address)
+        }
+    }
+
+    fn program_scanout(
+        adapter: &mut Adapter,
+        scanout: &crate::ioctl::ScanoutBuffer,
+        geometry_changed: bool,
+    ) -> Result<()> {
         let config = crate::blocks::PrimarySurfaceConfig {
             address: scanout.gpu_address(),
             meta_address: scanout.meta_address,
@@ -202,11 +215,7 @@ impl DisplayDevice {
             meta_pitch: scanout.meta_pitch,
             dcc_independent_block: scanout.dcc_independent_block,
         };
-        if geometry_changed {
-            pipe.set_primary_surface(&config)
-        } else {
-            pipe.set_primary_address(config.address, config.meta_address)
-        }
+        Self::program_primary(adapter, &config, geometry_changed)
     }
 
     fn info(&self) -> DisplayInfo {
@@ -822,6 +831,37 @@ impl Driver for DisplayDevice {
         }
         cursor.x = x;
         cursor.y = y;
+        Ok(())
+    }
+
+    fn restore_console(&self) -> Result<()> {
+        let offset = self
+            .framebuffer
+            .physical_address
+            .checked_sub(self.vram_base)
+            .ok_or(Error::Range)?;
+        let address = self.fb_start.checked_add(offset).ok_or(Error::Range)?;
+        let surface = crate::blocks::PrimarySurfaceConfig::linear(
+            address,
+            self.framebuffer.width as u32,
+            self.framebuffer.height as u32,
+            self.framebuffer.pitch as u32,
+        );
+
+        let mut adapter = self.gpu.lock();
+        let mut primary = self.primary.lock();
+        Self::program_primary(&mut adapter, &surface, true)?;
+        *primary = None;
+        self.primary_handle.store(0, Ordering::Release);
+        drop(primary);
+        drop(adapter);
+
+        let mut cursor = self.cursor.lock();
+        if cursor.buffer.is_some() || cursor.visible {
+            cursor.controller.disable()?;
+        }
+        cursor.buffer = None;
+        cursor.visible = false;
         Ok(())
     }
 }

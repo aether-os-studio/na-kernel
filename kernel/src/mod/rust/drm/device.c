@@ -1,4 +1,5 @@
 #include <dev/device.h>
+#include <drivers/tty.h>
 #include <mod/rust/drm/internal.h>
 
 static uint64_t na_drm_file_id(fd_t *fd) {
@@ -16,6 +17,15 @@ static void na_drm_close(drm_device_t *device, drm_file_t *file) {
     na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
     if (bridge && file && bridge->ops.close)
         bridge->ops.close(bridge->ops.context, (uint64_t)(uintptr_t)file);
+}
+
+static int na_drm_restore_console(void *context) {
+    drm_device_t *device = context;
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+
+    if (!bridge || !bridge->ops.restore_console)
+        return -ENOSYS;
+    return bridge->ops.restore_console(bridge->ops.context);
 }
 
 static int64_t na_drm_driver_ioctl(drm_device_t *device, uint32_t command,
@@ -214,6 +224,7 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
 void na_drm_device_unregister(drm_device_t *device) {
     if (!device)
         return;
+    tty_unbind_graphics_backend(device);
     na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
     for (uint32_t i = 0; i < DRM_MAX_CONNECTORS_PER_DEVICE; i++) {
         if (device->resource_mgr.connectors[i]) {
@@ -244,4 +255,20 @@ void na_drm_device_unregister(drm_device_t *device) {
 
 int na_drm_device_notify_hotplug(drm_device_t *device) {
     return device ? drm_notify_hotplug(device) : -EINVAL;
+}
+
+int na_drm_device_bind_console(drm_device_t *device,
+                               const na_boot_framebuffer_t *framebuffer) {
+    if (!device || !framebuffer)
+        return -EINVAL;
+
+    int ret = na_tty_rebind_framebuffer(framebuffer);
+    if (ret < 0)
+        return ret;
+
+    const tty_graphics_backend_t backend = {
+        .context = device,
+        .restore = na_drm_restore_console,
+    };
+    return tty_bind_graphics_backend(&backend);
 }

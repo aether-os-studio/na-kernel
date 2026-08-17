@@ -6,6 +6,7 @@
 #include <drivers/bus/usb.h>
 #include <mm/mm.h>
 #include <task/task.h>
+#include <task/wait.h>
 
 attribute_t usb_bus_subsystem_attr = {
     .name = "SUBSYSTEM",
@@ -557,7 +558,7 @@ static int usb_device_control(usb_device_t *usbdev,
         return -ENODEV;
 
     return usb_send_pipe(usbdev->defpipe, req->bRequestType & USB_DIR_IN, req,
-                         data, req->wLength, usb_timeout_ns(timeout_ms));
+                         data, req->wLength, usb_timeout_ns(timeout_ms), NULL);
 }
 
 static int usb_find_endpoint(usb_device_t *usbdev, uint8_t epaddr,
@@ -773,6 +774,7 @@ static ssize_t usbfs_ioctl(void *dev, int cmd, void *args, fd_t *fd) {
         usb_super_speed_endpoint_descriptor_t *ss_ep = NULL;
         usb_pipe_t *pipe;
         void *kbuf = NULL;
+        int actual = 0;
         int dir;
         int ret;
 
@@ -808,11 +810,13 @@ static ssize_t usbfs_ioctl(void *dev, int cmd, void *args, fd_t *fd) {
 
         dir = (bulk.ep & USB_DIR_IN) ? USB_DIR_IN : USB_DIR_OUT;
         ret = usb_send_pipe(pipe, dir, NULL, kbuf, (int)bulk.len,
-                            usb_timeout_ns(bulk.timeout));
-        if (ret == 0 && (bulk.ep & USB_DIR_IN) && bulk.len &&
-            copy_to_user(bulk.data, kbuf, bulk.len)) {
+                            usb_timeout_ns(bulk.timeout), &actual);
+        if (ret == 0 && (bulk.ep & USB_DIR_IN) && actual > 0 &&
+            copy_to_user(bulk.data, kbuf, (size_t)actual)) {
             ret = -EFAULT;
         }
+        if (ret == 0)
+            ret = actual;
 
         free(kbuf);
         usb_free_pipe(usbdev, pipe);
@@ -1065,28 +1069,197 @@ usb_realloc_pipe(usb_device_t *usbdev, usb_pipe_t *pipe,
 int usb_submit_xfer(usb_xfer_t *xfer) {
     if (!xfer || !xfer->pipe || !xfer->pipe->usbdev ||
         !xfer->pipe->usbdev->hub || !xfer->pipe->usbdev->hub->op ||
-        !xfer->pipe->usbdev->hub->op->submit_xfer) {
+        !xfer->pipe->usbdev->hub->op->submit_xfer || !xfer->cb) {
         return -EINVAL;
     }
 
     return xfer->pipe->usbdev->hub->op->submit_xfer(xfer);
 }
 
+typedef struct usb_sync_xfer {
+    wait_mutex_t lock;
+    wait_queue_head_t wait;
+    volatile int refs;
+    bool completed;
+    bool abandoned;
+    int status;
+    int actual_length;
+    int direction;
+    int data_size;
+    void *caller_data;
+    void *dma_data;
+    usb_ctrl_request_t command;
+    bool has_command;
+} usb_sync_xfer_t;
+
+static void usb_sync_xfer_put(usb_sync_xfer_t *sync) {
+    if (!sync || __atomic_sub_fetch(&sync->refs, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+
+    if (sync->dma_data)
+        free_frames_bytes(sync->dma_data, (size_t)sync->data_size);
+    free(sync);
+}
+
+static void usb_sync_xfer_complete(int status, int actual_length,
+                                   void *user_data) {
+    usb_sync_xfer_t *sync = user_data;
+
+    if (!sync)
+        return;
+
+    wait_mutex_lock(&sync->lock);
+    if (actual_length < 0 || actual_length > sync->data_size) {
+        status = EVENT_ERROR;
+        actual_length = 0;
+    }
+    if (!sync->abandoned && sync->direction == USB_DIR_IN &&
+        sync->caller_data && sync->dma_data && actual_length > 0) {
+        memcpy(sync->caller_data, sync->dma_data, (size_t)actual_length);
+    }
+    sync->status = status;
+    sync->actual_length = actual_length;
+    sync->completed = true;
+    wait_mutex_unlock(&sync->lock);
+
+    wait_queue_wake_all(&sync->wait, 0, EOK);
+    usb_sync_xfer_put(sync);
+}
+
+static int usb_sync_status(int status) {
+    switch (status) {
+    case EVENT_SUCCESS:
+    case EVENT_SHORT_PACKET:
+        return 0;
+    case EVENT_STALL:
+        return -EPIPE;
+    case EVENT_BABBLE:
+        return -EOVERFLOW;
+    case EVENT_TIMEOUT:
+        return -ETIMEDOUT;
+    default:
+        return -EIO;
+    }
+}
+
+static int usb_sync_xfer_finish(usb_sync_xfer_t *sync, int *actual_length_out) {
+    int ret;
+
+    wait_mutex_lock(&sync->lock);
+    ret = usb_sync_status(sync->status);
+    if (actual_length_out)
+        *actual_length_out = sync->actual_length;
+    wait_mutex_unlock(&sync->lock);
+    usb_sync_xfer_put(sync);
+    return ret;
+}
+
+static int usb_sync_xfer_abandon(usb_sync_xfer_t *sync, int ret,
+                                 int *actual_length_out) {
+    wait_mutex_lock(&sync->lock);
+    if (sync->completed) {
+        wait_mutex_unlock(&sync->lock);
+        return usb_sync_xfer_finish(sync, actual_length_out);
+    }
+    sync->abandoned = true;
+    sync->caller_data = NULL;
+    wait_mutex_unlock(&sync->lock);
+    usb_sync_xfer_put(sync);
+    return ret;
+}
+
 int usb_send_pipe(usb_pipe_t *pipe_fl, int dir, const void *cmd, void *data,
-                  int datasize, uint64_t timeout_ns) {
+                  int datasize, uint64_t timeout_ns, int *actual_length_out) {
+    usb_sync_xfer_t *sync;
+    uint64_t deadline;
+    int ret;
+
+    if (!pipe_fl || datasize < 0 || (datasize > 0 && !data))
+        return -EINVAL;
+    if (!current_task || current_task->preempt_count)
+        return -EDEADLK;
+    if (actual_length_out)
+        *actual_length_out = 0;
+
+    sync = calloc(1, sizeof(*sync));
+    if (!sync)
+        return -ENOMEM;
+    wait_mutex_init(&sync->lock);
+    wait_queue_init(&sync->wait);
+    sync->refs = 2;
+    sync->direction = dir;
+    sync->data_size = datasize;
+    sync->caller_data = data;
+    if (cmd) {
+        memcpy(&sync->command, cmd, sizeof(sync->command));
+        sync->has_command = true;
+    }
+    if (datasize > 0) {
+        sync->dma_data = alloc_frames_bytes((size_t)datasize);
+        if (!sync->dma_data) {
+            usb_sync_xfer_put(sync);
+            usb_sync_xfer_put(sync);
+            return -ENOMEM;
+        }
+        if (dir != USB_DIR_IN)
+            memcpy(sync->dma_data, data, (size_t)datasize);
+    }
+
     usb_xfer_t xfer = {
         .pipe = pipe_fl,
         .dir = dir,
-        .cmd = cmd,
-        .data = data,
+        .cmd = sync->has_command ? &sync->command : NULL,
+        .data = sync->dma_data,
         .datasize = datasize,
-        .timeout_ns = timeout_ns,
-        .cb = NULL,
-        .user_data = NULL,
-        .flags = 0,
+        .cb = usb_sync_xfer_complete,
+        .user_data = sync,
     };
 
-    return usb_submit_xfer(&xfer);
+    ret = usb_submit_xfer(&xfer);
+    if (ret < 0) {
+        usb_sync_xfer_put(sync);
+        usb_sync_xfer_put(sync);
+        return ret;
+    }
+
+    if (timeout_ns == (uint64_t)-1)
+        timeout_ns = (uint64_t)usb_xfer_time(pipe_fl, datasize) * 1000000ULL;
+    uint64_t now = nano_time();
+    deadline = timeout_ns > UINT64_MAX - now ? UINT64_MAX : now + timeout_ns;
+
+    for (;;) {
+        wait_queue_entry_t wait;
+        int64_t remain_ns;
+
+        task_prepare_block(current_task);
+        wait_queue_entry_init(&wait, current_task, 0, NULL, NULL);
+        wait_queue_add(&sync->wait, &wait);
+
+        wait_mutex_lock(&sync->lock);
+        bool completed = sync->completed;
+        wait_mutex_unlock(&sync->lock);
+        if (completed) {
+            wait_queue_remove(&sync->wait, &wait);
+            task_cancel_block_prepare(current_task);
+            return usb_sync_xfer_finish(sync, actual_length_out);
+        }
+
+        uint64_t now = nano_time();
+        if (now >= deadline) {
+            wait_queue_remove(&sync->wait, &wait);
+            task_cancel_block_prepare(current_task);
+            return usb_sync_xfer_abandon(sync, -ETIMEDOUT, actual_length_out);
+        }
+        remain_ns = deadline == UINT64_MAX ? -1 : (int64_t)(deadline - now);
+        ret = task_block(current_task, TASK_BLOCKING, remain_ns, "usb_xfer");
+        wait_queue_remove(&sync->wait, &wait);
+        task_cancel_block_prepare(current_task);
+
+        if (ret == ETIMEDOUT)
+            return usb_sync_xfer_abandon(sync, -ETIMEDOUT, actual_length_out);
+        if (ret < 0)
+            return usb_sync_xfer_abandon(sync, ret, actual_length_out);
+    }
 }
 
 int usb_send_intr_pipe(usb_pipe_t *pipe_fl, void *data_ptr, int len,
@@ -1097,10 +1270,8 @@ int usb_send_intr_pipe(usb_pipe_t *pipe_fl, void *data_ptr, int len,
         .cmd = NULL,
         .data = data_ptr,
         .datasize = len,
-        .timeout_ns = 0,
         .cb = cb,
         .user_data = user_data,
-        .flags = USB_XFER_ASYNC,
     };
 
     return usb_submit_xfer(&xfer);
@@ -1123,28 +1294,12 @@ void usb_free_pipe(usb_device_t *usbdev, usb_pipe_t *pipe) {
 int usb_send_default_control(usb_pipe_t *pipe, const usb_ctrl_request_t *req,
                              void *data) {
     return usb_send_pipe(pipe, req->bRequestType & USB_DIR_IN, req, data,
-                         req->wLength, (uint64_t)-1);
+                         req->wLength, (uint64_t)-1, NULL);
 }
 
 int usb_send_bulk(usb_pipe_t *pipe_fl, int dir, void *data, int datasize) {
-    return usb_send_pipe(pipe_fl, dir, NULL, data, datasize, (uint64_t)-1);
-}
-
-int usb_send_bulk_nonblock(usb_pipe_t *pipe_fl, int dir, void *data,
-                           int datasize) {
-    usb_xfer_t xfer = {
-        .pipe = pipe_fl,
-        .dir = dir,
-        .cmd = NULL,
-        .data = data,
-        .datasize = datasize,
-        .timeout_ns = 0,
-        .cb = NULL,
-        .user_data = NULL,
-        .flags = USB_XFER_ASYNC,
-    };
-
-    return usb_submit_xfer(&xfer);
+    return usb_send_pipe(pipe_fl, dir, NULL, data, datasize, (uint64_t)-1,
+                         NULL);
 }
 
 int usb_is_freelist(usb_controller_t *cntl, usb_pipe_t *pipe) {

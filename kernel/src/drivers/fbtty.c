@@ -132,12 +132,8 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
             return -EINVAL;
         spin_lock(&terminal_write_lock);
         device->tty_mode = arg;
-        // if (tty_vt_is_active(device) && device->terminal) {
-        //     flanterm_set_output_enabled(device->terminal, arg == KD_TEXT);
-        //     if (arg == KD_TEXT)
-        //         flanterm_full_refresh(device->terminal);
-        // }
         spin_unlock(&terminal_write_lock);
+        terminal_set_active(device, tty_vt_is_active(device));
         return 0;
     case KDGKBMODE: {
         int kbmode = device->tty_kbmode;
@@ -272,10 +268,16 @@ void terminal_set_active(tty_t *tty, bool active) {
     if (!tty || !tty->terminal)
         return;
 
+    bool text = active && tty->tty_mode == KD_TEXT;
+    if (text) {
+        int ret = tty_restore_graphics(tty);
+        if (ret < 0)
+            printk("tty: failed to restore graphics console: %d\n", ret);
+    }
+
     spin_lock(&terminal_write_lock);
-    flanterm_set_output_enabled(tty->terminal,
-                                active && tty->tty_mode == KD_TEXT);
-    if (active && tty->tty_mode == KD_TEXT)
+    flanterm_set_output_enabled(tty->terminal, text);
+    if (text)
         flanterm_full_refresh(tty->terminal);
     spin_unlock(&terminal_write_lock);
 }

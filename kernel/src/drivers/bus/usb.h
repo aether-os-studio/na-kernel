@@ -366,14 +366,9 @@ struct usb_xfer {
     const void *cmd;
     void *data;
     int datasize;
-    uint64_t timeout_ns;
     usb_xfer_cb cb;
     void *user_data;
-    int *actual_length_out;
-    uint32_t flags;
 };
-
-#define USB_XFER_ASYNC (1U << 0)
 
 struct usb_device_id {
     uint16_t match_flags;
@@ -422,31 +417,24 @@ struct usb_device_id {
 #define HID_REQ_SET_PROTOCOL 0x0B
 
 /**
- * Submit a prepared transfer to the controller that owns xfer->pipe.
- * Notes: ownership of the transfer buffer still belongs to the caller. For
- * asynchronous use, that means both the xfer object and its backing buffers
- * must outlive completion.
+ * Submit a prepared transfer asynchronously to the controller that owns
+ * xfer->pipe. The HCD copies the transfer description before returning and
+ * reports completion through xfer->cb. The data buffer must remain valid until
+ * that callback runs.
  */
 int usb_submit_xfer(usb_xfer_t *xfer);
 /**
- * Send one generic transfer through a prepared pipe.
- * Notes: this is the synchronous convenience path. Callers that need overlap or
- * completion callbacks should build a usb_xfer and use usb_submit_xfer().
+ * Submit one transfer and wait for its asynchronous completion in USB core.
+ * Host-controller drivers never implement the waiting side of this helper.
  */
 int usb_send_pipe(usb_pipe_t *pipe, int dir, const void *cmd, void *data,
-                  int datasize, uint64_t timeout_ns);
+                  int datasize, uint64_t timeout_ns, int *actual_length_out);
 /**
  * Send a synchronous bulk transfer.
  * Notes: bulk transfers may legitimately complete short. Treating every short
  * packet as a hard fault is a higher-level protocol decision, not a USB rule.
  */
 int usb_send_bulk(usb_pipe_t *pipe, int dir, void *data, int datasize);
-/**
- * Queue a non-blocking bulk transfer.
- * Notes: once queued, the caller must keep the payload buffer stable until the
- * controller has consumed it or reported completion through its own path.
- */
-int usb_send_bulk_nonblock(usb_pipe_t *pipe, int dir, void *data, int datasize);
 /**
  * Queue an interrupt transfer with a completion callback.
  * Notes: the callback runs from the USB completion path, so it should stay

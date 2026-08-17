@@ -752,6 +752,44 @@ int tty_rebind_framebuffer(const struct tty_graphics_ *framebuffer) {
     return 0;
 }
 
+int tty_bind_graphics_backend(const tty_graphics_backend_t *backend) {
+    tty_device_t *device = get_tty_device("tty0");
+
+    if (!backend || !backend->context || !backend->restore)
+        return -EINVAL;
+    if (!device || device->type != TTY_DEVICE_GRAPHI)
+        return -ENODEV;
+
+    spin_lock(&tty_vt_lock);
+    device->graphics_backend = *backend;
+    spin_unlock(&tty_vt_lock);
+    return 0;
+}
+
+void tty_unbind_graphics_backend(void *context) {
+    tty_device_t *device = get_tty_device("tty0");
+
+    if (!device || device->type != TTY_DEVICE_GRAPHI)
+        return;
+
+    spin_lock(&tty_vt_lock);
+    if (device->graphics_backend.context == context)
+        memset(&device->graphics_backend, 0, sizeof(device->graphics_backend));
+    spin_unlock(&tty_vt_lock);
+}
+
+int tty_restore_graphics(tty_t *tty) {
+    tty_graphics_backend_t backend;
+
+    if (!tty || !tty->device || tty->device->type != TTY_DEVICE_GRAPHI)
+        return 0;
+
+    spin_lock(&tty_vt_lock);
+    backend = tty->device->graphics_backend;
+    spin_unlock(&tty_vt_lock);
+    return backend.restore ? backend.restore(backend.context) : 0;
+}
+
 char *default_console = NULL;
 
 void parse_cmdline_console(const char *cmdline) {

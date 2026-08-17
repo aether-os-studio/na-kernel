@@ -517,6 +517,7 @@ typedef struct na_drm_driver_ops {
     int (*atomic_commit)(void *context, uint32_t flags, uint64_t user_data,
                          const na_drm_atomic_property_t *properties,
                          size_t property_count);
+    int (*restore_console)(void *context);
     int (*mmap)(void *context, uint64_t file_id, uint64_t offset,
                 uint64_t length, uint64_t *physical_address);
     int (*prime_export)(void *context, uint64_t file_id, uint32_t handle,
@@ -537,6 +538,8 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
                                      const na_drm_driver_info_t *driver_info);
 void na_drm_device_unregister(drm_device_t *device);
 int na_drm_device_notify_hotplug(drm_device_t *device);
+int na_drm_device_bind_console(drm_device_t *device,
+                               const na_boot_framebuffer_t *framebuffer);
 drm_connector_t *na_drm_connector_create(const na_drm_connector_info_t *info);
 int na_drm_connector_add_mode(drm_connector_t *connector,
                               const na_drm_mode_info_t *mode);

@@ -190,6 +190,10 @@ pub trait Driver: Sync + 'static {
     fn atomic_commit(&self, _commit: AtomicCommit<'_>) -> Result<()> {
         Err(Error::Unsupported)
     }
+
+    fn restore_console(&self) -> Result<()> {
+        Err(Error::Unsupported)
+    }
 }
 
 pub struct Device {
@@ -219,6 +223,12 @@ pub struct OwnedDevice<D: Driver + Send> {
 impl<D: Driver + Send> OwnedDevice<D> {
     pub fn notify_hotplug(&self) -> Result<()> {
         let status = unsafe { bindings::na_drm_device_notify_hotplug(self.raw.as_ptr()) };
+        Error::from_status(status)
+    }
+
+    pub fn bind_console(&self, framebuffer: crate::boot::Framebuffer) -> Result<()> {
+        let raw = framebuffer.as_raw();
+        let status = unsafe { bindings::na_drm_device_bind_console(self.raw.as_ptr(), &raw) };
         Error::from_status(status)
     }
 }
@@ -322,6 +332,7 @@ impl RegistrationConfig {
             page_flip: Some(Callbacks::<D>::page_flip),
             set_cursor: Some(Callbacks::<D>::set_cursor),
             atomic_commit: Some(Callbacks::<D>::atomic_commit),
+            restore_console: Some(Callbacks::<D>::restore_console),
             mmap: Some(Callbacks::<D>::mmap),
             prime_export: Some(Callbacks::<D>::prime_export),
             prime_import: Some(Callbacks::<D>::prime_import),
