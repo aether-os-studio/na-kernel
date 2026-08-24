@@ -25,6 +25,7 @@ typedef struct drm_connector {
     uint32_t id;
     uint32_t type;
     uint32_t connection;
+    uint32_t dpms;
     uint32_t encoder_id;
     uint32_t crtc_id;
     uint32_t mm_width;
@@ -32,6 +33,8 @@ typedef struct drm_connector {
     uint32_t subpixel;
     uint32_t count_modes;
     struct drm_mode_modeinfo *modes;
+    uint8_t *edid;
+    uint32_t edid_length;
     uint32_t count_props;
     uint32_t *prop_ids;
     uint64_t *prop_values;
@@ -47,6 +50,7 @@ typedef struct drm_crtc {
     uint32_t w;
     uint32_t h;
     uint32_t gamma_size;
+    bool active;
     uint32_t mode_valid;
     struct drm_mode_modeinfo mode;
     uint32_t *prop_ids;
@@ -131,6 +135,8 @@ typedef struct drm_plane {
     uint32_t gamma_size;
     uint32_t count_format_types;
     uint32_t *format_types;
+    uint32_t count_modifiers;
+    uint64_t *modifiers;
     void *driver_data;
     uint32_t refcount;
     enum drm_plane_type plane_type;

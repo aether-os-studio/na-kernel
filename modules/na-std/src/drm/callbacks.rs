@@ -6,7 +6,7 @@ use super::{
     device::{Driver, FileId, Ioctl, MmapRequest},
     modeset::{
         AtomicCommit, CrtcUpdate, CursorUpdate, DumbBufferRequest, FramebufferRequest,
-        FramebufferUpdate, PageFlip, PlaneUpdate,
+        FramebufferUpdate, PageFlip, PlaneUpdate, PropertyUpdate,
     },
     resources::{ConnectorList, CrtcList, EncoderList, PlaneList},
 };
@@ -31,6 +31,25 @@ impl<D: Driver> Callbacks<D> {
         if let Some(driver) = unsafe { Self::driver(context) } {
             driver.close(FileId::from_raw(file_id));
         }
+    }
+
+    pub(super) unsafe extern "C" fn restore_console(context: *mut core::ffi::c_void) -> i32 {
+        let Some(driver) = (unsafe { Self::driver(context) }) else {
+            return Error::InvalidArgument.status();
+        };
+        driver.restore_console().map_or_else(Error::status, |()| 0)
+    }
+
+    pub(super) unsafe extern "C" fn set_vblank_enabled(
+        context: *mut core::ffi::c_void,
+        enabled: bool,
+    ) -> i32 {
+        let Some(driver) = (unsafe { Self::driver(context) }) else {
+            return Error::InvalidArgument.status();
+        };
+        driver
+            .set_vblank_enabled(enabled)
+            .map_or_else(Error::status, |()| 0)
     }
 
     pub(super) unsafe extern "C" fn driver_ioctl(
@@ -497,6 +516,19 @@ impl<D: Driver> Callbacks<D> {
         }
         let update = unsafe { CrtcUpdate::from_raw(raw, connector_ids, connector_count) };
         driver.set_crtc(update).map_or_else(Error::status, |()| 0)
+    }
+
+    pub(super) unsafe extern "C" fn set_property(
+        context: *mut core::ffi::c_void,
+        raw: *const bindings::DrmPropertyUpdate,
+    ) -> i32 {
+        let (Some(driver), Some(raw)) = (unsafe { Self::driver(context) }, unsafe { raw.as_ref() })
+        else {
+            return Error::InvalidArgument.status();
+        };
+        PropertyUpdate::try_from(raw)
+            .and_then(|update| driver.set_property(update))
+            .map_or_else(Error::status, |()| 0)
     }
 
     pub(super) unsafe extern "C" fn page_flip(

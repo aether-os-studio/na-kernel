@@ -11,8 +11,6 @@
 
 #define XHCI_RING_ITEMS 128
 #define XHCI_RING_SIZE (XHCI_RING_ITEMS * sizeof(struct xhci_trb))
-#define XHCI_DEFERRED_CB_MAX 256
-#define XHCI_CALLBACK_QUEUE_ITEMS 512
 #define XHCI_TRB_MAX_XFER 65536
 #define XHCI_IMAN_IP (1U << 0)
 #define XHCI_IMAN_IE (1U << 1)
@@ -180,6 +178,10 @@ struct xhci_deferred_cb {
     int status;
     int actual;
     void *user_data;
+    void *data;
+    int requested_len;
+    bool dir_in;
+    struct xhci_deferred_cb *next;
 };
 
 struct xhci_event_ring {
@@ -194,15 +196,11 @@ struct xhci_event_ring {
 struct xhci_pipe {
     struct xhci_ring reqs;
     usb_pipe_t pipe;
+    spinlock_t lock;
     uint32_t slotid;
     uint32_t epid;
-    int transfer_count;
-    usb_xfer_cb async_cb;
-    void *async_user_data;
-    void *async_data;
-    int async_len;
-    int async_dir;
-    bool async_active;
+    struct xhci_deferred_cb *pending;
+    bool closing;
 };
 
 struct usb_xhci {
@@ -236,14 +234,13 @@ struct usb_xhci {
 
     spinlock_t event_lock;
     spinlock_t callback_lock;
+    wait_mutex_t command_lock;
     wait_queue_head_t irq_wait;
     task_t *event_task;
     task_t *callback_task;
-    struct xhci_deferred_cb callback_queue[XHCI_CALLBACK_QUEUE_ITEMS];
-    uint32_t callback_head;
-    uint32_t callback_tail;
+    struct xhci_deferred_cb *callback_head;
+    struct xhci_deferred_cb *callback_tail;
     uint32_t callback_count;
-    uint64_t callback_dropped;
     volatile uint32_t irq_seq;
     bool running;
 
@@ -530,26 +527,25 @@ static void xhci_commit_erdp(usb_xhci_t *xhci, struct xhci_event_ring *intr) {
     }
 }
 
-static void xhci_queue_callback(usb_xhci_t *xhci, usb_xfer_cb cb, int status,
-                                int actual, void *user_data) {
+static void xhci_queue_callback(usb_xhci_t *xhci,
+                                struct xhci_deferred_cb *callback, int status,
+                                int actual) {
     bool wake_worker = false;
 
-    if (!xhci || !cb)
+    if (!xhci || !callback || !callback->cb)
         return;
+
+    callback->status = status;
+    callback->actual = actual;
+    callback->next = NULL;
 
     spin_lock(&xhci->callback_lock);
-    if (xhci->callback_count >= XHCI_CALLBACK_QUEUE_ITEMS) {
-        xhci->callback_dropped++;
-        if ((xhci->callback_dropped & 0xff) == 1)
-            printk("xhci: dropping async callback, queue full\n");
-        spin_unlock(&xhci->callback_lock);
-        return;
-    }
-
     wake_worker = xhci->callback_count == 0;
-    xhci->callback_queue[xhci->callback_tail] = (struct xhci_deferred_cb){
-        .cb = cb, .status = status, .actual = actual, .user_data = user_data};
-    xhci->callback_tail = (xhci->callback_tail + 1) % XHCI_CALLBACK_QUEUE_ITEMS;
+    if (xhci->callback_tail)
+        xhci->callback_tail->next = callback;
+    else
+        xhci->callback_head = callback;
+    xhci->callback_tail = callback;
     xhci->callback_count++;
     task_t *worker = xhci->callback_task;
     spin_unlock(&xhci->callback_lock);
@@ -559,16 +555,20 @@ static void xhci_queue_callback(usb_xhci_t *xhci, usb_xfer_cb cb, int status,
 }
 
 static uint32_t xhci_take_callbacks(usb_xhci_t *xhci,
-                                    struct xhci_deferred_cb *callbacks,
+                                    struct xhci_deferred_cb **callbacks,
                                     uint32_t max_callbacks) {
     uint32_t count = 0;
 
     spin_lock(&xhci->callback_lock);
     while (count < max_callbacks && xhci->callback_count > 0) {
-        callbacks[count++] = xhci->callback_queue[xhci->callback_head];
-        xhci->callback_head =
-            (xhci->callback_head + 1) % XHCI_CALLBACK_QUEUE_ITEMS;
+        struct xhci_deferred_cb *callback = xhci->callback_head;
+
+        xhci->callback_head = callback->next;
+        if (!xhci->callback_head)
+            xhci->callback_tail = NULL;
         xhci->callback_count--;
+        callback->next = NULL;
+        callbacks[count++] = callback;
     }
     spin_unlock(&xhci->callback_lock);
 
@@ -584,19 +584,19 @@ static bool xhci_callback_queue_empty(usb_xhci_t *xhci) {
     return empty;
 }
 
-static void xhci_run_callbacks(struct xhci_deferred_cb *callbacks,
+static void xhci_run_callbacks(struct xhci_deferred_cb **callbacks,
                                uint32_t callback_count) {
     for (uint32_t i = 0; i < callback_count; i++) {
-        if (callbacks[i].cb) {
-            callbacks[i].cb(callbacks[i].status, callbacks[i].actual,
-                            callbacks[i].user_data);
-        }
+        struct xhci_deferred_cb *callback = callbacks[i];
+
+        callback->cb(callback->status, callback->actual, callback->user_data);
+        free(callback);
     }
 }
 
 static void xhci_callback_thread(uint64_t arg) {
     usb_xhci_t *xhci = (usb_xhci_t *)arg;
-    struct xhci_deferred_cb callbacks[32];
+    struct xhci_deferred_cb *callbacks[32];
 
     while (xhci->running) {
         uint32_t count = xhci_take_callbacks(
@@ -653,24 +653,21 @@ static uint32_t xhci_process_event_ring(struct xhci_event_ring *intr) {
                 int status = xhci_cc_to_status(evt_cc);
                 memcpy(&ring->evt, etrb, sizeof(*etrb));
                 ring->eidx = eidx;
-                pipe->transfer_count++;
 
-                if (pipe->async_active) {
-                    usb_xfer_cb cb = pipe->async_cb;
-                    void *user_data = pipe->async_user_data;
-                    int actual = xhci_actual_length(pipe, pipe->async_len);
+                struct xhci_deferred_cb *callback = NULL;
+                int actual = 0;
 
-                    if (pipe->async_dir && pipe->async_data && actual > 0)
-                        dma_sync_device_to_cpu(pipe->async_data, actual);
+                spin_lock(&pipe->lock);
+                callback = pipe->pending;
+                pipe->pending = NULL;
+                spin_unlock(&pipe->lock);
 
-                    pipe->async_active = false;
-                    pipe->async_cb = NULL;
-                    pipe->async_user_data = NULL;
-                    pipe->async_data = NULL;
-                    pipe->async_len = 0;
-                    pipe->async_dir = 0;
-
-                    xhci_queue_callback(xhci, cb, status, actual, user_data);
+                if (callback) {
+                    actual =
+                        xhci_actual_length(pipe, callback->requested_len);
+                    if (callback->dir_in && callback->data && actual > 0)
+                        dma_sync_device_to_cpu(callback->data, actual);
+                    xhci_queue_callback(xhci, callback, status, actual);
                 }
             } else {
                 printk(
@@ -742,8 +739,8 @@ static void xhci_signal_irq(usb_xhci_t *xhci) {
     wait_queue_wake_all(&xhci->irq_wait, 0, EOK);
 }
 
-static int xhci_event_wait(usb_xhci_t *xhci, struct xhci_ring *ring,
-                           uint32_t timeout_ms) {
+static int xhci_cmd_wait(usb_xhci_t *xhci, struct xhci_ring *ring,
+                         uint32_t timeout_ms) {
     uint64_t timeout = nano_time() + (uint64_t)timeout_ms * 1000000ULL;
 
     while (nano_time() < timeout) {
@@ -751,7 +748,8 @@ static int xhci_event_wait(usb_xhci_t *xhci, struct xhci_ring *ring,
         if (!xhci_ring_busy(ring))
             return TRB_CC(ring->evt.status);
 
-        if (!xhci->irq_enabled || !current_task) {
+        if (!xhci->irq_enabled || !current_task ||
+            current_task->preempt_count) {
             arch_pause();
             continue;
         }
@@ -774,8 +772,8 @@ static int xhci_event_wait(usb_xhci_t *xhci, struct xhci_ring *ring,
             continue;
         }
 
-        int reason =
-            task_block(current_task, TASK_BLOCKING, remain_ns, "xhci_event");
+        int reason = task_block(current_task, TASK_BLOCKING, remain_ns,
+                                "xhci_command");
         wait_queue_remove(&xhci->irq_wait, &wait);
         task_cancel_block_prepare(current_task);
         if (reason < 0 && reason != EOK && reason != ETIMEDOUT)
@@ -788,6 +786,9 @@ static int xhci_event_wait(usb_xhci_t *xhci, struct xhci_ring *ring,
 
 static int xhci_cmd_submit(usb_xhci_t *xhci, xhci_input_ctx_t *inctx,
                            uint32_t flags) {
+    int cc;
+
+    wait_mutex_lock(&xhci->command_lock);
     if (inctx) {
         dma_sync_cpu_to_device(inctx, (sizeof(struct xhci_inctx) * 33)
                                           << xhci->context64);
@@ -795,7 +796,9 @@ static int xhci_cmd_submit(usb_xhci_t *xhci, xhci_input_ctx_t *inctx,
 
     xhci_trb_queue(&xhci->cmds, inctx, xhci_trb_status(0, 0), flags);
     xhci_doorbell(xhci, 0, 0);
-    return xhci_event_wait(xhci, &xhci->cmds, 1000);
+    cc = xhci_cmd_wait(xhci, &xhci->cmds, 1000);
+    wait_mutex_unlock(&xhci->command_lock);
+    return cc;
 }
 
 static int xhci_cmd_enable_slot(usb_xhci_t *xhci) {
@@ -829,6 +832,14 @@ static int xhci_cmd_evaluate_context(usb_xhci_t *xhci, uint32_t slotid,
                                      xhci_input_ctx_t *inctx) {
     return xhci_cmd_submit(xhci, inctx,
                            (CR_EVALUATE_CONTEXT << TRB_TYPE_SHIFT) |
+                               (slotid << TRB_CR_SLOTID_SHIFT));
+}
+
+static int xhci_cmd_stop_endpoint(usb_xhci_t *xhci, uint32_t slotid,
+                                  uint32_t epid) {
+    return xhci_cmd_submit(xhci, NULL,
+                           (CR_STOP_ENDPOINT << TRB_TYPE_SHIFT) |
+                               (epid << TRB_CR_EPID_SHIFT) |
                                (slotid << TRB_CR_SLOTID_SHIFT));
 }
 
@@ -940,6 +951,7 @@ xhci_alloc_pipe(usb_device_t *usbdev, usb_endpoint_descriptor_t *epdesc,
     if (!pipe)
         return NULL;
     memset(pipe, 0, sizeof(*pipe));
+    spin_init(&pipe->lock);
 
     usb_desc2pipe(&pipe->pipe, usbdev, epdesc);
     pipe->epid = epid;
@@ -1053,10 +1065,42 @@ xhci_realloc_pipe(usb_device_t *usbdev, usb_pipe_t *upipe,
     if (!epdesc) {
         struct xhci_pipe *pipe = container_of(upipe, struct xhci_pipe, pipe);
         usb_xhci_t *xhci = container_of(upipe->cntl, usb_xhci_t, usb);
+        struct xhci_deferred_cb *callback;
+        bool pending;
+
+        spin_lock(&pipe->lock);
+        pipe->closing = true;
+        pending = pipe->pending != NULL;
+        spin_unlock(&pipe->lock);
+
+        if (pending) {
+            int cc = xhci_cmd_stop_endpoint(xhci, pipe->slotid, pipe->epid);
+
+            if (cc != CC_SUCCESS && cc != CC_CONTEXT_STATE_ERROR) {
+                spin_lock(&pipe->lock);
+                pending = pipe->pending != NULL;
+                spin_unlock(&pipe->lock);
+                if (pending) {
+                    printk("xhci: refusing to free active pipe %u:%u "
+                           "after stop failed, cc=%d\n",
+                           pipe->slotid, pipe->epid, cc);
+                    return upipe;
+                }
+            }
+        }
+
+        spin_lock(&xhci->event_lock);
+        spin_lock(&pipe->lock);
+        callback = pipe->pending;
+        pipe->pending = NULL;
         xhci->pipes[pipe->slotid][pipe->epid] = NULL;
+        spin_unlock(&pipe->lock);
+        spin_unlock(&xhci->event_lock);
+
+        if (callback)
+            xhci_queue_callback(xhci, callback, EVENT_ERROR, 0);
         xhci_free_ring(&pipe->reqs);
         free_frames_bytes(pipe, sizeof(*pipe));
-        // usb_add_freelist(upipe);
         return NULL;
     }
 
@@ -1141,15 +1185,15 @@ static void xhci_xfer_normal(struct xhci_pipe *pipe, void *data, int datalen,
 
 int xhci_submit_xfer(usb_xfer_t *xfer) {
     struct xhci_pipe *pipe;
+    struct xhci_deferred_cb *callback;
     usb_xhci_t *xhci;
-    int timeout_ms;
     int datalen;
     int dir;
-    int actual = 0;
+    bool set_address = false;
     const void *cmd;
     void *data;
 
-    if (!xfer || !xfer->pipe)
+    if (!xfer || !xfer->pipe || !xfer->cb || xfer->datasize < 0)
         return -EINVAL;
 
     pipe = container_of(xfer->pipe, struct xhci_pipe, pipe);
@@ -1159,64 +1203,45 @@ int xhci_submit_xfer(usb_xfer_t *xfer) {
     cmd = xfer->cmd;
     data = xfer->data;
 
-    if (pipe->async_active || xhci_ring_busy(&pipe->reqs))
-        return -EBUSY;
+    callback = calloc(1, sizeof(*callback));
+    if (!callback)
+        return -ENOMEM;
+    callback->cb = xfer->cb;
+    callback->user_data = xfer->user_data;
+    callback->data = data;
+    callback->requested_len = datalen;
+    callback->dir_in = dir != 0;
 
-    timeout_ms = xfer->timeout_ns != (uint64_t)-1
-                     ? (int)(xfer->timeout_ns / 1000000ULL)
-                     : usb_xfer_time(xfer->pipe, datalen);
+    if (cmd) {
+        const usb_ctrl_request_t *req = cmd;
+        set_address =
+            req->bRequestType ==
+                (USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE) &&
+            req->bRequest == USB_REQ_SET_ADDRESS;
+    }
+
+    spin_lock(&pipe->lock);
+    if (pipe->closing || pipe->pending || xhci_ring_busy(&pipe->reqs)) {
+        spin_unlock(&pipe->lock);
+        free(callback);
+        return -EBUSY;
+    }
+    if (!set_address)
+        pipe->pending = callback;
+    spin_unlock(&pipe->lock);
+
+    if (set_address) {
+        xhci_queue_callback(xhci, callback, EVENT_SUCCESS, 0);
+        return 0;
+    }
 
     if (data && datalen > 0)
         dma_sync_cpu_to_device(data, datalen);
 
-    if (xfer->flags & USB_XFER_ASYNC) {
-        pipe->async_active = true;
-        pipe->async_cb = xfer->cb;
-        pipe->async_user_data = xfer->user_data;
-        pipe->async_data = data;
-        pipe->async_len = datalen;
-        pipe->async_dir = dir ? 1 : 0;
-    }
-
-    if (cmd) {
-        // TODO
-        const usb_ctrl_request_t *req = cmd;
-        if (req->bRequestType ==
-                (USB_DIR_OUT | USB_TYPE_STANDARD | USB_RECIP_DEVICE) &&
-            req->bRequest == USB_REQ_SET_ADDRESS) {
-            if (xfer->flags & USB_XFER_ASYNC) {
-                pipe->async_active = false;
-                pipe->async_cb = NULL;
-                pipe->async_user_data = NULL;
-                pipe->async_data = NULL;
-                pipe->async_len = 0;
-                pipe->async_dir = 0;
-            }
-            if (xfer->actual_length_out)
-                *xfer->actual_length_out = 0;
-            return 0;
-        }
+    if (cmd)
         xhci_xfer_setup(pipe, dir, (void *)cmd, data, datalen, 0);
-    } else {
+    else
         xhci_xfer_normal(pipe, data, datalen, 0);
-    }
-
-    if (xfer->flags & USB_XFER_ASYNC) {
-        return 0;
-    }
-
-    int cc = xhci_event_wait(xhci, &pipe->reqs, timeout_ms);
-    if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET)
-        return -1;
-
-    actual = xhci_actual_length(pipe, datalen);
-    if (xfer->actual_length_out)
-        *xfer->actual_length_out = actual;
-
-    if (dir && data) {
-        if (actual > 0)
-            dma_sync_device_to_cpu(data, actual);
-    }
 
     return 0;
 }
@@ -1481,6 +1506,7 @@ static usb_xhci_t *xhci_controller_setup(void *baseaddr) {
     xhci->usb.flags = 0;
     spin_init(&xhci->event_lock);
     spin_init(&xhci->callback_lock);
+    wait_mutex_init(&xhci->command_lock);
     wait_queue_init(&xhci->irq_wait);
 
     xhci->mmio = baseaddr;

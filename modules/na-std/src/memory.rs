@@ -182,7 +182,7 @@ impl DmaBuffer {
     /// This is the safe equivalent of Linux's `READ_ONCE()` for device
     /// writeback memory; callers do not need to expose raw pointers.
     pub fn read_volatile_u64(&self, offset: usize) -> Result<u64> {
-        if offset % core::mem::align_of::<u64>() != 0
+        if !offset.is_multiple_of(core::mem::align_of::<u64>())
             || offset
                 .checked_add(core::mem::size_of::<u64>())
                 .filter(|end| *end <= self.length)
@@ -192,6 +192,19 @@ impl DmaBuffer {
         }
         let pointer = self.ptr.as_ptr().wrapping_add(offset).cast::<u64>();
         Ok(u64::from_le(unsafe { pointer.read_volatile() }))
+    }
+
+    pub fn read_volatile_u32(&self, offset: usize) -> Result<u32> {
+        if !offset.is_multiple_of(core::mem::align_of::<u32>())
+            || offset
+                .checked_add(core::mem::size_of::<u32>())
+                .filter(|end| *end <= self.length)
+                .is_none()
+        {
+            return Err(Error::Range);
+        }
+        let pointer = self.ptr.as_ptr().wrapping_add(offset).cast::<u32>();
+        Ok(u32::from_le(unsafe { pointer.read_volatile() }))
     }
 
     pub fn sync_for_device(&self) {

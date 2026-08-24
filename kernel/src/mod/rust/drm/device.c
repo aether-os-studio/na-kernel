@@ -1,4 +1,5 @@
 #include <dev/device.h>
+#include <drivers/tty.h>
 #include <mod/rust/drm/internal.h>
 
 static uint64_t na_drm_file_id(fd_t *fd) {
@@ -16,6 +17,22 @@ static void na_drm_close(drm_device_t *device, drm_file_t *file) {
     na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
     if (bridge && file && bridge->ops.close)
         bridge->ops.close(bridge->ops.context, (uint64_t)(uintptr_t)file);
+}
+
+static int na_drm_restore_console(void *context) {
+    drm_device_t *device = context;
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+
+    if (!bridge || !bridge->ops.restore_console)
+        return -ENOSYS;
+    return bridge->ops.restore_console(bridge->ops.context);
+}
+
+static int na_drm_set_vblank_enabled(drm_device_t *device, bool enabled) {
+    na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
+    if (!bridge || !bridge->ops.set_vblank_enabled)
+        return -ENOSYS;
+    return bridge->ops.set_vblank_enabled(bridge->ops.context, enabled);
 }
 
 static int64_t na_drm_driver_ioctl(drm_device_t *device, uint32_t command,
@@ -178,11 +195,13 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
         .release_fb = na_drm_release_framebuffer,
         .get_fb_handle = na_drm_get_framebuffer_handle,
         .set_plane = na_drm_set_plane,
+        .set_property = na_drm_set_property,
         .atomic_commit = na_drm_atomic_commit,
         .map_dumb = na_drm_map_dumb_buffer,
         .set_crtc = na_drm_set_crtc,
         .page_flip = na_drm_page_flip,
         .set_cursor = na_drm_set_cursor,
+        .set_vblank_enabled = na_drm_set_vblank_enabled,
         .get_connectors = na_drm_get_connectors,
         .get_crtcs = na_drm_get_crtcs,
         .get_encoders = na_drm_get_encoders,
@@ -214,12 +233,16 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
 void na_drm_device_unregister(drm_device_t *device) {
     if (!device)
         return;
+    tty_unbind_graphics_backend(device);
     na_drm_driver_bridge_t *bridge = na_drm_bridge(device);
     for (uint32_t i = 0; i < DRM_MAX_CONNECTORS_PER_DEVICE; i++) {
         if (device->resource_mgr.connectors[i]) {
             free(device->resource_mgr.connectors[i]->modes);
             device->resource_mgr.connectors[i]->modes = NULL;
             device->resource_mgr.connectors[i]->count_modes = 0;
+            free(device->resource_mgr.connectors[i]->edid);
+            device->resource_mgr.connectors[i]->edid = NULL;
+            device->resource_mgr.connectors[i]->edid_length = 0;
         }
     }
     for (uint32_t i = 0; i < DRM_MAX_PLANES_PER_DEVICE; i++) {
@@ -227,6 +250,9 @@ void na_drm_device_unregister(drm_device_t *device) {
             free(device->resource_mgr.planes[i]->format_types);
             device->resource_mgr.planes[i]->format_types = NULL;
             device->resource_mgr.planes[i]->count_format_types = 0;
+            free(device->resource_mgr.planes[i]->modifiers);
+            device->resource_mgr.planes[i]->modifiers = NULL;
+            device->resource_mgr.planes[i]->count_modifiers = 0;
         }
     }
     if (bridge && bridge->ops.release_framebuffer) {
@@ -244,4 +270,38 @@ void na_drm_device_unregister(drm_device_t *device) {
 
 int na_drm_device_notify_hotplug(drm_device_t *device) {
     return device ? drm_notify_hotplug(device) : -EINVAL;
+}
+
+int na_drm_device_bind_console(drm_device_t *device,
+                               const na_boot_framebuffer_t *framebuffer) {
+    const tty_graphics_backend_t backend = {
+        .context = device,
+        .restore = na_drm_restore_console,
+    };
+
+    if (!device || !framebuffer)
+        return -EINVAL;
+
+    int ret = tty_bind_graphics_backend(&backend);
+    if (ret < 0)
+        return ret;
+
+    ret = na_tty_rebind_framebuffer(framebuffer);
+    if (ret < 0)
+        tty_unbind_graphics_backend(device);
+    return ret;
+}
+
+int na_drm_device_set_hardware_vblank(drm_device_t *device, bool enabled,
+                                      uint64_t period_ns) {
+    return drm_set_hardware_vblank(device, enabled, period_ns);
+}
+
+void na_drm_device_handle_vblank(drm_device_t *device, uint32_t crtc_index) {
+    if (!device || crtc_index >= DRM_MAX_CRTCS_PER_DEVICE)
+        return;
+
+    drm_crtc_t *crtc = device->resource_mgr.crtcs[crtc_index];
+    if (crtc)
+        drm_handle_vblank(device, crtc->id);
 }

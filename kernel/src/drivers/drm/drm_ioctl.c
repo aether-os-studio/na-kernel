@@ -2349,18 +2349,32 @@ static void drm_edid_set_descriptor_text(uint8_t *desc, uint8_t tag,
     }
 }
 
-static void drm_edid_fill_dtd(uint8_t *dtd, uint32_t width, uint32_t height,
-                              uint32_t mm_width, uint32_t mm_height,
-                              uint32_t refresh_hz) {
-    uint32_t hblank = 160;
-    uint32_t vblank = 45;
-    uint32_t hsync_offset = 48;
-    uint32_t hsync_pulse = 32;
-    uint32_t vsync_offset = 3;
-    uint32_t vsync_pulse = 5;
-    uint32_t htotal = width + hblank;
-    uint32_t vtotal = height + vblank;
-    uint32_t pixel_clock_10khz = (htotal * vtotal * refresh_hz) / 10000U;
+static bool drm_edid_fill_dtd(uint8_t *dtd,
+                              const struct drm_mode_modeinfo *mode,
+                              uint32_t mm_width, uint32_t mm_height) {
+    if (!mode || mode->clock == 0 || mode->hdisplay == 0 ||
+        mode->vdisplay == 0 || mode->htotal < mode->hdisplay ||
+        mode->vtotal < mode->vdisplay || mode->hsync_start < mode->hdisplay ||
+        mode->hsync_end < mode->hsync_start ||
+        mode->vsync_start < mode->vdisplay ||
+        mode->vsync_end < mode->vsync_start)
+        return false;
+
+    uint32_t width = mode->hdisplay;
+    uint32_t height = mode->vdisplay;
+    uint32_t hblank = mode->htotal - mode->hdisplay;
+    uint32_t vblank = mode->vtotal - mode->vdisplay;
+    uint32_t hsync_offset = mode->hsync_start - mode->hdisplay;
+    uint32_t hsync_pulse = mode->hsync_end - mode->hsync_start;
+    uint32_t vsync_offset = mode->vsync_start - mode->vdisplay;
+    uint32_t vsync_pulse = mode->vsync_end - mode->vsync_start;
+    uint32_t pixel_clock_10khz = (mode->clock + 5U) / 10U;
+
+    if (pixel_clock_10khz > UINT16_MAX || width > 0xfff || height > 0xfff ||
+        hblank > 0xfff || vblank > 0xfff || hsync_offset > 0x3ff ||
+        hsync_pulse > 0x3ff || vsync_offset > 0x3f || vsync_pulse > 0x3f ||
+        mm_width > 0xfff || mm_height > 0xfff)
+        return false;
 
     memset(dtd, 0, 18);
     dtd[0] = pixel_clock_10khz & 0xff;
@@ -2380,7 +2394,14 @@ static void drm_edid_fill_dtd(uint8_t *dtd, uint32_t width, uint32_t height,
     dtd[12] = mm_width & 0xff;
     dtd[13] = mm_height & 0xff;
     dtd[14] = ((mm_width >> 8) & 0xf) << 4 | ((mm_height >> 8) & 0xf);
-    dtd[17] = 0x1a;
+    dtd[17] = 0x18;
+    if (mode->flags & DRM_MODE_FLAG_PHSYNC)
+        dtd[17] |= 1 << 1;
+    if (mode->flags & DRM_MODE_FLAG_PVSYNC)
+        dtd[17] |= 1 << 2;
+    if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+        dtd[17] |= 1 << 7;
+    return true;
 }
 
 static void drm_edid_set_default_chromaticity(uint8_t edid[128]) {
@@ -2409,29 +2430,14 @@ static void drm_edid_set_default_chromaticity(uint8_t edid[128]) {
 
 static void drm_build_connector_edid(drm_device_t *dev, drm_connector_t *conn,
                                      uint8_t edid[128]) {
-    uint32_t width = 1024;
-    uint32_t height = 768;
-    uint32_t refresh = 60;
+    struct drm_mode_modeinfo mode;
+    drm_fill_default_modeinfo(dev, &mode);
+    if (conn->modes && conn->count_modes > 0)
+        mode = conn->modes[0];
+    uint32_t width = mode.hdisplay ? mode.hdisplay : 1024;
+    uint32_t height = mode.vdisplay ? mode.vdisplay : 768;
     uint32_t mm_width = conn->mm_width;
     uint32_t mm_height = conn->mm_height;
-
-    if (conn->modes && conn->count_modes > 0) {
-        if (conn->modes[0].hdisplay > 0) {
-            width = conn->modes[0].hdisplay;
-        }
-        if (conn->modes[0].vdisplay > 0) {
-            height = conn->modes[0].vdisplay;
-        }
-        if (conn->modes[0].vrefresh > 0) {
-            refresh = conn->modes[0].vrefresh;
-        }
-    } else if (dev->op->get_display_info) {
-        uint32_t bpp = 0;
-        if (dev->op->get_display_info(dev, &width, &height, &bpp) != 0) {
-            width = 1024;
-            height = 768;
-        }
-    }
 
     if (mm_width == 0) {
         mm_width = (width * 264U) / 1000U;
@@ -2468,8 +2474,8 @@ static void drm_build_connector_edid(drm_device_t *dev, drm_connector_t *conn,
     edid[18] = 0x01;
     edid[19] = 0x04;
     edid[20] = 0x80;
-    edid[21] = width & 0xff;
-    edid[22] = height & 0xff;
+    edid[21] = MIN(mm_width / 10U, UINT8_MAX);
+    edid[22] = MIN(mm_height / 10U, UINT8_MAX);
     edid[23] = 0x78;
     edid[24] = 0x0a;
     drm_edid_set_default_chromaticity(edid);
@@ -2478,8 +2484,9 @@ static void drm_build_connector_edid(drm_device_t *dev, drm_connector_t *conn,
         edid[i] = 0x01;
     }
 
-    drm_edid_fill_dtd(&edid[54], width, height, mm_width, mm_height, refresh);
-    drm_edid_set_descriptor_text(&edid[72], 0xfc, "NAOS Virtual");
+    if (!drm_edid_fill_dtd(&edid[54], &mode, mm_width, mm_height))
+        drm_edid_set_descriptor_text(&edid[54], 0xfe, "NAOS mode");
+    drm_edid_set_descriptor_text(&edid[72], 0xfc, "NAOS Display");
     drm_edid_set_descriptor_text(&edid[90], 0xff, "00000001");
     drm_edid_set_descriptor_text(&edid[108], 0xfe, "NAOS DRM");
 
@@ -2890,9 +2897,12 @@ ssize_t drm_ioctl_mode_getcrtc(drm_device_t *dev, void *arg) {
     struct drm_mode_modeinfo mode;
     drm_fill_crtc_modeinfo(dev, crtc_obj, &mode);
 
-    crtc->gamma_size = 0;
-    crtc->mode_valid = 1;
-    memcpy(&crtc->mode, &mode, sizeof(struct drm_mode_modeinfo));
+    crtc->gamma_size = crtc_obj->gamma_size;
+    crtc->mode_valid = crtc_obj->mode_valid;
+    if (crtc_obj->mode_valid)
+        memcpy(&crtc->mode, &mode, sizeof(struct drm_mode_modeinfo));
+    else
+        memset(&crtc->mode, 0, sizeof(struct drm_mode_modeinfo));
     crtc->fb_id = crtc_obj->fb_id;
     crtc->x = crtc_obj->x;
     crtc->y = crtc_obj->y;
@@ -3052,7 +3062,7 @@ skip_encoders:
         uint32_t prop_ids[3] = {DRM_CONNECTOR_DPMS_PROP_ID,
                                 DRM_CONNECTOR_EDID_PROP_ID,
                                 DRM_CONNECTOR_CRTC_ID_PROP_ID};
-        uint64_t prop_values[3] = {DRM_MODE_DPMS_ON, 0, connector->crtc_id};
+        uint64_t prop_values[3] = {connector->dpms, 0, connector->crtc_id};
         prop_values[1] = drm_connector_edid_blob_id(connector->id);
         uint32_t copy_props = MIN(props_cap, conn->count_props);
 
@@ -3169,6 +3179,37 @@ static ssize_t drm_ioctl_mode_rmfb(drm_device_t *dev, void *arg) {
  */
 ssize_t drm_ioctl_mode_setcrtc(drm_device_t *dev, void *arg, fd_t *fd) {
     struct drm_mode_crtc *crtc_cmd = (struct drm_mode_crtc *)arg;
+    drm_file_t *file = drm_file_from_vfs_file(fd);
+
+    if (crtc_cmd->x & 0xffff0000U || crtc_cmd->y & 0xffff0000U)
+        return -ERANGE;
+    if (crtc_cmd->count_connectors > DRM_MAX_CONNECTORS_PER_DEVICE)
+        return -EINVAL;
+    if (crtc_cmd->mode_valid) {
+        if (crtc_cmd->fb_id == 0 || crtc_cmd->count_connectors == 0)
+            return -EINVAL;
+    } else if (crtc_cmd->fb_id != 0 || crtc_cmd->count_connectors != 0) {
+        return -EINVAL;
+    }
+    uint32_t connector_ids[DRM_MAX_CONNECTORS_PER_DEVICE] = {0};
+    if (crtc_cmd->count_connectors &&
+        (!crtc_cmd->set_connectors_ptr ||
+         copy_from_user(connector_ids,
+                        (void *)(uintptr_t)crtc_cmd->set_connectors_ptr,
+                        crtc_cmd->count_connectors * sizeof(uint32_t))))
+        return -EFAULT;
+    for (uint32_t i = 0; i < crtc_cmd->count_connectors; i++) {
+        for (uint32_t prior = 0; prior < i; prior++)
+            if (connector_ids[prior] == connector_ids[i])
+                return -EINVAL;
+        drm_connector_t *connector =
+            drm_connector_get(&dev->resource_mgr, connector_ids[i]);
+        if (!connector)
+            return -ENOENT;
+        drm_connector_free(&dev->resource_mgr, connector->id);
+        if (file && !drm_file_has_object(file, connector_ids[i]))
+            return -ENOENT;
+    }
 
     // Find the CRTC by ID
     drm_crtc_t *crtc = drm_crtc_get(&dev->resource_mgr, crtc_cmd->crtc_id);
@@ -3176,26 +3217,45 @@ ssize_t drm_ioctl_mode_setcrtc(drm_device_t *dev, void *arg, fd_t *fd) {
         return -ENOENT;
     }
 
-    // Update CRTC state
     uint32_t old_fb_id = crtc->fb_id;
-    crtc->fb_id = crtc_cmd->fb_id;
-    crtc->x = crtc_cmd->x;
-    crtc->y = crtc_cmd->y;
-    crtc->mode_valid = crtc_cmd->mode_valid;
-    if (crtc_cmd->mode_valid) {
-        memcpy(&crtc->mode, &crtc_cmd->mode, sizeof(struct drm_mode_modeinfo));
-        crtc->w = crtc_cmd->mode.hdisplay;
-        crtc->h = crtc_cmd->mode.vdisplay;
-    }
 
     // Call driver to set CRTC if supported
-    int ret = 0;
-    if (dev->op->set_crtc) {
-        ret = dev->op->set_crtc(dev, crtc_cmd, fd);
-    }
+    int ret =
+        dev->op->set_crtc ? dev->op->set_crtc(dev, crtc_cmd, fd) : -ENOTSUP;
 
-    if (ret == 0 && old_fb_id != 0 && old_fb_id != crtc_cmd->fb_id) {
-        drm_framebuffer_cleanup_closed(dev, old_fb_id);
+    if (ret == 0) {
+        crtc->fb_id = crtc_cmd->fb_id;
+        crtc->x = crtc_cmd->x;
+        crtc->y = crtc_cmd->y;
+        crtc->mode_valid = crtc_cmd->mode_valid;
+        crtc->active = crtc_cmd->mode_valid && crtc_cmd->fb_id != 0;
+        if (crtc_cmd->mode_valid) {
+            memcpy(&crtc->mode, &crtc_cmd->mode,
+                   sizeof(struct drm_mode_modeinfo));
+            crtc->w = crtc_cmd->mode.hdisplay;
+            crtc->h = crtc_cmd->mode.vdisplay;
+        } else {
+            memset(&crtc->mode, 0, sizeof(crtc->mode));
+            crtc->w = 0;
+            crtc->h = 0;
+        }
+
+        for (uint32_t i = 0; i < DRM_MAX_CONNECTORS_PER_DEVICE; i++) {
+            drm_connector_t *connector = dev->resource_mgr.connectors[i];
+            if (connector && connector->crtc_id == crtc->id)
+                connector->crtc_id = 0;
+        }
+        for (uint32_t i = 0; i < crtc_cmd->count_connectors; i++) {
+            drm_connector_t *connector =
+                drm_connector_get(&dev->resource_mgr, connector_ids[i]);
+            if (connector) {
+                connector->crtc_id = crtc->id;
+                drm_connector_free(&dev->resource_mgr, connector->id);
+            }
+        }
+
+        if (old_fb_id != 0 && old_fb_id != crtc_cmd->fb_id)
+            drm_framebuffer_cleanup_closed(dev, old_fb_id);
     }
 
     // Release reference
@@ -3290,6 +3350,7 @@ ssize_t drm_ioctl_mode_getplane(drm_device_t *dev, void *arg) {
  */
 ssize_t drm_ioctl_mode_setplane(drm_device_t *dev, void *arg, fd_t *fd) {
     struct drm_mode_set_plane *plane_cmd = (struct drm_mode_set_plane *)arg;
+    drm_file_t *file = drm_file_from_vfs_file(fd);
 
     // Find the plane by ID
     drm_plane_t *plane = drm_plane_get(&dev->resource_mgr, plane_cmd->plane_id);
@@ -3297,27 +3358,57 @@ ssize_t drm_ioctl_mode_setplane(drm_device_t *dev, void *arg, fd_t *fd) {
         return -ENOENT;
     }
 
-    // Update plane state
-    uint32_t old_fb_id = plane->fb_id;
-    plane->crtc_id = plane_cmd->crtc_id;
-    plane->fb_id = plane_cmd->fb_id;
-    plane->src_x = plane_cmd->src_x;
-    plane->src_y = plane_cmd->src_y;
-    plane->src_w = plane_cmd->src_w;
-    plane->src_h = plane_cmd->src_h;
-    plane->crtc_x = plane_cmd->crtc_x;
-    plane->crtc_y = plane_cmd->crtc_y;
-    plane->crtc_w = plane_cmd->crtc_w;
-    plane->crtc_h = plane_cmd->crtc_h;
-
-    // Call driver to set plane (if supported)
-    int ret = 0;
-    if (dev->op->set_plane) {
-        ret = dev->op->set_plane(dev, plane_cmd, fd);
+    if (plane_cmd->fb_id != 0) {
+        drm_crtc_t *crtc = drm_crtc_get(&dev->resource_mgr, plane_cmd->crtc_id);
+        if (!crtc) {
+            drm_plane_free(&dev->resource_mgr, plane->id);
+            return -ENOENT;
+        }
+        drm_crtc_free(&dev->resource_mgr, crtc->id);
+        if (file && !drm_file_has_object(file, plane_cmd->crtc_id)) {
+            drm_plane_free(&dev->resource_mgr, plane->id);
+            return -ENOENT;
+        }
     }
 
-    if (ret == 0 && old_fb_id != 0 && old_fb_id != plane_cmd->fb_id) {
-        drm_framebuffer_cleanup_closed(dev, old_fb_id);
+    uint32_t old_fb_id = plane->fb_id;
+    uint32_t old_crtc_id = plane->crtc_id;
+
+    // Call driver to set plane (if supported)
+    int ret =
+        dev->op->set_plane ? dev->op->set_plane(dev, plane_cmd, fd) : -ENOTSUP;
+
+    if (ret == 0) {
+        plane->crtc_id = plane_cmd->fb_id ? plane_cmd->crtc_id : 0;
+        plane->fb_id = plane_cmd->fb_id;
+        plane->src_x = plane_cmd->src_x;
+        plane->src_y = plane_cmd->src_y;
+        plane->src_w = plane_cmd->src_w;
+        plane->src_h = plane_cmd->src_h;
+        plane->crtc_x = plane_cmd->crtc_x;
+        plane->crtc_y = plane_cmd->crtc_y;
+        plane->crtc_w = plane_cmd->crtc_w;
+        plane->crtc_h = plane_cmd->crtc_h;
+        if (plane->plane_type == DRM_PLANE_TYPE_PRIMARY) {
+            if (old_crtc_id != 0 && old_crtc_id != plane->crtc_id) {
+                drm_crtc_t *old_crtc =
+                    drm_crtc_get(&dev->resource_mgr, old_crtc_id);
+                if (old_crtc) {
+                    old_crtc->fb_id = 0;
+                    drm_crtc_free(&dev->resource_mgr, old_crtc->id);
+                }
+            }
+            if (plane->crtc_id != 0) {
+                drm_crtc_t *crtc =
+                    drm_crtc_get(&dev->resource_mgr, plane->crtc_id);
+                if (crtc) {
+                    crtc->fb_id = plane->fb_id;
+                    drm_crtc_free(&dev->resource_mgr, crtc->id);
+                }
+            }
+        }
+        if (old_fb_id != 0 && old_fb_id != plane_cmd->fb_id)
+            drm_framebuffer_cleanup_closed(dev, old_fb_id);
     }
 
     // Release reference
@@ -3782,6 +3873,18 @@ ssize_t drm_ioctl_mode_getpropblob(drm_device_t *dev, void *arg) {
             return -ENOENT;
         }
 
+        if (connector->edid && connector->edid_length > 0) {
+            size_t blob_len = connector->edid_length;
+            size_t copy_len = MIN((size_t)blob->length, blob_len);
+            blob->length = connector->edid_length;
+            int ret = 0;
+            if (copy_len > 0 && blob->data)
+                ret =
+                    drm_copy_to_user_ptr(blob->data, connector->edid, copy_len);
+            drm_connector_free(&dev->resource_mgr, connector->id);
+            return ret;
+        }
+
         uint8_t edid[128];
         drm_build_connector_edid(dev, connector, edid);
         drm_connector_free(&dev->resource_mgr, connector->id);
@@ -3812,10 +3915,23 @@ ssize_t drm_ioctl_mode_getpropblob(drm_device_t *dev, void *arg) {
         }
 
         uint32_t count_formats = plane->count_format_types;
-        uint32_t count_modifiers = (count_formats + 63U) / 64U;
+        uint32_t format_chunks = (count_formats + 63U) / 64U;
+        uint32_t modifier_values =
+            plane->count_modifiers ? plane->count_modifiers : 1;
+        if (modifier_values > UINT32_MAX / format_chunks) {
+            drm_plane_free(&dev->resource_mgr, plane->id);
+            return -EOVERFLOW;
+        }
+        uint32_t count_modifiers = modifier_values * format_chunks;
         size_t formats_len = (size_t)count_formats * sizeof(uint32_t);
         size_t modifiers_len =
             (size_t)count_modifiers * sizeof(struct drm_format_modifier);
+        if (formats_len > SIZE_MAX - sizeof(struct drm_format_modifier_blob) ||
+            modifiers_len > SIZE_MAX - sizeof(struct drm_format_modifier_blob) -
+                                formats_len) {
+            drm_plane_free(&dev->resource_mgr, plane->id);
+            return -EOVERFLOW;
+        }
         size_t blob_len = sizeof(struct drm_format_modifier_blob) +
                           formats_len + modifiers_len;
 
@@ -3840,16 +3956,21 @@ ssize_t drm_ioctl_mode_getpropblob(drm_device_t *dev, void *arg) {
         struct drm_format_modifier *mods =
             (struct drm_format_modifier *)(blob_data +
                                            fmt_blob->modifiers_offset);
-        for (uint32_t chunk = 0; chunk < count_modifiers; chunk++) {
-            uint32_t offset = chunk * 64U;
-            uint32_t remain = count_formats - offset;
-            uint32_t bits = MIN(remain, 64U);
+        for (uint32_t modifier = 0; modifier < modifier_values; modifier++) {
+            uint64_t value =
+                plane->count_modifiers ? plane->modifiers[modifier] : 0;
+            for (uint32_t chunk = 0; chunk < format_chunks; chunk++) {
+                uint32_t index = modifier * format_chunks + chunk;
+                uint32_t offset = chunk * 64U;
+                uint32_t remain = count_formats - offset;
+                uint32_t bits = MIN(remain, 64U);
 
-            mods[chunk].offset = offset;
-            mods[chunk].pad = 0;
-            mods[chunk].modifier = 0;
-            mods[chunk].formats =
-                (bits == 64U) ? UINT64_MAX : ((1ULL << bits) - 1ULL);
+                mods[index].offset = offset;
+                mods[index].pad = 0;
+                mods[index].modifier = value;
+                mods[index].formats =
+                    bits == 64U ? UINT64_MAX : ((1ULL << bits) - 1ULL);
+            }
         }
 
         drm_plane_free(&dev->resource_mgr, plane->id);
@@ -4081,20 +4202,18 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
             return -ENOENT;
         }
 
-        uint32_t prop_count =
-            plane->plane_type == DRM_PLANE_TYPE_CURSOR ? 16 : 14;
+        uint32_t prop_count = 13;
 
         if (props->props_ptr) {
             uint32_t copy_props = MIN(props_cap, prop_count);
-            uint32_t prop_ids[16] = {
-                DRM_PROPERTY_ID_PLANE_TYPE,  DRM_PROPERTY_ID_IN_FORMATS,
-                DRM_PROPERTY_ID_FB_ID,       DRM_PROPERTY_ID_CRTC_ID,
-                DRM_PROPERTY_ID_SRC_X,       DRM_PROPERTY_ID_SRC_Y,
-                DRM_PROPERTY_ID_SRC_W,       DRM_PROPERTY_ID_SRC_H,
-                DRM_PROPERTY_ID_CRTC_X,      DRM_PROPERTY_ID_CRTC_Y,
-                DRM_PROPERTY_ID_CRTC_W,      DRM_PROPERTY_ID_CRTC_H,
-                DRM_PROPERTY_ID_IN_FENCE_FD, DRM_PROPERTY_ID_FB_DAMAGE_CLIPS,
-                DRM_PROPERTY_ID_HOTSPOT_X,   DRM_PROPERTY_ID_HOTSPOT_Y,
+            uint32_t prop_ids[13] = {
+                DRM_PROPERTY_ID_PLANE_TYPE,      DRM_PROPERTY_ID_IN_FORMATS,
+                DRM_PROPERTY_ID_FB_ID,           DRM_PROPERTY_ID_CRTC_ID,
+                DRM_PROPERTY_ID_SRC_X,           DRM_PROPERTY_ID_SRC_Y,
+                DRM_PROPERTY_ID_SRC_W,           DRM_PROPERTY_ID_SRC_H,
+                DRM_PROPERTY_ID_CRTC_X,          DRM_PROPERTY_ID_CRTC_Y,
+                DRM_PROPERTY_ID_CRTC_W,          DRM_PROPERTY_ID_CRTC_H,
+                DRM_PROPERTY_ID_FB_DAMAGE_CLIPS,
             };
             props->count_props = prop_count;
 
@@ -4106,7 +4225,7 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
         }
         if (props->prop_values_ptr) {
             uint32_t copy_props;
-            uint64_t prop_values[16];
+            uint64_t prop_values[13];
 
             props->count_props = prop_count;
             copy_props = MIN(props_cap, prop_count);
@@ -4151,10 +4270,7 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
                 }
             }
 
-            prop_values[12] = (uint64_t)-1;
-            prop_values[13] = 0;
-            prop_values[14] = (uint64_t)(int64_t)plane->hotspot_x;
-            prop_values[15] = (uint64_t)(int64_t)plane->hotspot_y;
+            prop_values[12] = 0;
 
             int ret = drm_copy_to_user_ptr(props->prop_values_ptr, prop_values,
                                            copy_props * sizeof(uint64_t));
@@ -4182,13 +4298,12 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
             return -ENOENT;
         }
 
-        props->count_props = (dev && dev->op && dev->op->driver_ioctl) ? 3 : 2;
+        props->count_props = 2;
 
         if (props->props_ptr) {
             uint32_t copy_props = MIN(props_cap, props->count_props);
-            uint32_t prop_ids[3] = {DRM_CRTC_ACTIVE_PROP_ID,
-                                    DRM_CRTC_MODE_ID_PROP_ID,
-                                    DRM_CRTC_OUT_FENCE_PTR_PROP_ID};
+            uint32_t prop_ids[2] = {DRM_CRTC_ACTIVE_PROP_ID,
+                                    DRM_CRTC_MODE_ID_PROP_ID};
             int ret = drm_copy_to_user_ptr(props->props_ptr, prop_ids,
                                            copy_props * sizeof(uint32_t));
             if (ret) {
@@ -4197,7 +4312,10 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
         }
         if (props->prop_values_ptr) {
             uint32_t copy_props = MIN(props_cap, props->count_props);
-            uint64_t prop_values[3] = {1, drm_crtc_mode_blob_id(crtc->id), 0};
+            uint64_t prop_values[2] = {
+                crtc->active,
+                crtc->mode_valid ? drm_crtc_mode_blob_id(crtc->id) : 0,
+            };
             int ret = drm_copy_to_user_ptr(props->prop_values_ptr, prop_values,
                                            copy_props * sizeof(uint64_t));
             if (ret) {
@@ -4276,7 +4394,7 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
         }
         if (props->prop_values_ptr) {
             uint32_t copy_props = MIN(props_cap, props->count_props);
-            uint64_t prop_values[3] = {DRM_MODE_DPMS_ON, 0, connector->crtc_id};
+            uint64_t prop_values[3] = {connector->dpms, 0, connector->crtc_id};
             prop_values[1] = drm_connector_edid_blob_id(connector->id);
             int ret = drm_copy_to_user_ptr(props->prop_values_ptr, prop_values,
                                            copy_props * sizeof(uint64_t));
@@ -4311,6 +4429,58 @@ ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg) {
     }
 
     return 0;
+}
+
+ssize_t drm_ioctl_mode_obj_setproperty(drm_device_t *dev, void *arg, fd_t *fd) {
+    struct drm_mode_obj_set_property *property =
+        (struct drm_mode_obj_set_property *)arg;
+    if (!dev || !property)
+        return -EINVAL;
+
+    switch (property->obj_type) {
+    case DRM_MODE_OBJECT_CONNECTOR: {
+        drm_connector_t *connector =
+            drm_connector_get(&dev->resource_mgr, property->obj_id);
+        if (!connector)
+            return -ENOENT;
+
+        int ret = 0;
+        if (property->prop_id == DRM_CONNECTOR_DPMS_PROP_ID) {
+            if (property->value > DRM_MODE_DPMS_OFF)
+                ret = -EINVAL;
+        } else if (property->prop_id == DRM_CONNECTOR_CRTC_ID_PROP_ID) {
+            if (property->value > UINT32_MAX) {
+                ret = -EINVAL;
+            } else if (property->value != 0) {
+                drm_crtc_t *crtc =
+                    drm_crtc_get(&dev->resource_mgr, (uint32_t)property->value);
+                if (!crtc)
+                    ret = -ENOENT;
+                else
+                    drm_crtc_free(&dev->resource_mgr, crtc->id);
+            }
+        } else {
+            ret = -EINVAL;
+        }
+
+        if (ret == 0 && dev->op && dev->op->set_property) {
+            ret = dev->op->set_property(dev, property, fd);
+            if (ret == -ENOTSUP || ret == -ENOSYS)
+                ret = 0;
+        }
+        if (ret == 0) {
+            if (property->prop_id == DRM_CONNECTOR_DPMS_PROP_ID)
+                connector->dpms = (uint32_t)property->value;
+            else
+                connector->crtc_id = (uint32_t)property->value;
+        }
+
+        drm_connector_free(&dev->resource_mgr, connector->id);
+        return ret;
+    }
+    default:
+        return -EINVAL;
+    }
 }
 
 /**
@@ -4362,6 +4532,19 @@ ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg, fd_t *fd) {
     if (type & _DRM_VBLANK_SIGNAL)
         return -EINVAL;
 
+    uint32_t crtc_index =
+        (type & _DRM_VBLANK_HIGH_CRTC_MASK) >> _DRM_VBLANK_HIGH_CRTC_SHIFT;
+    if (crtc_index == 0 && (type & _DRM_VBLANK_SECONDARY))
+        crtc_index = 1;
+    if (crtc_index >= DRM_MAX_CRTCS_PER_DEVICE ||
+        !dev->resource_mgr.crtcs[crtc_index])
+        return -EINVAL;
+    uint32_t crtc_id = dev->resource_mgr.crtcs[crtc_index]->id;
+
+    int ret = drm_set_vblank_enabled(dev, true);
+    if (ret < 0)
+        return ret;
+
     spin_lock(&dev->event_lock);
     uint64_t seq = dev->vblank_counter;
     spin_unlock(&dev->event_lock);
@@ -4373,18 +4556,21 @@ ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg, fd_t *fd) {
         target_seq = seq + 1;
 
     if (type & _DRM_VBLANK_EVENT)
-        return drm_defer_event_at(dev, fd, DRM_EVENT_VBLANK, user_data,
+        return drm_defer_event_at(dev, fd, DRM_EVENT_VBLANK, crtc_id, user_data,
                                   target_seq);
 
     while (true) {
         spin_lock(&dev->event_lock);
         seq = dev->vblank_counter;
+        uint64_t timestamp = dev->last_vblank_ns;
         spin_unlock(&dev->event_lock);
 
         if (seq >= target_seq) {
+            if (!timestamp)
+                timestamp = nano_time();
             vbl->reply.sequence = seq;
-            vbl->reply.tval_sec = nano_time() / 1000000000ULL;
-            vbl->reply.tval_usec = (nano_time() % 1000000000ULL) / 1000ULL;
+            vbl->reply.tval_sec = timestamp / 1000000000ULL;
+            vbl->reply.tval_usec = (timestamp % 1000000000ULL) / 1000ULL;
             return 0;
         }
 
@@ -4392,6 +4578,71 @@ ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg, fd_t *fd) {
         arch_wait_for_interrupt();
         arch_disable_interrupt();
     }
+}
+
+ssize_t drm_ioctl_crtc_get_sequence(drm_device_t *dev, void *arg) {
+    struct drm_crtc_get_sequence *request = (struct drm_crtc_get_sequence *)arg;
+    if (!dev || !request)
+        return -EINVAL;
+
+    drm_crtc_t *crtc = drm_crtc_get(&dev->resource_mgr, request->crtc_id);
+    if (!crtc)
+        return -ENOENT;
+
+    request->active = crtc->active;
+    drm_crtc_free(&dev->resource_mgr, crtc->id);
+
+    spin_lock(&dev->event_lock);
+    request->sequence = dev->vblank_counter;
+    uint64_t timestamp = dev->last_vblank_ns;
+    spin_unlock(&dev->event_lock);
+
+    if (!timestamp)
+        timestamp = nano_time();
+
+    request->sequence_ns = (int64_t)timestamp;
+    return 0;
+}
+
+ssize_t drm_ioctl_crtc_queue_sequence(drm_device_t *dev, void *arg, fd_t *fd) {
+    struct drm_crtc_queue_sequence *request =
+        (struct drm_crtc_queue_sequence *)arg;
+    if (!dev || !request)
+        return -EINVAL;
+    if (request->flags &
+        ~(DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS))
+        return -EINVAL;
+
+    drm_crtc_t *crtc = drm_crtc_get(&dev->resource_mgr, request->crtc_id);
+    if (!crtc)
+        return -ENOENT;
+    bool active = crtc->active;
+    drm_crtc_free(&dev->resource_mgr, crtc->id);
+    if (!active)
+        return -EINVAL;
+
+    spin_lock(&dev->event_lock);
+    uint64_t current = dev->vblank_counter;
+    spin_unlock(&dev->event_lock);
+
+    uint64_t target = request->sequence;
+    if (request->flags & DRM_CRTC_SEQUENCE_RELATIVE) {
+        if (target > UINT64_MAX - current)
+            return -EOVERFLOW;
+        target += current;
+    }
+    if (target <= current) {
+        if (request->flags & DRM_CRTC_SEQUENCE_NEXT_ON_MISS)
+            target = current + 1;
+        else
+            target = current;
+    }
+
+    int ret = drm_defer_event_at(dev, fd, DRM_EVENT_CRTC_SEQUENCE,
+                                 request->crtc_id, request->user_data, target);
+    if (ret == 0)
+        request->sequence = target;
+    return ret;
 }
 
 /**
@@ -4499,14 +4750,6 @@ ssize_t drm_ioctl_get_magic(drm_device_t *dev, void *arg) {
     return 0;
 }
 
-/**
- * drm_ioctl_get_client - Handle DRM_IOCTL_GET_CLIENT
- *
- * Linux intentionally exposes only entry zero nowadays. libdrm-amdgpu uses
- * it on primary nodes before AMDGPU_INFO to determine whether the file is
- * authenticated, so returning -EINVAL unconditionally prevents the AMDGPU
- * userspace ABI from being reached at all.
- */
 ssize_t drm_ioctl_get_client(drm_device_t *dev, void *arg, fd_t *fd) {
     struct drm_client *client = (struct drm_client *)arg;
     drm_file_t *file = drm_file_from_vfs_file(fd);
@@ -4885,6 +5128,19 @@ static int drm_ioctl_check_lease(drm_file_t *file, uint32_t cmd, void *arg) {
                    : -ENOENT;
     case DRM_IOCTL_WAIT_VBLANK:
         return file->revoked ? -EACCES : 0;
+    case DRM_IOCTL_CRTC_GET_SEQUENCE:
+        return drm_file_has_object(
+                   file, ((struct drm_crtc_get_sequence *)arg)->crtc_id)
+                   ? 0
+                   : -ENOENT;
+    case DRM_IOCTL_CRTC_QUEUE_SEQUENCE:
+        return file->revoked
+                   ? -EACCES
+                   : (drm_file_has_object(
+                          file,
+                          ((struct drm_crtc_queue_sequence *)arg)->crtc_id)
+                          ? 0
+                          : -ENOENT);
     case DRM_IOCTL_MODE_ATOMIC: {
         struct drm_mode_atomic *atomic = (struct drm_mode_atomic *)arg;
         if (file->revoked) {
@@ -4893,24 +5149,18 @@ static int drm_ioctl_check_lease(drm_file_t *file, uint32_t cmd, void *arg) {
         if (atomic->count_objs > DRM_MAX_LEASE_OBJECTS) {
             return -EINVAL;
         }
-        uint32_t *objects = calloc(atomic->count_objs, sizeof(uint32_t));
-        if (!objects) {
-            return -ENOMEM;
-        }
+        uint32_t objects[DRM_MAX_LEASE_OBJECTS];
         if (atomic->count_objs > 0 &&
             (!atomic->objs_ptr ||
              copy_from_user(objects, (void *)(uintptr_t)atomic->objs_ptr,
                             atomic->count_objs * sizeof(uint32_t)))) {
-            free(objects);
             return -EFAULT;
         }
         for (uint32_t i = 0; i < atomic->count_objs; i++) {
             if (!drm_file_has_object(file, objects[i])) {
-                free(objects);
                 return -ENOENT;
             }
         }
-        free(objects);
         return 0;
     }
     case DRM_IOCTL_MODE_CREATE_LEASE:
@@ -5064,10 +5314,24 @@ ssize_t drm_ioctl(void *data, ssize_t cmd, ssize_t arg, fd_t *fd) {
         ret = drm_ioctl_mode_destroypropblob(dev, ioarg);
         break;
     case DRM_IOCTL_MODE_SETPROPERTY:
-        ret = 0; // Not implemented
+        ret = drm_ioctl_mode_obj_setproperty(
+            dev,
+            &(struct drm_mode_obj_set_property){
+                .value =
+                    ((struct drm_mode_connector_set_property *)ioarg)->value,
+                .prop_id =
+                    ((struct drm_mode_connector_set_property *)ioarg)->prop_id,
+                .obj_id = ((struct drm_mode_connector_set_property *)ioarg)
+                              ->connector_id,
+                .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+            },
+            fd);
         break;
     case DRM_IOCTL_MODE_OBJ_GETPROPERTIES:
         ret = drm_ioctl_mode_obj_getproperties(dev, ioarg);
+        break;
+    case DRM_IOCTL_MODE_OBJ_SETPROPERTY:
+        ret = drm_ioctl_mode_obj_setproperty(dev, ioarg, fd);
         break;
     case DRM_IOCTL_SET_CLIENT_CAP:
         ret = drm_ioctl_set_client_cap(dev, ioarg);
@@ -5143,6 +5407,12 @@ ssize_t drm_ioctl(void *data, ssize_t cmd, ssize_t arg, fd_t *fd) {
         break;
     case DRM_IOCTL_WAIT_VBLANK:
         ret = drm_ioctl_wait_vblank(dev, ioarg, fd);
+        break;
+    case DRM_IOCTL_CRTC_GET_SEQUENCE:
+        ret = drm_ioctl_crtc_get_sequence(dev, ioarg);
+        break;
+    case DRM_IOCTL_CRTC_QUEUE_SEQUENCE:
+        ret = drm_ioctl_crtc_queue_sequence(dev, ioarg, fd);
         break;
     case DRM_IOCTL_GET_UNIQUE:
         ret = drm_ioctl_get_unique(dev, ioarg);

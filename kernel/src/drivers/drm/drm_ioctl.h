@@ -200,6 +200,7 @@ ssize_t drm_ioctl_mode_destroypropblob(drm_device_t *dev, void *arg);
  * @arg: ioctl argument
  */
 ssize_t drm_ioctl_mode_obj_getproperties(drm_device_t *dev, void *arg);
+ssize_t drm_ioctl_mode_obj_setproperty(drm_device_t *dev, void *arg, fd_t *fd);
 
 /**
  * drm_ioctl_set_client_cap - Handle DRM_IOCTL_SET_CLIENT_CAP
@@ -214,6 +215,9 @@ ssize_t drm_ioctl_set_client_cap(drm_device_t *dev, void *arg);
  * @arg: ioctl argument
  */
 ssize_t drm_ioctl_wait_vblank(drm_device_t *dev, void *arg, fd_t *fd);
+
+ssize_t drm_ioctl_crtc_get_sequence(drm_device_t *dev, void *arg);
+ssize_t drm_ioctl_crtc_queue_sequence(drm_device_t *dev, void *arg, fd_t *fd);
 
 /**
  * drm_ioctl_get_unique - Handle DRM_IOCTL_GET_UNIQUE

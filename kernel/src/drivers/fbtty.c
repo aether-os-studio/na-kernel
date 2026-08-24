@@ -1,4 +1,5 @@
 #include <drivers/tty.h>
+#include <drivers/fbcon.h>
 #include <mm/mm.h>
 #include <task/signal.h>
 #include <drivers/fbtty.h>
@@ -7,24 +8,10 @@
 #include <task/task.h>
 #include <libs/termios.h>
 #include <fs/vfs/fcntl.h>
-#define FLANTERM_IN_FLANTERM
-#include <libs/flanterm/flanterm_private.h>
-#include <libs/flanterm/flanterm.h>
-#include <libs/flanterm/flanterm_backends/fb_private.h>
-#include <libs/flanterm/flanterm_backends/fb.h>
-
-static spinlock_t terminal_write_lock = SPIN_INIT;
 
 void terminal_flush(tty_t *session) {
     if (session && session->terminal)
-        flanterm_flush(session->terminal);
-}
-
-static void *terminal_alloc(size_t size) { return malloc(size); }
-
-static void terminal_free(void *ptr, size_t size) {
-    (void)size;
-    free(ptr);
+        fb_console_flush(session->terminal);
 }
 
 extern void send_process_group_signal(int pgid, int sig);
@@ -34,15 +21,15 @@ ssize_t terminal_read(tty_t *device, char *buf, size_t count, fd_t *fd) {
 }
 
 int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
-    struct flanterm_context *ft_ctx = device->terminal;
-    struct flanterm_fb_context *fb_ctx = device->terminal;
     switch (cmd) {
     case TIOCGWINSZ: {
+        fb_console_geometry_t geometry = {0};
+        fb_console_get_geometry(device->terminal, &geometry);
         struct winsize ws = {
-            .ws_xpixel = fb_ctx->width,
-            .ws_ypixel = fb_ctx->height,
-            .ws_col = ft_ctx->cols,
-            .ws_row = ft_ctx->rows,
+            .ws_xpixel = geometry.width,
+            .ws_ypixel = geometry.height,
+            .ws_col = geometry.columns,
+            .ws_row = geometry.rows,
         };
         if (!arg || copy_to_user((void *)arg, &ws, sizeof(ws)))
             return -EFAULT;
@@ -130,14 +117,8 @@ int terminal_ioctl(tty_t *device, uint32_t cmd, uint64_t arg) {
     case KDSETMODE:
         if (arg != KD_TEXT && arg != KD_GRAPHICS)
             return -EINVAL;
-        spin_lock(&terminal_write_lock);
         device->tty_mode = arg;
-        // if (tty_vt_is_active(device) && device->terminal) {
-        //     flanterm_set_output_enabled(device->terminal, arg == KD_TEXT);
-        //     if (arg == KD_TEXT)
-        //         flanterm_full_refresh(device->terminal);
-        // }
-        spin_unlock(&terminal_write_lock);
+        terminal_set_active(device, tty_vt_is_active(device));
         return 0;
     case KDGKBMODE: {
         int kbmode = device->tty_kbmode;
@@ -221,50 +202,30 @@ int terminal_poll(tty_t *device, int events) {
 
 int terminal_rebind_framebuffer(tty_t *tty,
                                 const struct tty_graphics_ *framebuffer) {
-    struct flanterm_fb_context *ctx;
+    fb_console_geometry_t before = {0};
+    fb_console_geometry_t after = {0};
+    int ret;
 
     if (!tty || !tty->terminal || !framebuffer || !framebuffer->address)
         return -EINVAL;
-    if (framebuffer->bpp != 32 || framebuffer->pitch < framebuffer->width * 4 ||
-        framebuffer->red_mask_size < 8 || framebuffer->green_mask_size < 8 ||
-        framebuffer->blue_mask_size < 8)
-        return -ENOTSUP;
 
-    ctx = tty->terminal;
-
-    /* Repoint the existing backend instead of constructing a new flanterm
-     * context.  Its grid, cursor and parser state are the console history we
-     * need to redraw after the display controller changes scanout buffers. */
-    if (ctx->width != framebuffer->width || ctx->height != framebuffer->height)
-        return -ERANGE;
-
-    spin_lock(&terminal_write_lock);
-    ctx->framebuffer = framebuffer->address;
-    ctx->pitch = framebuffer->pitch;
-    ctx->red_mask_size = framebuffer->red_mask_size;
-    ctx->red_mask_shift =
-        framebuffer->red_mask_shift + (framebuffer->red_mask_size - 8);
-    ctx->green_mask_size = framebuffer->green_mask_size;
-    ctx->green_mask_shift =
-        framebuffer->green_mask_shift + (framebuffer->green_mask_size - 8);
-    ctx->blue_mask_size = framebuffer->blue_mask_size;
-    ctx->blue_mask_shift =
-        framebuffer->blue_mask_shift + (framebuffer->blue_mask_size - 8);
-    if (ctx->output_enabled && tty->tty_mode == KD_TEXT)
-        flanterm_full_refresh(tty->terminal);
-    spin_unlock(&terminal_write_lock);
-    return 0;
+    fb_console_get_geometry(tty->terminal, &before);
+    ret = fb_console_bind(tty->terminal, framebuffer);
+    if (ret < 0)
+        return ret;
+    fb_console_get_geometry(tty->terminal, &after);
+    if ((before.columns != after.columns || before.rows != after.rows) &&
+        tty->at_process_group_id > 0)
+        send_process_group_signal(tty->at_process_group_id, SIGWINCH);
+    return EOK;
 }
 
 size_t terminal_write(tty_t *device, const char *buf, size_t count) {
-    spin_lock(&terminal_write_lock);
 #if SERIAL_DEBUG
     serial_printk((char *)buf, count);
 #endif
-    if (device->terminal) {
-        flanterm_write(device->terminal, buf, count);
-    }
-    spin_unlock(&terminal_write_lock);
+    if (device->terminal)
+        fb_console_write(device->terminal, buf, count);
     return count;
 }
 
@@ -272,12 +233,14 @@ void terminal_set_active(tty_t *tty, bool active) {
     if (!tty || !tty->terminal)
         return;
 
-    spin_lock(&terminal_write_lock);
-    flanterm_set_output_enabled(tty->terminal,
-                                active && tty->tty_mode == KD_TEXT);
-    if (active && tty->tty_mode == KD_TEXT)
-        flanterm_full_refresh(tty->terminal);
-    spin_unlock(&terminal_write_lock);
+    bool text = active && tty->tty_mode == KD_TEXT;
+    if (text) {
+        int ret = tty_restore_graphics(tty);
+        if (ret < 0)
+            printk("tty: failed to restore graphics console: %d\n", ret);
+    }
+
+    fb_console_set_active(tty->terminal, text);
 }
 
 uint64_t create_session_terminal(tty_t *session) {
@@ -286,17 +249,9 @@ uint64_t create_session_terminal(tty_t *session) {
     if (session->device->type != TTY_DEVICE_GRAPHI)
         return -EINVAL;
     struct tty_graphics_ *framebuffer = session->device->private_data;
-    struct flanterm_context *fl_context =
-        framebuffer->address
-            ? flanterm_fb_init(
-                  terminal_alloc, terminal_free, (void *)framebuffer->address,
-                  framebuffer->width, framebuffer->height, framebuffer->pitch,
-                  framebuffer->red_mask_size, framebuffer->red_mask_shift,
-                  framebuffer->green_mask_size, framebuffer->green_mask_shift,
-                  framebuffer->blue_mask_size, framebuffer->blue_mask_shift,
-                  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0,
-                  0, FLANTERM_FB_ROTATE_0)
-            : NULL;
+    fb_console_t *console = fb_console_create(framebuffer);
+    if (!console)
+        return -ENOMEM;
     memset(&session->termios, 0, sizeof(termios));
     session->termios.c_iflag = BRKINT | ICRNL | INPCK | ISTRIP | IXON;
     session->termios.c_oflag = OPOST;
@@ -324,7 +279,7 @@ uint64_t create_session_terminal(tty_t *session) {
 
     session->tty_mode = KD_TEXT;
     session->tty_kbmode = K_XLATE;
-    session->terminal = fl_context;
+    session->terminal = console;
     session->ops.flush = terminal_flush;
     session->ops.ioctl = terminal_ioctl;
     session->ops.poll = terminal_poll;

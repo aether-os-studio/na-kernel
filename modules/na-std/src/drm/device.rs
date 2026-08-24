@@ -1,7 +1,8 @@
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::{ffi::CStr, pin::Pin, ptr::NonNull};
 
 use crate::memory::PhysicalAddress;
+use crate::sync::SpinLock;
 use crate::{Error, Result, bindings, pci};
 
 use super::{
@@ -9,7 +10,7 @@ use super::{
     modeset::{
         AtomicCommit, CrtcUpdate, CursorUpdate, DisplayInfo, DumbBuffer, DumbBufferMapping,
         DumbBufferRequest, FramebufferFormat, FramebufferInfo, FramebufferRequest,
-        FramebufferUpdate, PageFlip, PlaneUpdate,
+        FramebufferUpdate, PageFlip, PlaneUpdate, PropertyUpdate,
     },
     resources::{ConnectorList, CrtcList, EncoderList, PlaneList},
 };
@@ -175,6 +176,10 @@ pub trait Driver: Sync + 'static {
         Err(Error::Unsupported)
     }
 
+    fn set_property(&self, _update: PropertyUpdate) -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
     fn set_crtc(&self, _update: CrtcUpdate<'_>) -> Result<()> {
         Err(Error::Unsupported)
     }
@@ -188,6 +193,14 @@ pub trait Driver: Sync + 'static {
     }
 
     fn atomic_commit(&self, _commit: AtomicCommit<'_>) -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    fn set_vblank_enabled(&self, _enabled: bool) -> Result<()> {
+        Err(Error::Unsupported)
+    }
+
+    fn restore_console(&self) -> Result<()> {
         Err(Error::Unsupported)
     }
 }
@@ -213,6 +226,7 @@ unsafe impl Send for Device {}
 
 pub struct OwnedDevice<D: Driver + Send> {
     raw: NonNull<bindings::DrmDevice>,
+    vblank: Option<VblankConnection>,
     _driver: Pin<Box<D>>,
 }
 
@@ -221,15 +235,130 @@ impl<D: Driver + Send> OwnedDevice<D> {
         let status = unsafe { bindings::na_drm_device_notify_hotplug(self.raw.as_ptr()) };
         Error::from_status(status)
     }
+
+    pub fn bind_console(&self, framebuffer: crate::boot::Framebuffer) -> Result<()> {
+        let raw = framebuffer.as_raw();
+        let status = unsafe { bindings::na_drm_device_bind_console(self.raw.as_ptr(), &raw) };
+        Error::from_status(status)
+    }
+
+    pub fn attach_hardware_vblank(&mut self, source: VblankSource, period_ns: u64) -> Result<()> {
+        if self.vblank.is_some() {
+            return Err(Error::AlreadyExists);
+        }
+        self.vblank = Some(source.attach(self.raw, period_ns)?);
+        Ok(())
+    }
 }
 
 impl<D: Driver + Send> Drop for OwnedDevice<D> {
     fn drop(&mut self) {
+        self.vblank.take();
         unsafe { bindings::na_drm_device_unregister(self.raw.as_ptr()) };
     }
 }
 
 unsafe impl<D: Driver + Send> Send for OwnedDevice<D> {}
+
+/// IRQ-safe bridge from a display engine to one registered DRM device.
+/// The connection owns the device binding and disconnects before DRM
+/// unregistration, while cloned sources can remain in hardware handlers.
+#[derive(Clone)]
+pub struct VblankSource {
+    device: Arc<SpinLock<usize>>,
+}
+
+impl VblankSource {
+    pub fn new() -> Self {
+        Self {
+            device: Arc::new(SpinLock::new(0)),
+        }
+    }
+
+    pub fn signal(&self, crtc_index: u32) {
+        let binding = self.device.lock();
+        let device = *binding;
+        if device != 0 {
+            unsafe {
+                bindings::na_drm_device_handle_vblank(
+                    device as *mut bindings::DrmDevice,
+                    crtc_index,
+                )
+            };
+        }
+    }
+
+    pub fn set_period(&self, period_ns: u64) -> Result<()> {
+        if period_ns == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let binding = self.device.lock();
+        let device = *binding;
+        if device == 0 {
+            return Err(Error::NoDevice);
+        }
+        let status = unsafe {
+            bindings::na_drm_device_set_hardware_vblank(
+                device as *mut bindings::DrmDevice,
+                true,
+                period_ns,
+            )
+        };
+        Error::from_status(status)
+    }
+
+    fn attach(
+        &self,
+        device: NonNull<bindings::DrmDevice>,
+        period_ns: u64,
+    ) -> Result<VblankConnection> {
+        if period_ns == 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let mut binding = self.device.lock();
+        if *binding != 0 {
+            return Err(Error::AlreadyExists);
+        }
+        let status = unsafe {
+            bindings::na_drm_device_set_hardware_vblank(device.as_ptr(), true, period_ns)
+        };
+        Error::from_status(status)?;
+        *binding = device.as_ptr() as usize;
+        Ok(VblankConnection {
+            source: self.clone(),
+        })
+    }
+
+    fn detach(&self) {
+        let mut binding = self.device.lock();
+        let device = core::mem::replace(&mut *binding, 0);
+        if device != 0 {
+            unsafe {
+                bindings::na_drm_device_set_hardware_vblank(
+                    device as *mut bindings::DrmDevice,
+                    false,
+                    0,
+                )
+            };
+        }
+    }
+}
+
+impl Default for VblankSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct VblankConnection {
+    source: VblankSource,
+}
+
+impl Drop for VblankConnection {
+    fn drop(&mut self) {
+        self.source.detach();
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct DriverInfo {
@@ -318,10 +447,13 @@ impl RegistrationConfig {
             get_framebuffer_handle: Some(Callbacks::<D>::get_framebuffer_handle),
             dirty_framebuffer: Some(Callbacks::<D>::dirty_framebuffer),
             set_plane: Some(Callbacks::<D>::set_plane),
+            set_property: Some(Callbacks::<D>::set_property),
             set_crtc: Some(Callbacks::<D>::set_crtc),
             page_flip: Some(Callbacks::<D>::page_flip),
             set_cursor: Some(Callbacks::<D>::set_cursor),
             atomic_commit: Some(Callbacks::<D>::atomic_commit),
+            set_vblank_enabled: Some(Callbacks::<D>::set_vblank_enabled),
+            restore_console: Some(Callbacks::<D>::restore_console),
             mmap: Some(Callbacks::<D>::mmap),
             prime_export: Some(Callbacks::<D>::prime_export),
             prime_import: Some(Callbacks::<D>::prime_import),
@@ -404,6 +536,7 @@ impl<D: Driver + Send> OwnedDeviceBuilder<D> {
             .register(self.driver.as_ref().get_ref(), pci_device)?;
         Ok(OwnedDevice {
             raw,
+            vblank: None,
             _driver: self.driver,
         })
     }

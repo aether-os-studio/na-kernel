@@ -685,6 +685,7 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
     bool test_only = (atomic->flags & DRM_MODE_ATOMIC_TEST_ONLY) != 0;
     uint64_t prop_idx = 0;
     uint32_t committed_fb_id = 0;
+    uint32_t event_crtc_id = 0;
     bool has_committed_fb = false;
     uint32_t stale_fb_ids[DRM_MAX_PLANES_PER_DEVICE] = {0};
     uint32_t stale_fb_count = 0;
@@ -946,6 +947,13 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
             }
         }
 
+        if (plane && plane->crtc_id != 0)
+            event_crtc_id = plane->crtc_id;
+        else if (crtc)
+            event_crtc_id = crtc->id;
+        else if (connector && connector->crtc_id != 0)
+            event_crtc_id = connector->crtc_id;
+
         if (connector) {
             drm_connector_free(&gpu_dev->resource_mgr, connector->id);
         }
@@ -983,8 +991,10 @@ int plainfb_atomic_commit(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
     drm_framebuffer_free(&drm_dev->resource_mgr, scanout_fb->id);
 
     if (atomic->flags & DRM_MODE_PAGE_FLIP_EVENT) {
+        if (event_crtc_id == 0)
+            return -EINVAL;
         ret = drm_defer_event(drm_dev, fd, DRM_EVENT_FLIP_COMPLETE,
-                              atomic->user_data);
+                              event_crtc_id, atomic->user_data);
         if (ret < 0) {
             return ret;
         }
@@ -1099,7 +1109,7 @@ static int plainfb_page_flip(drm_device_t *drm_dev,
 
     if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT) {
         ret = drm_defer_event(drm_dev, fd, DRM_EVENT_FLIP_COMPLETE,
-                              flip->user_data);
+                              flip->crtc_id, flip->user_data);
         if (ret < 0) {
             return ret;
         }
@@ -1304,6 +1314,7 @@ void drm_plainfb_init() {
         gpu_device->connectors[i]->count_modes > 0) {
         gpu_device->crtcs[i]->mode = gpu_device->connectors[i]->modes[0];
         gpu_device->crtcs[i]->mode_valid = 1;
+        gpu_device->crtcs[i]->active = true;
     }
 
     // Create encoder

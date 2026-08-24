@@ -19,6 +19,24 @@ pub struct Framebuffer {
     pub blue_mask_shift: u8,
 }
 
+impl Framebuffer {
+    pub(crate) const fn as_raw(self) -> bindings::na_boot_framebuffer_t {
+        bindings::na_boot_framebuffer_t {
+            physical_address: self.physical_address,
+            width: self.width,
+            height: self.height,
+            bpp: self.bpp,
+            pitch: self.pitch,
+            red_mask_size: self.red_mask_size,
+            red_mask_shift: self.red_mask_shift,
+            green_mask_size: self.green_mask_size,
+            green_mask_shift: self.green_mask_shift,
+            blue_mask_size: self.blue_mask_size,
+            blue_mask_shift: self.blue_mask_shift,
+        }
+    }
+}
+
 /// Returns the boot framebuffer, or `Error::NotFound` when the platform did
 /// not provide one.
 pub fn framebuffer() -> Result<Framebuffer> {
@@ -55,19 +73,7 @@ pub fn framebuffer() -> Result<Framebuffer> {
 /// Rebinds the graphical TTYs to a driver-owned scanout framebuffer while
 /// retaining their flanterm grids and cursor state.
 pub fn rebind_framebuffer(framebuffer: Framebuffer) -> Result<()> {
-    let raw = bindings::na_boot_framebuffer_t {
-        physical_address: framebuffer.physical_address,
-        width: framebuffer.width,
-        height: framebuffer.height,
-        bpp: framebuffer.bpp,
-        pitch: framebuffer.pitch,
-        red_mask_size: framebuffer.red_mask_size,
-        red_mask_shift: framebuffer.red_mask_shift,
-        green_mask_size: framebuffer.green_mask_size,
-        green_mask_shift: framebuffer.green_mask_shift,
-        blue_mask_size: framebuffer.blue_mask_size,
-        blue_mask_shift: framebuffer.blue_mask_shift,
-    };
+    let raw = framebuffer.as_raw();
     let status = unsafe { bindings::na_tty_rebind_framebuffer(&raw) };
     Error::from_status(status as i32)
 }

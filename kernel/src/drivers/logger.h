@@ -3,10 +3,6 @@
 #include <libs/klibc.h>
 #include <stdarg.h>
 #include <fs/vfs/vfs.h>
-#include <libs/flanterm/flanterm_backends/fb.h>
-#include <libs/flanterm/flanterm.h>
-
-extern struct flanterm_context *ft_ctx;
 
 int printk(const char *fmt, ...);
 int vsnprintf(char *buf, size_t size, const char *fmt, va_list args);

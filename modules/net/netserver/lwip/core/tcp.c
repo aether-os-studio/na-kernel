@@ -912,7 +912,7 @@ u32_t tcp_update_rcv_ann_wnd(struct tcp_pcb *pcb) {
     new_right_edge = pcb->rcv_nxt + pcb->rcv_wnd;
 
     if (TCP_SEQ_GEQ(new_right_edge, pcb->rcv_ann_right_edge +
-                                        LWIP_MIN((TCP_WND / 2), pcb->mss))) {
+                                        LWIP_MIN((TCP_WND / 2), (u32_t)pcb->mss))) {
         /* we can advertise more window */
         pcb->rcv_ann_wnd = pcb->rcv_wnd;
         return new_right_edge - pcb->rcv_ann_right_edge;

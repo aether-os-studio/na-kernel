@@ -8,10 +8,7 @@
 #include <task/task.h>
 #include <fs/vfs/fcntl.h>
 
-void terminal_flush_serial(tty_t *session) {
-    // flanterm_flush(session->terminal);
-    return;
-}
+void terminal_flush_serial(tty_t *session) { return; }
 
 extern void send_process_group_signal(int pgid, int sig);
 

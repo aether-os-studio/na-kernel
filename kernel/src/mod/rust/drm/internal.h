@@ -39,6 +39,8 @@ int na_drm_dirty_framebuffer(drm_device_t *device,
                              struct drm_mode_fb_dirty_cmd *command, fd_t *fd);
 int na_drm_set_plane(drm_device_t *device, struct drm_mode_set_plane *command,
                      fd_t *fd);
+int na_drm_set_property(drm_device_t *device,
+                        struct drm_mode_obj_set_property *command, fd_t *fd);
 int na_drm_set_crtc(drm_device_t *device, struct drm_mode_crtc *command,
                     fd_t *fd);
 int na_drm_page_flip(drm_device_t *device,

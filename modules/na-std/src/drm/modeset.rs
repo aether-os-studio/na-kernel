@@ -1,10 +1,10 @@
 use core::slice;
 
-use crate::{bindings, memory::PhysicalAddress};
+use crate::{Error, Result, bindings, memory::PhysicalAddress};
 
 use super::device::FileId;
 
-use super::resources::Mode;
+use super::resources::{Mode, PlaneType};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisplayInfo {
@@ -134,6 +134,7 @@ impl FramebufferUpdate<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaneUpdate {
     pub plane_id: u32,
+    pub plane_type: PlaneType,
     pub crtc_id: u32,
     pub framebuffer_id: u32,
     pub framebuffer_handle: u32,
@@ -152,6 +153,11 @@ impl From<&bindings::DrmPlaneUpdate> for PlaneUpdate {
     fn from(raw: &bindings::DrmPlaneUpdate) -> Self {
         Self {
             plane_id: raw.plane_id,
+            plane_type: match raw.plane_type {
+                1 => PlaneType::Primary,
+                2 => PlaneType::Cursor,
+                _ => PlaneType::Overlay,
+            },
             crtc_id: raw.crtc_id,
             framebuffer_id: raw.framebuffer_id,
             framebuffer_handle: raw.framebuffer_handle,
@@ -251,9 +257,50 @@ impl From<&bindings::DrmCursorUpdate> for CursorUpdate {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PropertyObject {
+    Crtc,
+    Connector,
+    Plane,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PropertyUpdate {
+    pub object_id: u32,
+    pub object: PropertyObject,
+    pub property_id: u32,
+    pub value: u64,
+}
+
+impl TryFrom<&bindings::DrmPropertyUpdate> for PropertyUpdate {
+    type Error = Error;
+
+    fn try_from(raw: &bindings::DrmPropertyUpdate) -> Result<Self> {
+        let object = match raw.object_type {
+            0xcccc_cccc => PropertyObject::Crtc,
+            0xc0c0_c0c0 => PropertyObject::Connector,
+            0xeeee_eeee => PropertyObject::Plane,
+            _ => return Err(Error::InvalidArgument),
+        };
+        Ok(Self {
+            object_id: raw.object_id,
+            object,
+            property_id: raw.property_id,
+            value: raw.value,
+        })
+    }
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Default)]
 pub struct AtomicProperty(bindings::DrmAtomicProperty);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomicObject {
+    Plane(PlaneType),
+    Crtc,
+    Connector,
+}
 
 impl AtomicProperty {
     pub const fn object_id(&self) -> u32 {
@@ -262,6 +309,20 @@ impl AtomicProperty {
 
     pub const fn property_id(&self) -> u32 {
         self.0.property_id
+    }
+
+    pub fn object(&self) -> Result<AtomicObject> {
+        match self.0.object_type {
+            0xeeee_eeee => match self.0.plane_type {
+                0 => Ok(AtomicObject::Plane(PlaneType::Overlay)),
+                1 => Ok(AtomicObject::Plane(PlaneType::Primary)),
+                2 => Ok(AtomicObject::Plane(PlaneType::Cursor)),
+                _ => Err(Error::InvalidArgument),
+            },
+            0xcccc_cccc => Ok(AtomicObject::Crtc),
+            0xc0c0_c0c0 => Ok(AtomicObject::Connector),
+            _ => Err(Error::InvalidArgument),
+        }
     }
 
     pub const fn value(&self) -> u64 {
@@ -274,6 +335,10 @@ impl AtomicProperty {
         } else {
             Some(self.0.framebuffer_handle)
         }
+    }
+
+    pub fn mode(&self) -> Option<Mode> {
+        unsafe { self.0.mode_info.as_ref() }.map(Mode::from_raw)
     }
 }
 

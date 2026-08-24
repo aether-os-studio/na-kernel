@@ -286,6 +286,7 @@ impl Driver for GpuDevice {
             mm_height: 0,
             subpixel: 0,
             modes: &modes,
+            edid: None,
         })?;
         Ok(())
     }
@@ -319,6 +320,7 @@ impl Driver for GpuDevice {
             gamma_size: 0,
             plane_type: PlaneType::Primary,
             formats: &FORMATS,
+            modifiers: &[0],
         })
     }
 

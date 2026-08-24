@@ -60,6 +60,7 @@ drm_connector_t *na_drm_connector_create(const na_drm_connector_info_t *info) {
 
     connector->type = info->connector_type;
     connector->connection = info->connection;
+    connector->dpms = DRM_MODE_DPMS_ON;
     connector->encoder_id =
         na_drm_resource_token(info->encoder_index, DRM_MAX_ENCODERS_PER_DEVICE);
     connector->crtc_id =
@@ -90,10 +91,25 @@ int na_drm_connector_add_mode(drm_connector_t *connector,
     return 0;
 }
 
+int na_drm_connector_set_edid(drm_connector_t *connector, const uint8_t *edid,
+                              uint32_t length) {
+    if (!connector || !edid || length == 0)
+        return -EINVAL;
+    uint8_t *copy = malloc(length);
+    if (!copy)
+        return -ENOMEM;
+    memcpy(copy, edid, length);
+    free(connector->edid);
+    connector->edid = copy;
+    connector->edid_length = length;
+    return 0;
+}
+
 void na_drm_connector_destroy(drm_connector_t *connector) {
     if (!connector)
         return;
     free(connector->modes);
+    free(connector->edid);
     free(connector);
 }
 
@@ -110,6 +126,7 @@ drm_crtc_t *na_drm_crtc_create(const na_drm_crtc_info_t *info) {
     crtc->w = info->width;
     crtc->h = info->height;
     crtc->gamma_size = info->gamma_size;
+    crtc->active = info->mode_valid;
     crtc->mode_valid = info->mode_valid;
     if (info->mode_valid)
         na_drm_mode_copy(&crtc->mode, &info->mode_info);
@@ -176,10 +193,27 @@ int na_drm_plane_add_format(drm_plane_t *plane, uint32_t format) {
     return 0;
 }
 
+int na_drm_plane_add_modifier(drm_plane_t *plane, uint64_t modifier) {
+    if (!plane || plane->count_modifiers == UINT32_MAX)
+        return -EINVAL;
+
+    size_t count = (size_t)plane->count_modifiers + 1;
+    if (count > SIZE_MAX / sizeof(*plane->modifiers))
+        return -EINVAL;
+    uint64_t *modifiers = realloc(plane->modifiers, count * sizeof(*modifiers));
+    if (!modifiers)
+        return -ENOMEM;
+
+    plane->modifiers = modifiers;
+    modifiers[plane->count_modifiers++] = modifier;
+    return 0;
+}
+
 void na_drm_plane_destroy(drm_plane_t *plane) {
     if (!plane)
         return;
     free(plane->format_types);
+    free(plane->modifiers);
     free(plane);
 }
 

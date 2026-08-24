@@ -36,6 +36,10 @@ void drm_resource_manager_cleanup(drm_resource_manager_t *mgr) {
     // Free all connectors
     for (uint32_t i = 0; i < DRM_MAX_CONNECTORS_PER_DEVICE; i++) {
         if (mgr->connectors[i]) {
+            free(mgr->connectors[i]->modes);
+            free(mgr->connectors[i]->edid);
+            free(mgr->connectors[i]->prop_ids);
+            free(mgr->connectors[i]->prop_values);
             free(mgr->connectors[i]);
             mgr->connectors[i] = NULL;
         }
@@ -98,6 +102,7 @@ drm_connector_t *drm_connector_alloc(drm_resource_manager_t *mgr, uint32_t type,
     connector->id = mgr->next_object_id++;
     connector->type = type;
     connector->connection = DRM_MODE_CONNECTED;
+    connector->dpms = DRM_MODE_DPMS_ON;
     connector->driver_data = driver_data;
     connector->refcount = 1;
 
@@ -113,6 +118,10 @@ void drm_connector_free(drm_resource_manager_t *mgr, uint32_t id) {
     for (uint32_t i = 0; i < DRM_MAX_CONNECTORS_PER_DEVICE; i++) {
         if (mgr->connectors[i] && mgr->connectors[i]->id == id) {
             if (--mgr->connectors[i]->refcount == 0) {
+                free(mgr->connectors[i]->modes);
+                free(mgr->connectors[i]->edid);
+                free(mgr->connectors[i]->prop_ids);
+                free(mgr->connectors[i]->prop_values);
                 free(mgr->connectors[i]);
                 mgr->connectors[i] = NULL;
             }

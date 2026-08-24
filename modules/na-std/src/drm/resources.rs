@@ -99,7 +99,16 @@ impl Mode {
     }
 
     pub fn with_name(mut self, name: &CStr) -> Result<Self> {
-        let bytes = name.to_bytes();
+        self.set_name(name.to_bytes())?;
+        Ok(self)
+    }
+
+    pub fn with_name_bytes(mut self, bytes: &[u8]) -> Result<Self> {
+        self.set_name(bytes)?;
+        Ok(self)
+    }
+
+    fn set_name(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.len() >= self.name.len() {
             return Err(Error::InvalidArgument);
         }
@@ -107,7 +116,7 @@ impl Mode {
         for (destination, source) in self.name.iter_mut().zip(bytes) {
             *destination = *source as core::ffi::c_char;
         }
-        Ok(self)
+        Ok(())
     }
 
     pub fn name(&self) -> Option<&CStr> {
@@ -167,6 +176,7 @@ pub struct Connector<'a> {
     pub mm_height: u32,
     pub subpixel: u32,
     pub modes: &'a [Mode],
+    pub edid: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Copy)]
@@ -194,6 +204,7 @@ pub struct Plane<'a> {
     pub gamma_size: u32,
     pub plane_type: PlaneType,
     pub formats: &'a [u32],
+    pub modifiers: &'a [u64],
 }
 
 trait RawResource {
@@ -302,6 +313,15 @@ impl ConnectorList<'_> {
                 return Err(error);
             }
         }
+        if let Some(edid) = connector.edid {
+            let length = u32::try_from(edid.len()).map_err(|_| Error::InvalidArgument)?;
+            let status =
+                unsafe { bindings::na_drm_connector_set_edid(raw.as_ptr(), edid.as_ptr(), length) };
+            if let Err(error) = Error::from_status(status) {
+                unsafe { bindings::na_drm_connector_destroy(raw.as_ptr()) };
+                return Err(error);
+            }
+        }
         self.0.push(raw)
     }
 
@@ -392,6 +412,13 @@ impl PlaneList<'_> {
                 .ok_or(Error::OutOfMemory)?;
         for format in plane.formats {
             let status = unsafe { bindings::na_drm_plane_add_format(raw.as_ptr(), *format) };
+            if let Err(error) = Error::from_status(status) {
+                unsafe { bindings::na_drm_plane_destroy(raw.as_ptr()) };
+                return Err(error);
+            }
+        }
+        for modifier in plane.modifiers {
+            let status = unsafe { bindings::na_drm_plane_add_modifier(raw.as_ptr(), *modifier) };
             if let Err(error) = Error::from_status(status) {
                 unsafe { bindings::na_drm_plane_destroy(raw.as_ptr()) };
                 return Err(error);

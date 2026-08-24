@@ -720,6 +720,7 @@ tty_device_t *get_tty_device(const char *name) {
 int tty_rebind_framebuffer(const struct tty_graphics_ *framebuffer) {
     tty_device_t *device;
     struct tty_graphics_ *graphics;
+    tty_t *active;
 
     if (!framebuffer || !framebuffer->address || framebuffer->bpp != 32 ||
         framebuffer->red_mask_size < 8 || framebuffer->green_mask_size < 8 ||
@@ -732,13 +733,6 @@ int tty_rebind_framebuffer(const struct tty_graphics_ *framebuffer) {
         return -ENODEV;
 
     graphics = device->private_data;
-    /* Existing flanterm grids are dimensioned at boot.  ASTRA currently
-     * preserves the firmware's 1920x1080 mode, so a pointer/pitch rebind is
-     * lossless and retains the complete text console state. */
-    if (graphics->width != framebuffer->width ||
-        graphics->height != framebuffer->height)
-        return -ERANGE;
-
     for (unsigned int i = 1; i < 64; i++) {
         tty_t *tty = tty_vts[i];
         if (!tty || tty->device != device || !tty->terminal)
@@ -749,7 +743,51 @@ int tty_rebind_framebuffer(const struct tty_graphics_ *framebuffer) {
     }
 
     *graphics = *framebuffer;
+    active = tty_vt_active();
+    for (unsigned int i = 1; i < 64; i++) {
+        tty_t *tty = tty_vts[i];
+        if (tty && tty->device == device && tty->terminal)
+            terminal_set_active(tty, tty == active);
+    }
     return 0;
+}
+
+int tty_bind_graphics_backend(const tty_graphics_backend_t *backend) {
+    tty_device_t *device = get_tty_device("tty0");
+
+    if (!backend || !backend->context || !backend->restore)
+        return -EINVAL;
+    if (!device || device->type != TTY_DEVICE_GRAPHI)
+        return -ENODEV;
+
+    spin_lock(&tty_vt_lock);
+    device->graphics_backend = *backend;
+    spin_unlock(&tty_vt_lock);
+    return 0;
+}
+
+void tty_unbind_graphics_backend(void *context) {
+    tty_device_t *device = get_tty_device("tty0");
+
+    if (!device || device->type != TTY_DEVICE_GRAPHI)
+        return;
+
+    spin_lock(&tty_vt_lock);
+    if (device->graphics_backend.context == context)
+        memset(&device->graphics_backend, 0, sizeof(device->graphics_backend));
+    spin_unlock(&tty_vt_lock);
+}
+
+int tty_restore_graphics(tty_t *tty) {
+    tty_graphics_backend_t backend;
+
+    if (!tty || !tty->device || tty->device->type != TTY_DEVICE_GRAPHI)
+        return 0;
+
+    spin_lock(&tty_vt_lock);
+    backend = tty->device->graphics_backend;
+    spin_unlock(&tty_vt_lock);
+    return backend.restore ? backend.restore(backend.context) : 0;
 }
 
 char *default_console = NULL;

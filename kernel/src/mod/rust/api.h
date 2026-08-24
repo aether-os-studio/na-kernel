@@ -102,7 +102,6 @@ void na_mutex_lock(na_mutex_t *mutex);
 void na_mutex_unlock(na_mutex_t *mutex);
 int na_acpi_table_find(const char signature[4], UacpiTable *table);
 void na_acpi_table_release(UacpiTable *table);
-int na_acpi_atrm_read(uint8_t *buf, size_t buf_size, size_t *out_len);
 
 typedef struct na_boot_framebuffer {
     uint64_t physical_address;
@@ -405,6 +404,7 @@ typedef na_drm_clip_t DrmClip;
 
 typedef struct na_drm_plane_update {
     uint32_t plane_id;
+    uint32_t plane_type;
     uint32_t crtc_id;
     uint32_t framebuffer_id;
     uint32_t framebuffer_handle;
@@ -453,11 +453,22 @@ typedef struct na_drm_cursor_update {
 } na_drm_cursor_update_t;
 typedef na_drm_cursor_update_t DrmCursorUpdate;
 
-typedef struct na_drm_atomic_property {
+typedef struct na_drm_property_update {
     uint32_t object_id;
+    uint32_t object_type;
     uint32_t property_id;
     uint64_t value;
+} na_drm_property_update_t;
+typedef na_drm_property_update_t DrmPropertyUpdate;
+
+typedef struct na_drm_atomic_property {
+    uint32_t object_id;
+    uint32_t object_type;
+    uint32_t property_id;
+    uint32_t plane_type;
+    uint64_t value;
     uint32_t framebuffer_handle;
+    const na_drm_mode_info_t *mode_info;
 } na_drm_atomic_property_t;
 typedef na_drm_atomic_property_t DrmAtomicProperty;
 
@@ -510,6 +521,7 @@ typedef struct na_drm_driver_ops {
                              uint32_t color, const na_drm_clip_t *clips,
                              uint32_t clip_count);
     int (*set_plane)(void *context, const na_drm_plane_update_t *update);
+    int (*set_property)(void *context, const na_drm_property_update_t *update);
     int (*set_crtc)(void *context, const na_drm_crtc_update_t *update,
                     const uint32_t *connector_ids, uint32_t connector_count);
     int (*page_flip)(void *context, const na_drm_page_flip_t *flip);
@@ -517,6 +529,8 @@ typedef struct na_drm_driver_ops {
     int (*atomic_commit)(void *context, uint32_t flags, uint64_t user_data,
                          const na_drm_atomic_property_t *properties,
                          size_t property_count);
+    int (*set_vblank_enabled)(void *context, bool enabled);
+    int (*restore_console)(void *context);
     int (*mmap)(void *context, uint64_t file_id, uint64_t offset,
                 uint64_t length, uint64_t *physical_address);
     int (*prime_export)(void *context, uint64_t file_id, uint32_t handle,
@@ -537,9 +551,16 @@ drm_device_t *na_drm_device_register(const na_drm_driver_ops_t *ops,
                                      const na_drm_driver_info_t *driver_info);
 void na_drm_device_unregister(drm_device_t *device);
 int na_drm_device_notify_hotplug(drm_device_t *device);
+int na_drm_device_bind_console(drm_device_t *device,
+                               const na_boot_framebuffer_t *framebuffer);
+int na_drm_device_set_hardware_vblank(drm_device_t *device, bool enabled,
+                                      uint64_t period_ns);
+void na_drm_device_handle_vblank(drm_device_t *device, uint32_t crtc_index);
 drm_connector_t *na_drm_connector_create(const na_drm_connector_info_t *info);
 int na_drm_connector_add_mode(drm_connector_t *connector,
                               const na_drm_mode_info_t *mode);
+int na_drm_connector_set_edid(drm_connector_t *connector, const uint8_t *edid,
+                              uint32_t length);
 void na_drm_connector_destroy(drm_connector_t *connector);
 drm_crtc_t *na_drm_crtc_create(const na_drm_crtc_info_t *info);
 void na_drm_crtc_destroy(drm_crtc_t *crtc);
@@ -548,6 +569,7 @@ void na_drm_encoder_destroy(drm_encoder_t *encoder);
 drm_plane_t *na_drm_plane_create(drm_device_t *device,
                                  const na_drm_plane_info_t *info);
 int na_drm_plane_add_format(drm_plane_t *plane, uint32_t format);
+int na_drm_plane_add_modifier(drm_plane_t *plane, uint64_t modifier);
 void na_drm_plane_destroy(drm_plane_t *plane);
 int na_drm_syncobj_wait(uint64_t file_id, uint32_t handle, uint64_t point,
                         int64_t timeout_ns);

@@ -1157,6 +1157,7 @@ struct drm_file;
 
 struct k_drm_event {
     uint32_t type;
+    uint32_t crtc_id;
     uint64_t user_data;
     struct timespec timestamp;
     uint64_t sequence;
@@ -1260,6 +1261,8 @@ typedef struct drm_device_op {
                          uint32_t *handle);
     int (*set_plane)(drm_device_t *drm_dev, struct drm_mode_set_plane *plane,
                      fd_t *fd);
+    int (*set_property)(drm_device_t *drm_dev,
+                        struct drm_mode_obj_set_property *property, fd_t *fd);
     int (*atomic_commit)(drm_device_t *drm_dev, struct drm_mode_atomic *atomic,
                          fd_t *fd);
     int (*map_dumb)(drm_device_t *drm_dev, struct drm_mode_map_dumb *args,
@@ -1270,6 +1273,7 @@ typedef struct drm_device_op {
                      struct drm_mode_crtc_page_flip *flip, fd_t *fd);
     int (*set_cursor)(drm_device_t *drm_dev, struct drm_mode_cursor *cursor,
                       fd_t *fd);
+    int (*set_vblank_enabled)(drm_device_t *drm_dev, bool enabled);
     int (*gamma_set)(drm_device_t *drm_dev, struct drm_mode_crtc_lut *gamma);
     int (*get_connectors)(drm_device_t *drm_dev, drm_connector_t **connectors,
                           uint32_t *count);
@@ -1319,7 +1323,10 @@ struct drm_device {
     uint32_t pending_event_count;
     uint64_t vblank_counter;
     uint64_t vblank_period_ns;
+    uint64_t last_vblank_ns;
     uint64_t next_vblank_ns;
+    bool hardware_vblank;
+    bool hardware_vblank_enabled;
     bool hotplug_pending;
     drm_resource_manager_t resource_mgr;
     spinlock_t lease_lock;
@@ -1404,12 +1411,17 @@ ssize_t drm_open(void *data, void *arg);
 ssize_t drm_close(void *data, void *arg);
 
 /* Event handling */
-int drm_post_event(drm_device_t *dev, fd_t *fd, uint32_t type,
+int drm_post_event(drm_device_t *dev, fd_t *fd, uint32_t type, uint32_t crtc_id,
                    uint64_t user_data);
 int drm_defer_event(drm_device_t *dev, fd_t *fd, uint32_t type,
-                    uint64_t user_data);
+                    uint32_t crtc_id, uint64_t user_data);
 int drm_defer_event_at(drm_device_t *dev, fd_t *fd, uint32_t type,
-                       uint64_t user_data, uint64_t target_sequence);
+                       uint32_t crtc_id, uint64_t user_data,
+                       uint64_t target_sequence);
 void drm_cancel_file_events(drm_file_t *file);
 int drm_notify_hotplug(drm_device_t *dev);
+int drm_set_hardware_vblank(drm_device_t *dev, bool enabled,
+                            uint64_t period_ns);
+int drm_set_vblank_enabled(drm_device_t *dev, bool enabled);
+void drm_handle_vblank(drm_device_t *dev, uint32_t crtc_id);
 void drm_handle_vblank_tick(void);

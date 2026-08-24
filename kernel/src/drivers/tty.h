@@ -13,12 +13,10 @@ typedef struct tty_virtual_device tty_device_t;
 typedef struct tty_session tty_t;
 typedef struct vfs_file fd_t;
 
-typedef struct tty_device_ops {
-    size_t (*write)(tty_device_t *device, const char *buf, size_t count);
-    size_t (*read)(tty_device_t *device, char *buf, size_t count);
-    void (*flush)(tty_device_t *res);
-    int (*ioctl)(tty_device_t *device, uint32_t cmd, uint32_t arg);
-} tty_device_ops_t;
+typedef struct tty_graphics_backend {
+    void *context;
+    int (*restore)(void *context);
+} tty_graphics_backend_t;
 
 struct tty_graphics_ {
     void *address;
@@ -41,8 +39,8 @@ struct tty_serial_ {
 
 typedef struct tty_virtual_device { // TTY 设备
     enum tty_device_type type;
-    tty_device_ops_t ops; // 图形设备不具备 read write 操作
-    void *private_data;   // 实际设备
+    tty_graphics_backend_t graphics_backend;
+    void *private_data; // 实际设备
     char name[32];
 
     struct llist_header node;
@@ -125,6 +123,9 @@ bool tty_vt_is_active(const tty_t *tty);
 tty_t *tty_vt_active(void);
 void terminal_set_active(tty_t *tty, bool active);
 int tty_rebind_framebuffer(const struct tty_graphics_ *framebuffer);
+int tty_bind_graphics_backend(const tty_graphics_backend_t *backend);
+void tty_unbind_graphics_backend(void *context);
+int tty_restore_graphics(tty_t *tty);
 void tty_sysfs_register(uint64_t dev, const char *name);
 void tty_input_event(dev_input_event_t *event, uint16_t type, uint16_t code,
                      int32_t value);

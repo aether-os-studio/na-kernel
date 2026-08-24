@@ -289,15 +289,8 @@ static int na_usb_pipe_transfer(na_usb_pipe_t *pipe, uint8_t direction,
     if (!size)
         return 0;
 
-    usb_xfer_t transfer = {
-        .pipe = pipe->pipe,
-        .dir = direction,
-        .data = data,
-        .datasize = (int)size,
-        .timeout_ns = (uint64_t)-1,
-        .actual_length_out = &actual,
-    };
-    status = usb_submit_xfer(&transfer);
+    status = usb_send_pipe(pipe->pipe, direction, NULL, data, (int)size,
+                           (uint64_t)-1, &actual);
     if (status != 0)
         return status == -1 ? -EIO : status;
     if (actual < 0 || (size_t)actual > size)
@@ -336,16 +329,8 @@ int na_usb_control_transfer(na_usb_device_t *device, uint8_t request_type,
         .wIndex = index,
         .wLength = (uint16_t)size,
     };
-    usb_xfer_t transfer = {
-        .pipe = usb->defpipe,
-        .dir = request_type & USB_DIR_IN,
-        .cmd = &control,
-        .data = data,
-        .datasize = (int)size,
-        .timeout_ns = (uint64_t)-1,
-        .actual_length_out = &actual,
-    };
-    status = usb_submit_xfer(&transfer);
+    status = usb_send_pipe(usb->defpipe, request_type & USB_DIR_IN, &control,
+                           data, (int)size, (uint64_t)-1, &actual);
     if (status != 0)
         return status == -1 ? -EIO : status;
     if (actual < 0 || (size_t)actual > size)
